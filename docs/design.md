@@ -1086,7 +1086,9 @@ symbol.
     the source), so one source tree serves both. Only the binary differs,
     because the USD C++ ABI changes between releases, so each USD version
     needs its own build of the plugin. CMake refuses USD older than 25.08.
-    DCC USD builds come later.
+    DCC USD builds come later. *Verified:* the plugin builds against both
+    26.08 and 25.08, and the USD tests pass on both. A plugin built for
+    26.08 fails in 25.08, which confirms one build per version.
   * Registration: `PXR_PLUGINPATH_NAME` pointing at the plugin's
     `plugInfo.json`. `clio doctor` checks that the plugin loads and that the
     `clio` scheme is registered (`Ar.GetRegisteredURISchemes()`).

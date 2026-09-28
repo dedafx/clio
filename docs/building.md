@@ -93,8 +93,13 @@ The wheel is tagged `cp313-abi3`. With the plugin it contains
 ```bash
 python3.13 -m pip install pytest
 export CLIO_TEST_P4D=/path/to/p4d
-python3.13 -m pytest    # USD tests need pxr importable: PYTHONPATH=$PXR_ROOT/lib/python3.13/site-packages
+python3.13 -m pytest
 ```
+
+The USD tests need `pxr` importable. USD's build script installs the Python
+modules in a version-dependent place: `$PXR_ROOT/lib/python3.13/site-packages`
+for 26.08, and `$PXR_ROOT/lib/python` for 25.08. The script prints the path
+at the end of the build.
 
 Tests that need a server are skipped when `CLIO_TEST_P4D` is not set, and
 the USD tests are skipped when `pxr` or the plugin is missing. Set

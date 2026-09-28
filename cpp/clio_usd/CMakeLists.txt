@@ -29,6 +29,9 @@ target_compile_definitions(clioUsd PRIVATE
 target_link_libraries(clioUsd PRIVATE clio::core ar tf vt)
 clio_hide_static_symbols(clioUsd)
 clio_set_warnings(clioUsd)
+# USD's own headers (pxr/base/vt/dictionary.h) include a deprecated libstdc++
+# header, which triggers a #warning in every file that includes them.
+target_compile_options(clioUsd PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-Wno-deprecated>)
 
 set(CLIO_USD_LIBRARY_PATH "../clioUsd${CMAKE_SHARED_MODULE_SUFFIX}")
 set(_clio_usd_build_dir "${CMAKE_BINARY_DIR}/usd_plugin")

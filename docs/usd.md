@@ -15,8 +15,8 @@ built and why it is designed this way, see [building.md](building.md) and
 > fetches into one request, and relative paths inside `clio:` layers are
 > not done yet. See [Current limitations](#current-limitations).
 
-Supported: Python 3.13, OpenUSD 26.08 (and 25.08 or later, with a plugin
-built for that USD version). No DCC integrations yet.
+Supported: Python 3.13, OpenUSD 26.08 and 25.08 (tested), and versions in
+between, with a plugin built for that USD version. No DCC integrations yet.
 
 ---
 
