@@ -43,7 +43,10 @@ server's parallel transfer) or in a small native extension of our own
 4. **Easy branching** for asset development, built on Perforce streams.
 5. **Performance** that holds up with multi-GB files and workspaces of
    100k+ files (see §8).
-6. **Safe by default.** Clio never deletes or reverts local work unless the
+6. **UI-ready data access.** Version history and status can be shown in
+   list UIs using cached data and a small, fixed number of server calls
+   (see §9).
+7. **Safe by default.** Clio never deletes or reverts local work unless the
    user asks for it explicitly.
 
 ### Non-goals (for v1)
@@ -73,7 +76,7 @@ did.
 | **Save** | `p4 submit` | Adds, edits, and deletes are detected and opened automatically. |
 | **Change** | A numbered pending changelist | The CLI hides the default changelist. |
 | **Draft** | A shelved changelist | "Share this without saving it." |
-| **Discard** | `p4 revert` | Always confirmed; can back up first (§9). |
+| **Discard** | `p4 revert` | Always confirmed; can back up first (§10). |
 | **Version** | A file revision / changelist number / label | `crate.ma@v12`, `@label`, `@1234`. |
 | **Publish** | `p4 copy` up to the parent stream | |
 | **Update branch** | `p4 merge` down from the parent stream | |
@@ -90,7 +93,10 @@ did.
 │             Assets · History · Drafts                                │
 │  Cross-cutting: Config · Errors · Events/Progress · Cancellation     │
 ├──────────────────────────────────────────────────────────────────────┤
-│  Local state:  StatusCache (SQLite, per workspace)                   │
+│  Local state:  StatusCache  (SQLite, per workspace)            §8.3  │
+│                HistoryCache (SQLite, per server + user)        §9    │
+│                ContentCache (files by digest: thumbnails, …)   §9    │
+│  Views:        FileListView · HistoryView (UI-ready, no Qt)    §9    │
 │  Native (opt): deda.clio._native — hashing, FS scan, diffing (§8.4)  │
 ├──────────────────────────────────────────────────────────────────────┤
 │  Backend protocol (typed, tagged records in / out)                   │
@@ -128,7 +134,7 @@ did.
   so no text parsing is needed. It is slower (a process spawn plus a
   connection per call) but always works.
 * **Testing.** Service logic is tested against `FakeBackend` in milliseconds.
-  Integration tests run against a real, throwaway `p4d` (§11).
+  Integration tests run against a real, throwaway `p4d` (§12).
 * **Future.** A different transport (for example a native backend written
   directly against the P4 C++ API) can be added without API changes.
 
@@ -145,7 +151,7 @@ clio/
 ├── src/deda/clio/
 │   ├── __init__.py             # public API; lazy re-exports
 │   ├── _version.py
-│   ├── errors.py               # exception hierarchy (§9)
+│   ├── errors.py               # exception hierarchy (§10)
 │   ├── models.py               # frozen, slotted dataclasses
 │   ├── config.py               # layered config (§6)
 │   ├── events.py               # progress / event types, cancellation token
@@ -157,7 +163,11 @@ clio/
 │   ├── assets.py
 │   ├── history.py
 │   ├── drafts.py
-│   ├── cache/                  # SQLite status cache (§8.3)
+│   ├── cache/
+│   │   ├── status.py           # per-workspace status cache (§8.3)
+│   │   ├── history.py          # server metadata / history cache (§9)
+│   │   └── content.py          # digest-addressed content cache (§9)
+│   ├── views/                  # UI-ready view models, no Qt dependency (§9)
 │   ├── backends/
 │   │   ├── base.py             # Backend Protocol, Record types
 │   │   ├── p4python.py
@@ -509,12 +519,277 @@ repeated syncs of the same large files come from a local cache;
 | `status` on an asset (cached, 1k files) | < 50 ms |
 | `status` on a 100k-file workspace (warm cache, no watcher) | < 2 s |
 | `lock` 500 files (incl. cross-branch check) | 2–3 server round trips |
+| History panel for a previously viewed file | < 20 ms, 0 server calls (fresh within the polling interval) |
+| Open a folder of 500 files in a view | ≤ 2 server calls |
 | `get` of large binaries | Network/disk-bound: within 10% of raw `p4 sync --parallel` |
 
 A `benchmarks/` suite (pytest-benchmark against a local `p4d` with
 generated binary files) runs in CI, so regressions are caught.
 
-## 9. Errors and safety
+## 9. Server data in user interfaces: history and caching
+
+Clio has no UI in v1, but Dedaverse, Imagine, and DCC panels will show
+Perforce data in lists: file browsers with version columns, per-file
+version history, asset activity feeds, and lock indicators. Done naively,
+every row and every click becomes a server call. With hundreds of rows and
+dozens of artists, that is slow for the user and expensive for the server.
+This section sets the rules now, so the API does not have to change when a
+UI arrives.
+
+**Core rules**
+
+1. **Server data is classified by how it changes.** The class decides
+   whether it is cached, for how long, and how it is refreshed (§9.2).
+2. **A UI never calls the server per row.** Views ask for the rows that are
+   visible, Clio batches them into one call, and the results are shown
+   (§9.5).
+3. **Show cached data at once, then revalidate** (stale-while-revalidate).
+   A UI always gets an instant answer, marked with how fresh it is.
+4. **Cached data is for display only.** Any action (lock, save, get,
+   publish) checks the server directly. A decision like "is this file
+   locked?" is never taken from the cache.
+5. **One cheap call answers "has anything changed?"** before any expensive
+   refresh (§9.4).
+
+### 9.1 UI scenarios to support
+
+| Scenario | Data shown | Typical size |
+|---|---|---|
+| **File list / asset browser** with status columns | name, local version vs latest ("v12 of 14"), last changed by/when, size, locked by, out-of-date flag | 50–5,000 rows, ~30 visible |
+| **Version history panel** for one file | every revision: version, change number, user, date, description, action, size, thumbnail | 1–1,000+ revisions, first ~20 visible |
+| **Asset history** (all files under an asset folder) | changes that touched the asset, grouped by change | 10s–1,000s of changes |
+| **Compare versions** | two revisions' metadata and previews side by side | 2 revisions |
+| **Activity feed** ("what changed on my branch today") | recent changes in a stream or folder | last N changes |
+| **Branch view** | which files differ between a branch and its parent, and which branch a revision came from | up to the size of the branch |
+| **Lock / presence badges** | who has a file locked or open, in which branch | the visible rows |
+
+### 9.2 Data classes and caching policy
+
+| Class | Examples | Changes? | Policy |
+|---|---|---|---|
+| **Immutable** | Submitted revision metadata (`path#rev` → change, action, type, time, size, digest). File content at a revision. | Never, in normal use | **Cache forever.** Fetched once per machine. |
+| **Append-only** | A file's or folder's history (new revisions are only ever added). Integration (branch/merge) records. | Grows | **Cache, and fetch only the new part** using a high-water mark (§9.4). |
+| **Mostly immutable** | Submitted change descriptions (the owner can edit them with `p4 change -u`, admins with `-f`). | Rarely | Cache. Revalidate lazily (for example when displayed, if older than a day) and on explicit refresh. |
+| **Volatile** | Head revision of a path, who has it opened or locked, pending changes, shelves (drafts), stream specs. | Often | **Short TTL** (default 15–30 s) for visible rows only. Always refetched before an action. |
+| **Local** | Have revision, local modifications. | On local actions | From the per-workspace StatusCache (§8.3), not from the server. |
+| **Never cached** | Pending changelist numbers (they are renumbered on submit), protections, tickets. | — | Always live. |
+
+**Exceptions to "immutable".** Admins can rewrite history with
+`p4 obliterate`, `p4 retype`, purge old content with `+S` or `p4 archive`,
+or restore a server from a checkpoint. Clio handles this without trying to
+detect every case up front:
+* A "no such file" or "purged" reply for a cached key deletes that key and
+  its dependants, and the view is refreshed.
+* The cache is keyed by server identity (§9.3). A replaced or restored
+  server gets a new cache.
+* `clio cache verify [PATH]` and a low-frequency background check (for
+  example a weekly sample) compare cached rows with the server and drop a
+  scope if they disagree. `clio cache clear` is always available.
+
+### 9.3 Cache tiers and where they live
+
+| Tier | Contents | Lifetime | Location |
+|---|---|---|---|
+| **L1: in memory** | Model objects for the current session: recently viewed history, visible rows | Process | LRU, bounded by entry count |
+| **L2: HistoryCache** | Server metadata (revisions, changes, integrations, head info, watermarks) | Persistent | SQLite, one DB per server + Perforce user |
+| **L3: ContentCache** | File bytes fetched for display: thumbnails, previews, small sidecars, older versions opened for comparison | Persistent, size-limited LRU (e.g. 5 GB) | Folder keyed by server digest + size |
+
+Notes:
+* **Why the HistoryCache is not per workspace.** History belongs to the
+  server, not to a workspace. One cache per machine, shared by the CLI and
+  every DCC, means a file's history is fetched once, whichever tool shows it
+  first. It lives in the user cache folder
+  (`<user cache dir>/clio/<server-id>/<p4user>/history.db`).
+* **Why per Perforce user.** Protections can hide paths from some users. A
+  cache must never show a user rows that were fetched with someone else's
+  permissions, so caches are never shared across Perforce users.
+* **Server identity** comes from `p4 info` (server ID where set, otherwise
+  server address plus server root), so that two servers never share a
+  cache. *(To confirm against the target server's configuration, Q3.)*
+* **Local disk only.** SQLite must not be on a network share. It runs in WAL
+  mode with a busy timeout and short write transactions, so several
+  processes (CLI, Maya, Houdini) can read and write it at once. If the
+  optional per-machine agent (§8.1.2) is built later, it becomes the single
+  owner of the cache and the other processes ask it instead.
+* **ContentCache is content-addressed.** A file's revision is identified by
+  its server digest (MD5) and size. Identical content, such as a file copied
+  to a branch, is stored once and never downloaded twice. Content comes from
+  `p4 print -o`, which does not change the workspace.
+
+**HistoryCache schema (sketch)**
+
+```sql
+changes      (change INTEGER PRIMARY KEY, user, client, stream, time,
+              description, desc_fetched_at)
+revisions    (depot_path, rev, change, action, filetype, time, size, digest,
+              PRIMARY KEY (depot_path, rev))
+integrations (to_path, to_rev, from_path, from_start_rev, from_end_rev, how)
+heads        (depot_path PRIMARY KEY, head_rev, head_change, fetched_at)
+presence     (depot_path, user, client, action, is_locked, fetched_at)  -- volatile
+scopes       (scope_path PRIMARY KEY, watermark_change, checked_at,
+              complete INTEGER)  -- see §9.4
+```
+
+Descriptions are stored once per change, not per file, because one change
+often contains hundreds of files. Size estimate: about 150–250 bytes per
+revision row, so a million revisions is roughly 200 MB. That is acceptable
+on a workstation, and the cache can be limited to scopes the user has
+actually viewed.
+
+### 9.4 Keeping the cache fresh with few server calls
+
+**Scopes and watermarks.** A *scope* is a depot path the UI is watching (an
+asset folder, a stream). For each scope the cache stores a **watermark**:
+the highest submitted change number already known for that scope.
+
+**The freshness check (idle cost: one call per scope).**
+
+```
+latest = p4 changes -m1 -s submitted //imagine/main/props/crate/...
+if latest == watermark:      nothing changed → cache is valid, done
+else:                        fetch only the delta (below)
+```
+
+`p4 changes -m1` on a scoped path is one of the cheapest queries the server
+answers, and it needs no special permissions.
+
+**The delta fetch (cost: one or two calls, whatever the scope size).**
+
+```
+p4 -ztag filelog -l -t //imagine/main/props/crate/...@<watermark+1>,@now
+```
+
+This returns only the revisions submitted since the watermark, for every
+file in the scope. They are appended to `revisions`, `changes`, and `heads`,
+and the watermark moves forward. Views showing affected rows get a
+`rows_changed` event. *(To verify in Phase 1: `filelog` with a change range
+vs `p4 files` on the range plus a batched `p4 describe -s`, whichever costs
+the server less on large scopes.)*
+
+**The first fetch of a scope** is the only expensive one. It is paginated
+and done lazily:
+* The list view needs only head info for its rows: one `p4 fstat` (with
+  `-T` limiting fields) for the whole folder.
+* Full history is fetched per file when needed (§9.5), not for the whole
+  scope, until the scope is marked `complete`.
+* Very large scopes are split into sub-folders, so a server limit
+  (`MaxScanRows`, `MaxResults`) is never hit. A "too many rows" error makes
+  Clio split the request and retry, and is not shown to the user.
+
+**When checks run.**
+
+| Trigger | What happens |
+|---|---|
+| A view becomes visible, or the app regains focus | Freshness check for its scope |
+| While visible | Freshness check every 30–60 s (configurable). Paused when hidden or minimized. |
+| After any Clio action (save, get, lock, publish) | Affected scopes are updated from the action's own results. No extra call. |
+| User clicks "Refresh" | Freshness check plus volatile data for visible rows |
+| Before any action | Live check of the files involved. The cache is not trusted. |
+
+**Push notifications (later, optional).** Perforce does not push events to
+clients. A studio that wants instant updates can add a server
+`change-commit` trigger that publishes "change N submitted to //path" to a
+small notification service (for example WebSocket or a message queue).
+Clio would then use it to replace polling. The cache design does not
+change: a notification is simply "run the freshness check for this scope
+now". It is not needed for v1.
+
+### 9.5 How a UI asks for data
+
+UIs use **view models** from `deda.clio.views`. They have no Qt
+dependency but map directly onto `QAbstractItemModel` (or any other
+toolkit). They own batching, prioritization, and cancellation, so each UI
+does not have to reinvent them.
+
+```python
+from deda import clio
+from deda.clio.views import FileListView, HistoryView
+
+s = clio.connect(project="imagine")
+
+# File browser: rows are available at once from the cache.
+files = FileListView(s, "props/crate", columns=("version", "head", "locked_by",
+                                                 "changed_by", "changed_at"))
+files.rows_changed.connect(on_rows_changed)   # (first, last) indices
+files.set_visible_range(0, 40)                # only these rows are fetched
+row = files[3]      # FileRow(path=..., have_rev=12, head_rev=14,
+                    #         locked_by=None, freshness=Freshness.STALE)
+
+# History panel for the selected file: first page from the cache,
+# then any newer revisions from the delta fetch.
+hist = HistoryView(s, "props/crate/crate.ma", page_size=20)
+hist.rows_changed.connect(on_history_changed)
+hist.fetch_more()   # next (older) page, when the user scrolls
+thumb = hist[0].thumbnail(max_size=256)   # Future[Path], from ContentCache
+
+# Without views: the same data through the service API.
+page = s.history.revisions("props/crate/crate.ma", limit=20,
+                           max_age=timedelta(seconds=30))
+page.items, page.freshness, page.next_cursor
+```
+
+Each result carries **freshness** (`FRESH`, `STALE` with its age, or
+`LOADING`), so a UI can show a subtle "updating" state instead of blocking.
+
+**Request pipeline** (inside Clio, shared by all views in a process):
+
+1. **Coalesce.** Requests arriving within a short window (for example 30 ms)
+   are merged. Scrolling past 40 rows becomes one `fstat` or one
+   multi-file `filelog`, not 40 calls.
+2. **Deduplicate.** Two views asking for the same key share one in-flight
+   request and its result.
+3. **Prioritize.** Visible rows first, then the selected file's history,
+   then prefetch (the next page, the rows just below the visible range).
+4. **Cancel.** Rows scrolled out of view before their request starts are
+   dropped. A request that has started finishes and is cached.
+5. **Run on the connection pool** (§8.1), never on the UI thread. Results
+   come back as events, which the consumer marshals to its UI thread (in Qt,
+   a queued signal).
+
+### 9.6 Cached vs live: decision table
+
+| UI need | Source | Server calls |
+|---|---|---|
+| Open a folder of 500 files | Cache for all rows at once. One `fstat` (limited fields) for visible rows if stale. | 0–1 (+1 freshness check) |
+| Scroll the list | Coalesced `fstat` for newly visible stale rows | ≤ 1 per scroll pause |
+| Select a file, show history | Cache. If the file has never been viewed: one `filelog -m 20`. | 0–1 |
+| Scroll history to older versions | Cache, else `filelog` for the next page | 0–1 per page |
+| Thumbnail for a revision | ContentCache, else one `p4 print` (batched for visible revisions) | 0–1 |
+| Compare two versions | Metadata from cache. Content from ContentCache or `p4 print` to a temp folder. | 0–2 |
+| Lock badge on a row | Cached presence with a 15–30 s TTL, refreshed in the same batched `fstat` | shared with the row refresh |
+| Artist clicks **Lock** | **Live** `fstat` plus `edit` on the server, then update the cache | always live |
+| Activity feed for a branch | Cache, plus the freshness check and delta fetch | 1 when idle |
+| Idle UI | Freshness check per visible scope every 30–60 s | 1 per scope per interval |
+
+**Budget rule (to check in tests):** a user interaction costs at most one or
+two server calls, whatever the number of rows. Idle UIs cost at most one
+call per visible scope per polling interval. The integration tests count
+backend calls per scenario and fail if a change breaks the budget.
+
+### 9.7 Server-side considerations for many UI users
+
+* With many artists running UIs, metadata queries add up. For larger
+  studios, recommend a **read-only replica or edge server** so that history
+  and status queries don't load the commit server. P4 Proxy caches file
+  *content* (useful for thumbnails and syncs), not metadata.
+* Keep polling intervals configurable at the site level, so an admin can
+  reduce load centrally.
+* History that comes from before a branch was made (`filelog -i` follows
+  it back into the parent stream) is stored under the parent's paths, so
+  it is cached once and shared by every branch made from that parent.
+
+### 9.8 Thumbnails and previews
+
+Thumbnails are the most frequent binary request in a UI. The recommended
+convention is a small sidecar image per asset version (for example
+`.clio/thumb.png` next to the asset, submitted with it). Clio then shows it
+through `p4 print` and the ContentCache, and each thumbnail is downloaded
+at most once per machine. Alternatives are Perforce attributes (`p4
+attribute`) or an external thumbnail service. *(Q8: which convention fits
+Dedaverse/Imagine? This affects the save workflow, which would generate
+the thumbnail.)*
+
+## 10. Errors and safety
 
 * **Exception hierarchy** rooted at `ClioError`: `ConnectionError`,
   `AuthError`, `LockedByOtherError(path, user, workspace, branch)`,
@@ -532,7 +807,7 @@ generated binary files) runs in CI, so regressions are caught.
 * **Branch switch** with opened files is refused by default and offers to
   shelve them as a draft first.
 
-## 10. CLI
+## 11. CLI
 
 Entry point `clio` (also `python -m deda.clio.cli`). Human-readable output by
 default, `--json` on every command for tooling, and exit codes documented
@@ -553,13 +828,14 @@ clio branch list | create NAME [--from PARENT] [--task] | switch NAME
 clio branch update [NAME] | publish [NAME] -m MSG | retire NAME
 clio export ASSET --version V --dest DIR
 clio doctor                     # config, connectivity, server settings, typemap
+clio cache verify [PATH] | cache clear [PATH]   # history/content caches (§9)
 ```
 
 Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
 `revert`, `shelve`). *(Q4: CLI framework. The recommendation is `click`,
 loaded lazily, or `argparse` for zero dependencies.)*
 
-## 11. Testing strategy
+## 12. Testing strategy
 
 * **Unit tests** (`tests/unit`) run service logic against `FakeBackend`.
   They are fast and have no server.
@@ -573,7 +849,7 @@ loaded lazily, or `argparse` for zero dependencies.)*
   `P4PythonBackend` and `P4CliBackend`.
 * **Benchmarks** (§8.7) and **native/pure parity tests** for `_native`.
 
-## 12. Integration with Dedaverse, Imagine, and DCCs
+## 13. Integration with Dedaverse, Imagine, and DCCs
 
 * Clio depends only on P4Python (optional), `tomli` (py < 3.11), and the
   optional native wheel. It never imports Dedaverse or Imagine. They depend
@@ -586,17 +862,17 @@ loaded lazily, or `argparse` for zero dependencies.)*
 * The event bus (§5.6) lets Dedaverse drive lock icons, progress bars, and
   notifications without polling.
 
-## 13. Roadmap
+## 14. Roadmap
 
 | Phase | Scope |
 |---|---|
 | **0 — Skeleton** | `pyproject`, namespace package, CI, `FakeBackend`, `p4d` test fixture, error model, config. |
-| **1 — Core workflow** | `P4PythonBackend` + pool, connect/login/setup, get (parallel), lock/unlock, save, status (no cache yet), history, CLI for these. Baseline benchmarks. |
+| **1 — Core workflow** | `P4PythonBackend` + pool, connect/login/setup, get (parallel), lock/unlock, save, status (no cache yet), history backed by the HistoryCache with watermark refresh (§9.3–9.4), CLI for these. Baseline benchmarks. |
 | **2 — Branching** | Streams/task streams, switch, update/publish with binary conflict handling, cross-branch lock check, drafts (shelves). |
 | **3 — Performance** | StatusCache, cheap change checks, optional watcher. Profile, then `_native` (Rust/PyO3 abi3) for hashing/scan/diff if the benchmarks justify it. |
-| **4 — Ecosystem** | Asset resolver plugins, validation hooks, `P4CliBackend` for DCC fallback, `clio doctor`, Dedaverse integration. |
+| **4 — Ecosystem** | UI view models (`FileListView`, `HistoryView`) with the request pipeline, ContentCache and thumbnails (§9.5–9.8), asset resolver plugins, validation hooks, `P4CliBackend` for DCC fallback, `clio doctor`, Dedaverse integration. |
 
-## 14. Open questions
+## 15. Open questions
 
 1. **Namespace:** Does Dedaverse use a PEP 420 implicit `deda` namespace
    (no `deda/__init__.py`)? If it ships a `deda/__init__.py`, it must be
@@ -615,3 +891,9 @@ loaded lazily, or `argparse` for zero dependencies.)*
 7. **Asset identity:** Is an asset a folder (all files under a path), or is
    it defined by Dedaverse/Imagine metadata (for example a USD asset or a
    database ID)? This decides how much of the resolver ships in Clio itself.
+8. **Thumbnails:** Should asset versions carry a thumbnail sidecar
+   submitted with the asset (recommended), use Perforce attributes, or come
+   from an external service?
+9. **UI refresh:** Is 30–60 s polling acceptable for artist UIs in v1, or
+   do you want instant updates (a server trigger plus a notification
+   service, §9.4) early on?
