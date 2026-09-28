@@ -7,6 +7,7 @@
 
 #include <doctest/doctest.h>
 
+#include <chrono>
 #include <fstream>
 #include <sstream>
 
@@ -154,4 +155,61 @@ TEST_CASE("verify policy uses a stored historical version without the server") {
     const auto resolved = verify.resolve(id);
     REQUIRE(resolved);
     CHECK(readFile(resolved->localPath) == "v1");
+}
+
+TEST_CASE("when Perforce is unavailable, local files are used with a warning") {
+    auto fx = fixtureOrSkip();
+    if (!fx) return;
+
+    const auto v1 = fx->submit({{"a.usda", "v1"}}, "v1");
+    fx->submit({{"a.usda", "v2"}}, "v2"); // the workspace now has v2
+
+    auto settings = fx->settings();
+    settings.connection.port = "localhost:1"; // nothing listens here
+    AssetResolver resolver(settings);
+
+    SUBCASE("latest uses the workspace file") {
+        const auto resolved = resolver.resolve(AssetIdentifier::parse("clio:/a.usda"));
+        REQUIRE(resolved);
+        CHECK(readFile(resolved->localPath) == "v2");
+        CHECK(resolved->warning.find("Perforce is not available") != std::string::npos);
+    }
+    SUBCASE("a historical pin falls back to the workspace file") {
+        const auto resolved = resolver.resolve(
+            AssetIdentifier::parse("clio:/a.usda?change=" + std::to_string(v1)));
+        REQUIRE(resolved);
+        CHECK(resolved->localPath == fx->workspaceRoot() / "a.usda");
+        CHECK(resolved->warning.find("may not be version @" + std::to_string(v1)) != std::string::npos);
+    }
+    SUBCASE("a file that is not on disk still fails") {
+        CHECK_FALSE(resolver.resolve(AssetIdentifier::parse("clio:/missing.usda")));
+    }
+    SUBCASE("verify policy never falls back") {
+        auto strict = settings;
+        strict.policy = Policy::Verify;
+        AssetResolver verify(strict);
+        CHECK_FALSE(verify.resolve(AssetIdentifier::parse("clio:/a.usda?change=" + std::to_string(v1))));
+    }
+}
+
+TEST_CASE("an unreachable server does not stall resolves") {
+    auto fx = fixtureOrSkip();
+    if (!fx) return;
+    fx->submit({{"a.usda", "v1"}}, "v1");
+
+    auto settings = fx->settings();
+    settings.connection.port = "10.255.255.1:1666"; // non-routable: packets are dropped
+    settings.connection.connectTimeout = std::chrono::seconds(2);
+    AssetResolver resolver(settings);
+
+    const auto start = std::chrono::steady_clock::now();
+    const auto first = resolver.resolve(AssetIdentifier::parse("clio:/a.usda"));
+    const auto second = resolver.resolve(AssetIdentifier::parse("clio:/a.usda"));
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+
+    REQUIRE(first);
+    REQUIRE(second);
+    CHECK_FALSE(first->warning.empty());
+    // One connect attempt at most (2 s); the second resolve does not retry.
+    CHECK(elapsed < std::chrono::seconds(8));
 }

@@ -6,7 +6,17 @@
 #include <clientapi.h>
 #include <p4libs.h> // clientapi.h already includes keepalive.h, which has no include guard
 
+#include <cerrno>
+#include <cstring>
 #include <mutex>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <netdb.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
 
 namespace clio::core::p4 {
 
@@ -41,6 +51,92 @@ void initializeP4Libraries() {
     if (!failure.empty()) {
         throw P4Error("Could not initialize the Perforce API: " + failure);
     }
+}
+
+// Split a P4PORT such as "ssl:perforce:1666", "perforce:1666", "1666" or
+// "tcp6:[::1]:1666" into host and service. Returns false for ports that do
+// not use TCP directly (rsh:, jsh:), which are not checked.
+bool splitTcpPort(std::string port, std::string& host, std::string& service) {
+    if (port.rfind("rsh:", 0) == 0 || port.rfind("jsh:", 0) == 0) {
+        return false;
+    }
+    for (const char* proto : {"tcp:", "tcp4:", "tcp6:", "tcp46:", "tcp64:",
+                              "ssl:", "ssl4:", "ssl6:", "ssl46:", "ssl64:"}) {
+        if (port.rfind(proto, 0) == 0) {
+            port.erase(0, std::strlen(proto));
+            break;
+        }
+    }
+    const std::size_t colon = port.rfind(':');
+    if (colon == std::string::npos) {
+        host = "localhost";
+        service = port;
+    } else {
+        host = port.substr(0, colon);
+        service = port.substr(colon + 1);
+    }
+    if (host.size() > 1 && host.front() == '[' && host.back() == ']') {
+        host = host.substr(1, host.size() - 2);
+    }
+    return !host.empty() && !service.empty();
+}
+
+// Try a TCP connection with a time limit. Returns an error message, or ""
+// if the server accepted the connection.
+std::string checkReachable(const std::string& port, std::chrono::seconds timeout) {
+#ifdef _WIN32
+    // TODO: Windows implementation (Winsock). Until then, rely on P4API.
+    (void)port;
+    (void)timeout;
+    return {};
+#else
+    std::string host, service;
+    if (timeout.count() <= 0 || !splitTcpPort(port, host, service)) {
+        return {};
+    }
+    addrinfo hints{};
+    hints.ai_socktype = SOCK_STREAM;
+    addrinfo* addresses = nullptr;
+    if (const int rc = getaddrinfo(host.c_str(), service.c_str(), &hints, &addresses); rc != 0) {
+        return "cannot resolve " + host + ": " + gai_strerror(rc);
+    }
+    std::string failure = "cannot reach " + host + ":" + service;
+    const int timeoutMs = static_cast<int>(timeout.count() * 1000);
+    for (addrinfo* ai = addresses; ai; ai = ai->ai_next) {
+        const int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+        int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (rc != 0 && errno == EINPROGRESS) {
+            pollfd pfd{fd, POLLOUT, 0};
+            rc = poll(&pfd, 1, timeoutMs);
+            if (rc == 1) {
+                int soError = 0;
+                socklen_t len = sizeof(soError);
+                getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &len);
+                rc = soError == 0 ? 0 : -1;
+                if (soError != 0) {
+                    failure = "cannot reach " + host + ":" + service + ": " + std::strerror(soError);
+                }
+            } else {
+                failure = "no answer from " + host + ":" + service + " within " +
+                          std::to_string(timeout.count()) + " s";
+                rc = -1;
+            }
+        } else if (rc != 0) {
+            failure = "cannot reach " + host + ":" + service + ": " + std::strerror(errno);
+        }
+        close(fd);
+        if (rc == 0) {
+            freeaddrinfo(addresses);
+            return {};
+        }
+    }
+    freeaddrinfo(addresses);
+    return failure;
+#endif
 }
 
 // Collects everything a command reports. Never prompts: Clio runs in
@@ -226,10 +322,21 @@ void Connection::_connect() {
     if (!_options.cwd.empty()) client.SetCwd(_options.cwd.c_str());
     if (!_options.ticketFile.empty()) client.SetTicketFile(_options.ticketFile.c_str());
 
+    // P4PORT may come from the environment or P4CONFIG, so ask the API.
+    const StrPtr& effectivePort = client.GetPort();
+    const std::string port(effectivePort.Text(), effectivePort.Length());
+    if (const std::string unreachable = checkReachable(port, _options.connectTimeout);
+        !unreachable.empty()) {
+        _impl = std::make_unique<Impl>();
+        throw P4Error("Could not connect to Perforce at " + port + ": " + unreachable);
+    }
+
     ::Error e;
     client.Init(&e);
     if (e.Test()) {
-        throw P4Error("Could not connect to Perforce: " + formatError(e), {formatError(e)});
+        const std::string detail = formatError(e);
+        _impl = std::make_unique<Impl>(); // start clean on the next attempt
+        throw P4Error("Could not connect to Perforce: " + detail, {detail});
     }
     // Must follow Init() (see clientapi.h).
     client.SetProg(_options.programName.c_str());

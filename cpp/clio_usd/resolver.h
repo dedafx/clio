@@ -6,6 +6,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 
 namespace clio::core {
@@ -59,8 +60,11 @@ private:
     std::shared_ptr<clio::core::AssetResolver> _GetCoreResolver() const;
     std::shared_ptr<clio::core::AssetResolver> _GetCoreResolver(const ClioResolverContext& ctx) const;
 
+    void _WarnOnce(const std::string& assetPath, const std::string& warning) const;
+
     mutable std::mutex _mutex;
     mutable std::map<std::string, std::shared_ptr<clio::core::AssetResolver>> _coreResolvers;
+    mutable std::set<std::string> _warned; ///< paths already warned about, until refresh
 };
 
 PXR_NAMESPACE_CLOSE_SCOPE

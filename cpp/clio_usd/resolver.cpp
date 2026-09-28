@@ -82,6 +82,16 @@ std::shared_ptr<clio::core::AssetResolver> ClioResolver::_GetCoreResolver() cons
     return nullptr;
 }
 
+void ClioResolver::_WarnOnce(const std::string& assetPath, const std::string& warning) const {
+    {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (!_warned.insert(assetPath).second) {
+            return;
+        }
+    }
+    TF_WARN("clio: %s: %s", assetPath.c_str(), warning.c_str());
+}
+
 std::string ClioResolver::_CreateIdentifier(const std::string& assetPath,
                                             const ArResolvedPath& anchorAssetPath) const {
     return guarded("creating an identifier for", assetPath, std::string(), [&] {
@@ -109,7 +119,13 @@ ArResolvedPath ClioResolver::_Resolve(const std::string& assetPath) const {
             return ArResolvedPath();
         }
         const auto asset = core->resolve(AssetIdentifier::parse(assetPath));
-        return asset ? ArResolvedPath(asset->localPath.generic_string()) : ArResolvedPath();
+        if (!asset) {
+            return ArResolvedPath();
+        }
+        if (!asset->warning.empty()) {
+            _WarnOnce(assetPath, asset->warning);
+        }
+        return ArResolvedPath(asset->localPath.generic_string());
     });
 }
 
@@ -175,6 +191,7 @@ void ClioResolver::_RefreshContext(const ArResolverContext& context) {
             return;
         }
         it->second->refresh();
+        _warned.clear();
     }
     ArNotice::ResolverChanged(*ctx).Send();
 }

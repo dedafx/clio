@@ -1064,6 +1064,15 @@ symbol.
 * **Policies in the context:** `sync` (default: fetch what is needed),
   `verify` (fail if not present, no server calls, for farm reproducibility),
   and `offline` (use whatever is on disk and warn).
+* **Enhancement, not a barrier.** Under `sync` and `offline`, if Perforce
+  cannot be used (unreachable, not logged in, request refused), the resolver
+  uses the local file and warns once per path. Historical pins use the
+  version store first, then the workspace file, with a warning that the
+  version may differ. After a failure the server is not contacted again for
+  60 s (or until `_RefreshContext`), and an unreachable server is abandoned
+  after `connect_timeout` (default 10 s). P4API has no connect timeout, so
+  Clio checks TCP reachability itself. Only `verify` fails instead.
+  Fallback answers are not remembered.
 * **Python access.** `deda.clio.usd` builds contexts from strings, so it
   needs no compiled Python module. A wrapped `ClioResolverContext` class for
   Python (through USD's `ArWrapResolverContextForPython`) is optional and

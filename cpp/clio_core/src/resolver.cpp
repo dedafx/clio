@@ -1,5 +1,7 @@
 #include "clio/core/resolver.hpp"
 
+#include "clio/core/error.hpp"
+
 namespace clio::core {
 
 AssetResolver::AssetResolver(Settings settings) : _workspace(std::move(settings)) {}
@@ -22,41 +24,87 @@ std::optional<ResolvedAsset> AssetResolver::resolve(const AssetIdentifier& id) {
     // TODO(design §10.3): route misses through the coalescer so concurrent
     // misses from USD worker threads become one batched sync.
     std::optional<ResolvedAsset> resolved = _resolveUncached(id, pin);
-    if (resolved) {
+    // A fallback answer is not remembered, so the exact version is fetched
+    // once the server is reachable again.
+    if (resolved && resolved->warning.empty()) {
         std::lock_guard<std::mutex> lock(_memoMutex);
         _memo.emplace(key, *resolved);
     }
     return resolved;
 }
 
+bool AssetResolver::_serverAvailable() const {
+    const auto retryAt = _serverRetryAt.load();
+    return retryAt == 0 || std::chrono::steady_clock::now().time_since_epoch().count() >= retryAt;
+}
+
+void AssetResolver::_markServerUnavailable() {
+    const auto retryAt = std::chrono::steady_clock::now() + serverRetryInterval;
+    _serverRetryAt.store(retryAt.time_since_epoch().count());
+}
+
+std::optional<ResolvedAsset> AssetResolver::_useWorkspaceFile(ResolvedAsset asset,
+                                                              const std::string& reason) const {
+    asset.localPath = _workspace.workspacePath(asset.id);
+    if (!std::filesystem::exists(asset.localPath)) {
+        return std::nullopt;
+    }
+    asset.warning = reason + "; using the local file " + asset.localPath.string() +
+                    ", which may not be version " + asset.pin.str();
+    return asset;
+}
+
 std::optional<ResolvedAsset> AssetResolver::_resolveUncached(const AssetIdentifier& id,
                                                              const Pin& pin) {
     const Policy policy = settings().policy;
-    ResolvedAsset asset{id, pin, _workspace.depotPath(id), {}};
+    ResolvedAsset asset{id, pin, _workspace.depotPath(id), {}, {}};
+    const bool mayContactServer = policy == Policy::Sync && _serverAvailable();
+    const std::string unavailable = "Perforce is not available";
 
     if (pin.isHistorical()) {
         asset.localPath = _workspace.versionStorePath(id, pin);
         const bool stored = std::filesystem::exists(asset.localPath);
-        if (policy != Policy::Sync) {
+        if (policy == Policy::Verify) {
+            // Strict: the exact version or nothing.
             return stored ? std::optional<ResolvedAsset>(asset) : std::nullopt;
         }
         // Change and revision pins name content that never changes, so a
         // stored file is reused. A label can be moved by an admin, so it is
         // fetched from the server again once per process (design §8.3).
-        if (stored && pin.kind() != Pin::Kind::Label) {
+        if (stored && (pin.kind() != Pin::Kind::Label || !mayContactServer)) {
             return asset;
         }
-        if (!_workspace.fetchVersion(id, pin)) {
-            return std::nullopt;
+        if (!mayContactServer) {
+            return _useWorkspaceFile(asset, policy == Policy::Offline ? "Offline" : unavailable);
         }
-        return asset;
+        try {
+            if (!_workspace.fetchVersion(id, pin)) {
+                return std::nullopt; // the file does not exist at that version
+            }
+            return asset;
+        } catch (const P4Error& e) {
+            _markServerUnavailable();
+            if (stored) {
+                asset.warning = unavailable + " (" + e.what() + "); using the stored copy of label " +
+                                pin.labelName() + ", which may be out of date";
+                return asset;
+            }
+            return _useWorkspaceFile(asset, unavailable + " (" + e.what() + ")");
+        }
     }
 
     asset.localPath = _workspace.workspacePath(id);
-    if (pin.kind() == Pin::Kind::Latest && policy == Policy::Sync) {
-        // A no-op on the server when the file is already current.
-        // TODO(design §10.3): answer from the StatusCache manifest instead.
-        _workspace.sync({id}, pin);
+    if (pin.kind() == Pin::Kind::Latest && mayContactServer) {
+        try {
+            // A no-op on the server when the file is already current.
+            // TODO(design §10.3): skip the call when the file is known current.
+            _workspace.sync({id}, pin);
+        } catch (const P4Error& e) {
+            _markServerUnavailable();
+            if (policy != Policy::Verify) {
+                return _useWorkspaceFile(asset, unavailable + " (" + e.what() + ")");
+            }
+        }
     }
     if (!std::filesystem::exists(asset.localPath)) {
         return std::nullopt;
@@ -71,6 +119,7 @@ std::filesystem::path AssetResolver::resolveForNewAsset(const AssetIdentifier& i
 void AssetResolver::refresh() {
     std::lock_guard<std::mutex> lock(_memoMutex);
     _memo.clear();
+    _serverRetryAt.store(0);
 }
 
 } // namespace clio::core

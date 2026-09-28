@@ -29,6 +29,12 @@ struct ConnectionOptions {
     /// §10.3), so a prompt there would hang.
     std::function<std::optional<std::string>(const std::string& prompt, bool noEcho)> prompt;
 
+    /// Give up on an unreachable server after this long. The operating
+    /// system's own TCP connect timeout can be over two minutes, and
+    /// Perforce has no setting for it, so Clio checks reachability itself
+    /// first (tcp and ssl ports). Zero disables the check.
+    std::chrono::seconds connectTimeout{10};
+
     /// A command is cancelled if it runs longer than this. Zero disables the
     /// limit. See design doc §10.3 ("Blocking and timeouts").
     std::chrono::seconds commandTimeout{120};

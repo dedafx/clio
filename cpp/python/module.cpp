@@ -28,6 +28,7 @@ nb::dict resolvedToDict(const ResolvedAsset& asset) {
     d["pin"] = asset.pin.str();
     d["depot_path"] = asset.depotPath;
     d["local_path"] = asset.localPath;
+    d["warning"] = asset.warning.empty() ? nb::none() : nb::cast(asset.warning);
     return d;
 }
 
@@ -179,7 +180,9 @@ NB_MODULE(_core, m) {
                 return resolvedToDict(*asset);
             },
             "identifier"_a,
-            "Return {identifier, pin, depot_path, local_path}, or None if the asset is not available.")
+            "Return {identifier, pin, depot_path, local_path, warning}, or None if the asset is not "
+            "available. 'warning' is set when a local file was used instead of the exact version, "
+            "for example because Perforce was unreachable.")
         .def("resolve_for_new_asset", &AssetResolver::resolveForNewAsset, "identifier"_a)
         .def("refresh", &AssetResolver::refresh);
 }

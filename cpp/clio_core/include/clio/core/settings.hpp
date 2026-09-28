@@ -35,6 +35,8 @@ Policy parsePolicy(const std::string& text);
 ///   pin      default pin: latest (default), have, @change, @label
 ///   policy   sync (default), verify, offline
 ///   timeout  command timeout in seconds (default 120, 0 = none)
+///   connect_timeout
+///            seconds to wait for an unreachable server (default 10, 0 = OS default)
 struct Settings {
     p4::ConnectionOptions connection;
     std::string depotRoot;

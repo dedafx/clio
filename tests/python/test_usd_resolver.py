@@ -50,7 +50,7 @@ _SCRIPT = textwrap.dedent(
 )
 
 
-def _open_stage(resources: Path, settings: str, root: str) -> dict:
+def _open_stage(resources: Path, settings: str, root: str, stderr: list | None = None) -> dict:
     env = dict(os.environ)
     env["PXR_PLUGINPATH_NAME"] = os.pathsep.join(
         filter(None, [os.fspath(resources), env.get("PXR_PLUGINPATH_NAME")])
@@ -63,6 +63,8 @@ def _open_stage(resources: Path, settings: str, root: str) -> dict:
         check=False,
     )
     assert out.returncode == 0, out.stderr
+    if stderr is not None:
+        stderr.append(out.stderr)
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
@@ -157,3 +159,16 @@ def test_relative_sublayer_inside_clio_layer_is_fetched(p4_server):
     result = _open_stage(resources, p4_server.settings_text(), "clio:/shots/sh010/shot.usda")
 
     assert len([p for p in result["real_paths"] if p]) == 3
+
+
+def test_stage_opens_from_local_files_when_perforce_is_unavailable(p4_server):
+    resources = _plugin_resources()
+    p4_server.submit({"assets/crate/crate.usda": _crate(1), "shots/sh010/shot.usda": _SHOT}, "v1")
+    # The files are in the workspace; now the server cannot be reached.
+    settings = p4_server.settings_text(port="localhost:1")
+
+    stderr: list[str] = []
+    result = _open_stage(resources, settings, "clio:/shots/sh010/shot.usda", stderr)
+
+    assert result["value"] == 1
+    assert "Perforce is not available" in stderr[0]

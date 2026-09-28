@@ -174,6 +174,7 @@ matter, and the values may not contain `;` or `=`.
 | `pin` | no | `latest` (default), `have`, `@<change>`, `@<label>` |
 | `policy` | no | `sync` (default), `verify` or `offline` (below) |
 | `timeout` | no | Seconds before a Perforce command is cancelled. Default `120`, `0` = none |
+| `connect_timeout` | no | Seconds to wait for an unreachable server before falling back to local files. Default `10`, `0` = the OS default (can be over 2 minutes) |
 
 You can check a string in Python before handing it to USD:
 
@@ -186,9 +187,9 @@ clio.Settings.parse(settings)   # raises clio.ConfigError with the reason
 
 | Policy | Contacts the server? | Use it for |
 |---|---|---|
-| `sync` | Yes, to fetch what is missing or out of date | Everyday work |
+| `sync` | Yes, to fetch what is missing or out of date. Falls back to local files, with a warning, if the server is unavailable. | Everyday work |
 | `verify` | No. A resolve fails if the file is not already on disk at the required version. | Render farms and reproducible builds, where a prefetch step has already fetched everything |
-| `offline` | No. Uses whatever is on disk. | Working without a connection |
+| `offline` | No. Uses whatever is on disk (for historical pins: the version store, then the workspace). | Working without a connection |
 
 ### A default context for every stage
 
@@ -260,7 +261,8 @@ Warning: clio: resolving 'clio:/assets/crate/crate.usda' failed: p4 sync failed:
 | `Clio does not prompt for passwords` / `password (P4PASSWD) invalid or unset` | No valid ticket | `p4 login` (or set `tickets=`) |
 | `no resolver context` | Stage opened without a clio context and no `CLIO_RESOLVER_CONTEXT` | Pass a context, or set the variable |
 | `invalid resolver context` | Bad settings string | Check it with `clio.Settings.parse` |
-| `timed out after N s` | Server slow or unreachable | Check the connection, or raise `timeout=` |
+| `timed out after N s` | A command took longer than `timeout` | Check the connection, or raise `timeout=` |
+| `Perforce is not available ...; using the local file` | Fallback: server unreachable or refused | Nothing if the local file is fine; otherwise fix the connection or login and call `RefreshContext` |
 | Layer missing, no clio warning | The file doesn't exist at that version, or `verify`/`offline` found nothing on disk | Check the path and pin |
 
 To confirm the plugin is loaded:
@@ -269,6 +271,50 @@ To confirm the plugin is loaded:
 from pxr import Ar
 assert "clio" in Ar.GetRegisteredURISchemes()
 ```
+
+---
+
+## Working without Perforce
+
+Clio is meant to be an enhancement, not a barrier. With the Clio plugin
+installed, a stage whose files are already on disk opens even when
+Perforce cannot be used:
+
+* **Server unreachable, not logged in, or refusing the request:** with the
+  `sync` policy (the default), Clio uses the local file and prints one
+  warning per path, for example:
+  ```
+  Warning: clio: clio:/assets/crate/crate.usda: Perforce is not available (...);
+           using the local file /work/imagine/assets/crate/crate.usda, which may not be version latest
+  ```
+  For a historical pin (`@change`, `@label`, `#rev`), Clio uses the copy in
+  the version store if it has one, and otherwise falls back to the file in
+  your workspace, **which may be a different version**. The warning says so.
+* **No waiting on a dead server.** Clio gives up on an unreachable server
+  after `connect_timeout` seconds (default 10). It then does not contact
+  the server again for 60 seconds, or until you call `RefreshContext`. A
+  stage with hundreds of layers therefore pays the timeout once, not once
+  per layer.
+* **`offline` policy:** never contacts the server and uses what is on disk
+  (for historical pins, the version store first, then the workspace).
+* **`verify` policy:** the strict option. It never falls back, so a farm
+  job fails rather than rendering the wrong version.
+
+Answers that came from a fallback are not remembered, so Clio fetches the
+exact version as soon as the server is reachable again.
+
+## Sharing files with people who do not have access to your Perforce server
+
+| Recipient has | Can they open a stage with `clio:` paths? |
+|---|---|
+| The Clio plugin, and a copy of the files laid out as in the depot | **Yes.** Point a context at their copy (`depot=//imagine/main;root=/their/copy;policy=offline`). Every `clio:/assets/...` path maps to `<root>/assets/...`. |
+| Plain USD (no Clio plugin) | **No.** USD has no resolver for `clio:` paths, so those layers fail to load. |
+
+So today, files that use `clio:` paths need Clio to open them. The
+planned `clio usd localize` command (design §10.5) rewrites `clio:` paths
+to plain relative paths in a delivery copy, but it is not implemented yet.
+Whether layers should contain `clio:` paths at all, or plain paths that
+Clio enhances, is an open design decision (design §10.5).
 
 ---
 
@@ -297,6 +343,10 @@ code:
    their asset paths are `clio:` paths. The renderer must also accept the
    local path Clio returns. That is the normal case, but it hasn't been
    tested with specific renderers.
-6. **One plugin build per USD version.** A plugin built for USD 26.08 will
+6. **Without the Clio plugin, `clio:` paths do not load** (see
+   [Sharing files](#sharing-files-with-people-who-do-not-have-access-to-your-perforce-server)).
+7. **The connect time limit is Linux/macOS only** for now. On Windows,
+   an unreachable server takes the operating system's default timeout.
+8. **One plugin build per USD version.** A plugin built for USD 26.08 will
    not load in 25.08, and the other way round. Use the wheel or build that
    matches your USD.

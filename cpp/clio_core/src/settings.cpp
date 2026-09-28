@@ -128,6 +128,16 @@ Settings Settings::parse(const std::string& text) {
             }
         } else if (key == "policy") {
             settings.policy = parsePolicy(value);
+        } else if (key == "connect_timeout") {
+            try {
+                const long seconds = std::stol(value);
+                if (seconds < 0) {
+                    throw std::invalid_argument("negative");
+                }
+                settings.connection.connectTimeout = std::chrono::seconds(seconds);
+            } catch (const std::exception&) {
+                throw ConfigError("connect_timeout must be a number of seconds, got '" + value + "'");
+            }
         } else if (key == "timeout") {
             try {
                 const long seconds = std::stol(value);
@@ -173,6 +183,9 @@ std::string Settings::str() const {
     if (!connection.ticketFile.empty()) add("tickets", connection.ticketFile);
     if (pin != Pin::latest()) add("pin", pin.str());
     if (policy != Policy::Sync) add("policy", policyName(policy));
+    if (connection.connectTimeout != p4::ConnectionOptions{}.connectTimeout) {
+        add("connect_timeout", std::to_string(connection.connectTimeout.count()));
+    }
     if (connection.commandTimeout != p4::ConnectionOptions{}.commandTimeout) {
         add("timeout", std::to_string(connection.commandTimeout.count()));
     }
