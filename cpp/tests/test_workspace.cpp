@@ -114,3 +114,44 @@ TEST_CASE("have pin uses the workspace without syncing") {
     REQUIRE(resolved);
     CHECK(readFile(resolved->localPath) == "a1");
 }
+
+TEST_CASE("a moved label is fetched again by a new resolver") {
+    auto fx = fixtureOrSkip();
+    if (!fx) return;
+
+    fx->submit({{"a.usda", "v1"}}, "v1");
+    fx->connection().runOrThrow("tag", {"-l", "approved", "//depot/proj/..."});
+    const auto id = AssetIdentifier::parse("clio:/a.usda?label=approved");
+    {
+        AssetResolver resolver(fx->settings());
+        REQUIRE(resolver.resolve(id));
+        CHECK(readFile(resolver.resolve(id)->localPath) == "v1");
+    }
+
+    fx->submit({{"a.usda", "v2"}}, "v2");
+    fx->connection().runOrThrow("tag", {"-l", "approved", "//depot/proj/..."});
+    {
+        AssetResolver resolver(fx->settings()); // a new process, in effect
+        const auto resolved = resolver.resolve(id);
+        REQUIRE(resolved);
+        CHECK(readFile(resolved->localPath) == "v2");
+    }
+}
+
+TEST_CASE("verify policy uses a stored historical version without the server") {
+    auto fx = fixtureOrSkip();
+    if (!fx) return;
+
+    const auto v1 = fx->submit({{"a.usda", "v1"}}, "v1");
+    const auto id = AssetIdentifier::parse("clio:/a.usda?change=" + std::to_string(v1));
+    REQUIRE(AssetResolver(fx->settings()).resolve(id)); // fetch into the store
+
+    // The version store is organised per server, so keep the same port;
+    // the verify policy has no code path that contacts the server.
+    auto settings = fx->settings();
+    settings.policy = Policy::Verify;
+    AssetResolver verify(settings);
+    const auto resolved = verify.resolve(id);
+    REQUIRE(resolved);
+    CHECK(readFile(resolved->localPath) == "v1");
+}

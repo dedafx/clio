@@ -36,12 +36,17 @@ std::optional<ResolvedAsset> AssetResolver::_resolveUncached(const AssetIdentifi
 
     if (pin.isHistorical()) {
         asset.localPath = _workspace.versionStorePath(id, pin);
-        // Stored versions never change, so a stored file is always valid.
-        // TODO(design §9.2): labels can be moved by admins; revalidate them.
-        if (std::filesystem::exists(asset.localPath)) {
+        const bool stored = std::filesystem::exists(asset.localPath);
+        if (policy != Policy::Sync) {
+            return stored ? std::optional<ResolvedAsset>(asset) : std::nullopt;
+        }
+        // Change and revision pins name content that never changes, so a
+        // stored file is reused. A label can be moved by an admin, so it is
+        // fetched from the server again once per process (design §8.3).
+        if (stored && pin.kind() != Pin::Kind::Label) {
             return asset;
         }
-        if (policy != Policy::Sync || !_workspace.fetchVersion(id, pin)) {
+        if (!_workspace.fetchVersion(id, pin)) {
             return std::nullopt;
         }
         return asset;

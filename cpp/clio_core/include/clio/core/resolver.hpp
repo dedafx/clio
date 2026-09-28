@@ -25,11 +25,13 @@ struct ResolvedAsset {
 ///
 ///   latest   sync into the workspace (policy sync), then use the workspace file
 ///   have     use the workspace file; never contacts the server
-///   @change, @label, #rev
+///   @change, #rev
 ///            use the version store; fetch with p4 print if missing
+///   @label   use the version store, but fetch again once per process,
+///            because labels can be moved
 ///
-/// Thread-safe. Results are remembered until refresh(), so repeated resolves
-/// of the same identifier make no server calls.
+/// The server is the authority (design §8.3): results are remembered in
+/// memory only, until refresh(). Thread-safe.
 class AssetResolver {
 public:
     explicit AssetResolver(Settings settings);

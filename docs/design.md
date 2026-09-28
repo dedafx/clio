@@ -107,9 +107,8 @@ did.
 │             Assets · History · Drafts                                │
 │  Cross-cutting: Config · Errors · Events/Progress · Cancellation     │
 ├──────────────────────────────────────────────────────────────────────┤
-│  Local state:  StatusCache  (SQLite, per workspace)            §8.3  │
-│                HistoryCache (SQLite, per server + user)        §9    │
-│                ContentCache (files by digest: thumbnails, …)   §9    │
+│  Caches:       in memory only; server is authority         §8.3, §9  │
+│  Files:        version store (immutable versions for pins)     §10.4 │
 │  Views:        FileListView · HistoryView (UI-ready, no Qt)    §9    │
 ├──────────────────────────────────────────────────────────────────────┤
 │  Backend protocol (typed, tagged records in / out)                   │
@@ -444,25 +443,52 @@ least risk.
 * **Out-of-workspace retrieval** uses `p4 print -o`. It does not update the
   have list, so farm/cache exports do not affect the user's workspace state.
 
-### 8.3 Avoid scanning the disk: the local status cache
+### 8.3 Caching: the server is the authority
 
-The slowest artist-facing operation in Perforce is usually "what did I
-change?" (`p4 reconcile`/`status`). On large trees it walks the disk and may
-hash every file. Clio avoids it:
+**Decision (MVP): caches live in memory only.** There is no local
+database. The Perforce server is the only source of truth. Anything Clio
+remembers is a short-lived, per-process copy that can always be thrown away
+and fetched again. A persistent local store (for example SQLite) is
+considered only if measurements show the MVP is too slow (Backlog, §15).
 
-* **StatusCache** is a per-workspace SQLite database (WAL mode) that stores,
-  for each file, `depot_path, have_rev, size, mtime, digest, open_action,
-  lock_state`. It is filled from `p4 have` / `p4 fstat -Ol` (which returns
-  server digests and sizes) and updated by every Clio operation.
-* **Change detection** compares `(size, mtime)` from a fast directory scan
-  against the cache. Only files whose size or mtime changed are hashed.
-  Only those files are passed to a scoped `p4 reconcile` (or opened directly),
-  using `reconcile -m` so the C++ API also checks modtimes before digests.
-* **Optional file watcher** (`watchdog` / OS notifications) marks paths dirty
-  as they change, so `status` for an asset returns without scanning at all.
-* **UI reads** (lock badges, "out of date" indicators in Dedaverse) come from
-  the cache in microseconds. A background refresh keeps it current using the
-  cheap check in §8.1.7.
+Why: a persistent cache must be kept in sync with the server across
+sessions, processes and admin changes (obliterate, label moves, retypes),
+and a stale answer is worse than a slow one. With memory-only caches,
+restarting a tool always starts from the server, and there is no cache file
+to repair.
+
+**Staleness rules** (they apply to every cache in Clio, including the
+resolver's):
+
+1. **Actions always ask the server.** Lock, save, get, publish and branch
+   operations never decide from a cache. Perforce itself enforces locks,
+   have-lists and conflicts at the moment of the action.
+2. **Only immutable data is kept for the whole process.** A submitted
+   revision (`path#rev`), a change number snapshot (`@change`) and file
+   content at a revision never change in normal use, so they can be reused
+   until the process exits.
+3. **Mutable data is bounded by time.** Head revisions, `latest`,
+   lock/open state and **labels** (an admin can move them) are re-checked
+   after the polling interval (30–60 s, §9.4) or on explicit refresh. They
+   are never trusted longer than that.
+4. **Refresh is always available.** `refresh()` in Python and
+   `_RefreshContext` in USD drop cached answers, so the next request goes
+   to the server.
+5. **Nothing survives the process.** Except for the version store below,
+   every cache is lost at exit.
+
+**The version store is not a cache of server state.** Files fetched for
+historical pins (§10.4) are written to disk, because USD must read them as
+files. Only content that cannot change is reused across processes: a
+change-number snapshot or a file revision. Label pins are re-checked against
+the server once per process, because labels can move.
+
+**"What did I change?" without a local database.** Clio asks the server for
+the have-list and digests of the scope (`p4 fstat -Ol` on the asset folder)
+and runs a scoped `p4 reconcile -m` (modtime checked before digests). This
+work is always limited to the asset or folder in question, never the whole
+workspace. If that proves too slow on large assets, the first step is an
+in-memory index for the session; a persistent store comes after that.
 
 ### 8.4 Native code: one C++ core
 
@@ -508,7 +534,7 @@ repeated syncs of the same large files come from a local cache;
 ### 8.6 Python-level hygiene
 
 * **Lazy imports.** The `clio` CLI must start fast (target < 150 ms to first
-  output for `clio --help`). Import the C++ extension, SQLite, and the CLI framework
+  output for `clio --help`). Import the C++ extension and the CLI framework
   only in the code paths that need them. `deda.clio.__init__` uses
   module-level `__getattr__` for lazy re-exports.
 * **Slotted, frozen dataclasses** for records. Avoid per-file Python objects
@@ -577,7 +603,7 @@ UI arrives.
 | **Append-only** | A file's or folder's history (new revisions are only ever added). Integration (branch/merge) records. | Grows | **Cache, and fetch only the new part** using a high-water mark (§9.4). |
 | **Mostly immutable** | Submitted change descriptions (the owner can edit them with `p4 change -u`, admins with `-f`). | Rarely | Cache. Revalidate lazily (for example when displayed, if older than a day) and on explicit refresh. |
 | **Volatile** | Head revision of a path, who has it opened or locked, pending changes, shelves (drafts), stream specs. | Often | **Short TTL** (default 15–30 s) for visible rows only. Always refetched before an action. |
-| **Local** | Have revision, local modifications. | On local actions | From the per-workspace StatusCache (§8.3), not from the server. |
+| **Local** | Have revision, local modifications. | On local actions | Asked of the server (have-list) and the disk, scoped to the asset (§8.3). |
 | **Never cached** | Pending changelist numbers (they are renumbered on submit), protections, tickets. | — | Always live. |
 
 **Exceptions to "immutable".** Admins can rewrite history with
@@ -596,35 +622,33 @@ detect every case up front:
 
 | Tier | Contents | Lifetime | Location |
 |---|---|---|---|
-| **L1: in memory** | Model objects for the current session: recently viewed history, visible rows | Process | LRU, bounded by entry count |
-| **L2: HistoryCache** | Server metadata (revisions, changes, integrations, head info, watermarks) | Persistent | SQLite, one DB per server + Perforce user |
-| **L3: ContentCache** | File bytes fetched for display: thumbnails, previews, small sidecars, older versions opened for comparison | Persistent, size-limited LRU (e.g. 5 GB) | Folder keyed by server digest + size |
+| **HistoryCache (MVP)** | Server metadata (revisions, changes, integrations, head info, watermarks) and model objects for visible rows | Process | **In memory**, LRU bounded by entry count, one per server + Perforce user |
+| **ContentCache (backlog)** | File bytes fetched for display: thumbnails, previews, older versions opened for comparison | Size-limited LRU (e.g. 5 GB) | Folder keyed by server digest + size |
+| **Persistent HistoryCache (backlog)** | The same data, kept across sessions | Persistent | SQLite, only if measurements show it is needed (§8.3) |
 
 Notes:
+* **MVP: memory only.** The HistoryCache lives in each process and is lost
+  at exit (§8.3). The staleness rules in §8.3 apply: immutable rows are
+  reused, and mutable rows are re-checked after the polling interval.
 * **Why the HistoryCache is not per workspace.** History belongs to the
-  server, not to a workspace. One cache per machine, shared by the CLI and
-  every DCC, means a file's history is fetched once, whichever tool shows it
-  first. It lives in the user cache folder
-  (`<user cache dir>/clio/<server-id>/<p4user>/history.db`).
+  server, not to a workspace, so one cache per server serves every
+  workspace in the process.
 * **Why per Perforce user.** Protections can hide paths from some users. A
   cache must never show a user rows that were fetched with someone else's
   permissions, so caches are never shared across Perforce users.
 * **Server identity** comes from `p4 info` (server ID where set, otherwise
   server address plus server root), so that two servers never share a
   cache. *(To confirm against the target server's configuration, Q2.)*
-* **Local disk only.** SQLite must not be on a network share. It runs in WAL
-  mode with a busy timeout and short write transactions, so several
-  processes (CLI, Maya, Houdini) can read and write it at once. If the
-  optional per-machine agent (§8.1.2) is built later, it becomes the single
-  owner of the cache and the other processes ask it instead. The C++
-  resolver (§10.3) reads and writes the same databases, using the same
-  versioned schema.
+* **If a persistent store is added later** (backlog): SQLite on local disk
+  only, never on a network share, in WAL mode so several processes can use
+  it, with a versioned schema shared by Python and the C++ resolver.
 * **ContentCache is content-addressed.** A file's revision is identified by
   its server digest (MD5) and size. Identical content, such as a file copied
   to a branch, is stored once and never downloaded twice. Content comes from
   `p4 print -o`, which does not change the workspace.
 
-**HistoryCache schema (sketch)**
+**HistoryCache data model (sketch).** Shown as tables, but held in memory
+for the MVP. The same shape would become the schema of a persistent store.
 
 ```sql
 changes      (change INTEGER PRIMARY KEY, user, client, stream, time,
@@ -921,11 +945,11 @@ USD worker threads
 └──────────────────┬───────────────────────────┘
                    │ plain C++ API (no USD types)
 ┌──────────────────▼───────────────────────────┐
-│ clio_core  (static library, no USD, no Python)│
+│ clio_core (static library, no USD, no Python)│
 │   Config (reads the same clio.toml)          │
 │   P4 connection pool (P4API ClientApi)       │
 │   Pin + anchoring rules (§10.4)              │
-│   Manifest / status lookup (SQLite, §8.3)    │
+│   In-memory resolve cache (§8.3 rules)       │
 │   Miss coalescer: single-flight + batching   │
 │   Sync / print / edit / add / lock ops       │
 │   Workspace lock (shared with Python Clio)   │
@@ -947,11 +971,13 @@ USD worker threads
 **How a resolve works**
 
 1. **Fast path (no server).** `_Resolve` works out the depot path and pin
-   (context + anchor + query) and looks it up in the in-memory manifest,
-   which is loaded from the workspace's StatusCache and kept for the life of
-   the context. If the file is present at the required revision, the local
-   path is returned. The target is microseconds, so composition speed is
-   unchanged when everything is up to date.
+   (context + anchor + query) and looks it up in the resolver's in-memory
+   cache. Following §8.3, immutable pins (`@change`, `#rev`) are cached for
+   the process. `latest` and labels are cached until the polling interval
+   passes or the context is refreshed. A hit returns the local path in
+   microseconds, so composition speed is unchanged when everything is up
+   to date. *(Scaffold: results are kept until `refresh`; the time limit
+   comes with phase 3.)*
 2. **Miss (file missing or stale).** The request goes to the **coalescer**:
    * *Single-flight:* concurrent requests for the same file share one fetch.
    * *Batching window* (for example 10–30 ms, configurable): misses from
@@ -994,9 +1020,9 @@ work on the same workspace at the same time (a DCC resolving while the
 artist runs `clio get`):
 * Both read the same config (`clio.toml`, §6). The C++ side uses a TOML
   parser such as toml++ (header-only).
-* Both use the same SQLite caches (§8.3, §9.3). The schema is versioned,
-  documented in one place, and covered by cross-language tests. The C++ side
-  writes only through short WAL transactions.
+* Caches are per process and in memory (§8.3), so there is no shared
+  cache file to keep consistent. Both sides get their answers from the
+  server, which keeps them in agreement.
 * Workspace-changing operations (sync, edit, add) take a **per-workspace
   file lock**, shared by Python and C++, so two processes never sync the
   same workspace at once. Read-only work (version-store prints, metadata)
@@ -1044,8 +1070,7 @@ symbol.
   would need its own per-USD build.
 * **Build and distribution:**
   * CMake project under `cpp/`.
-  * `clio_core` links P4API (`libclient`, `librpc`, `libsupp`, plus OpenSSL)
-    and SQLite.
+  * `clio_core` links P4API (`libclient`, `librpc`, `libsupp`, plus OpenSSL).
   * `clioUsd` links `clio_core` and USD (`ar`, `tf`, `vt`). It is built
     against standalone OpenUSD: **26.08** (primary) and **25.08 or later**.
     The `ArResolver` API is identical between 25.08 and 26.08 (verified in
@@ -1258,12 +1283,14 @@ loaded lazily, or `argparse` for zero dependencies.)*
 | **0 — Scaffold** *(done)* | CMake project; `clio_core` (P4API connections, pins, `clio:` identifiers, settings, resolve for latest/have/historical pins, version store); `deda.clio._core` (nanobind, abi3); the `clioUsd` resolver plugin; C++, Python and USD tests against a throwaway `p4d`. See [building.md](building.md). |
 | **1 — Core workflow** | Python services over `CoreBackend`: connect/login/setup, get (parallel), lock/unlock, save, status, history backed by the HistoryCache with watermark refresh (§9.3–9.4), CLI for these. Baseline benchmarks. |
 | **2 — Branching** | Streams/task streams, switch, update/publish with binary conflict handling, cross-branch lock check, drafts (shelves). |
-| **3 — Performance** | Connection pool and miss coalescer in `clio_core`; StatusCache (shared SQLite) as the resolver fast path; optional watcher; C++ hashing/scan/diff if benchmarks justify it. |
+| **3 — Performance** | Connection pool and miss coalescer in `clio_core`; time-bounded in-memory caches (§8.3); C++ hashing/scan/diff if benchmarks justify it. Measure; add a persistent store only if the numbers call for it. |
 | **4 — USD completion** | Settle the resolved-path form (§10.4); write side (edit/lock on save, §10.6); revision-based timestamps; `deda.clio.usd.prepare` (option A); CI builds against USD 26.08 and 25.08. |
 | **5 — Ecosystem** | UI view models (`FileListView`, `HistoryView`) with the request pipeline, ContentCache (§9.5), asset resolver plugins, validation hooks, `clio doctor`. Dedaverse/DCC integration when targeted. |
 
 ### Backlog
 
+* **Persistent local cache (SQLite)** for status and history, only if
+  in-memory caching proves too slow (§8.3).
 * **Thumbnails and previews** (§9.8).
 * **Push notifications** for instant UI refresh (§9.4). MVP polls every
   30–60 s.
@@ -1296,6 +1323,9 @@ loaded lazily, or `argparse` for zero dependencies.)*
 
 ### Decided
 
+* Caching: in memory only for the MVP; the server is the authority
+  (§8.3). A persistent SQLite store is in the backlog, only if performance
+  requires it.
 * Targets: Python 3.13; standalone USD 26.08, plus USD 25.08 or later; no
   DCCs yet.
 * Native code: a single C++ core (`clio_core`) for Python (nanobind) and
