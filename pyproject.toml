@@ -1,0 +1,37 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "nanobind>=2.4"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "deda-clio"
+version = "0.1.0"
+description = "Artist-friendly Perforce asset access, with a USD asset resolver"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.13"
+classifiers = [
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+    "Topic :: Software Development :: Version Control",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+build-dir = "build/{wheel_tag}"
+wheel.packages = ["src/deda"]
+# One abi3 wheel for CPython 3.13 and later.
+wheel.py-api = "cp313"
+
+[tool.scikit-build.cmake.define]
+CLIO_BUILD_PYTHON = "ON"
+CLIO_BUILD_TESTS = "OFF"
+CLIO_BUILD_USD = { env = "CLIO_BUILD_USD", default = "OFF" }
+CLIO_P4API_ROOT = { env = "CLIO_P4API_ROOT", default = "" }
+pxr_DIR = { env = "PXR_ROOT", default = "" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]

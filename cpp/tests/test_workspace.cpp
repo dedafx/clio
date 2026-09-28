@@ -1,0 +1,116 @@
+// Integration tests against a throwaway p4d. Skipped without $CLIO_TEST_P4D.
+
+#include "p4d_fixture.hpp"
+
+#include "clio/core/error.hpp"
+#include "clio/core/resolver.hpp"
+
+#include <doctest/doctest.h>
+
+#include <fstream>
+#include <sstream>
+
+using namespace clio::core;
+using clio::test::P4dFixture;
+
+namespace {
+
+std::string readFile(const std::filesystem::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    std::ostringstream out;
+    out << in.rdbuf();
+    return out.str();
+}
+
+std::unique_ptr<P4dFixture> fixtureOrSkip() {
+    auto fx = P4dFixture::create();
+    if (!fx) {
+        MESSAGE("CLIO_TEST_P4D is not set; skipping Perforce integration test");
+    }
+    return fx;
+}
+
+} // namespace
+
+TEST_CASE("connection runs tagged commands") {
+    auto fx = fixtureOrSkip();
+    if (!fx) return;
+
+    const auto info = fx->connection().runOrThrow("info");
+    REQUIRE(info.records.size() == 1);
+    CHECK(info.records[0].at("userName") == "clio_tester");
+
+    const auto bad = fx->connection().run("fstat", {"//depot/proj/does-not-exist"});
+    CHECK(bad.records.empty());
+    CHECK_THROWS_AS(fx->connection().runOrThrow("no-such-command"), P4Error);
+}
+
+TEST_CASE("latest syncs into the workspace") {
+    auto fx = fixtureOrSkip();
+    if (!fx) return;
+
+    fx->submit({{"props/crate/crate.usda", "#usda 1.0\n"}}, "crate v1");
+    fx->clearWorkspace();
+
+    AssetResolver resolver(fx->settings());
+    const auto id = AssetIdentifier::parse("clio:/props/crate/crate.usda");
+    const auto resolved = resolver.resolve(id);
+    REQUIRE(resolved);
+    CHECK(resolved->localPath == fx->workspaceRoot() / "props/crate/crate.usda");
+    CHECK(resolved->depotPath == "//depot/proj/props/crate/crate.usda");
+    CHECK(readFile(resolved->localPath) == "#usda 1.0\n");
+
+    CHECK_FALSE(resolver.resolve(AssetIdentifier::parse("clio:/props/missing.usda")));
+}
+
+TEST_CASE("historical pins go to the version store and leave the workspace alone") {
+    auto fx = fixtureOrSkip();
+    if (!fx) return;
+
+    const auto v1 = fx->submit({{"props/crate/crate.usda", "v1"}}, "v1");
+    fx->submit({{"props/crate/crate.usda", "v2"}}, "v2");
+
+    AssetResolver resolver(fx->settings());
+    const auto atV1 = resolver.resolve(
+        AssetIdentifier::parse("clio:/props/crate/crate.usda?change=" + std::to_string(v1)));
+    REQUIRE(atV1);
+    CHECK(readFile(atV1->localPath) == "v1");
+    CHECK(atV1->localPath.string().find(fx->versionStore().string()) == 0);
+
+    const auto rev1 = resolver.resolve(AssetIdentifier::parse("clio:/props/crate/crate.usda?rev=1"));
+    REQUIRE(rev1);
+    CHECK(readFile(rev1->localPath) == "v1");
+
+    CHECK(readFile(fx->workspaceRoot() / "props/crate/crate.usda") == "v2");
+}
+
+TEST_CASE("verify and offline policies never contact the server") {
+    auto fx = fixtureOrSkip();
+    if (!fx) return;
+
+    fx->submit({{"a.usda", "a"}}, "a");
+    fx->clearWorkspace();
+
+    auto settings = fx->settings();
+    settings.policy = Policy::Verify;
+    AssetResolver verify(settings);
+    CHECK_FALSE(verify.resolve(AssetIdentifier::parse("clio:/a.usda")));
+
+    settings.policy = Policy::Offline;
+    settings.connection.port = "localhost:1"; // would fail if contacted
+    AssetResolver offline(settings);
+    CHECK_FALSE(offline.resolve(AssetIdentifier::parse("clio:/a.usda")));
+}
+
+TEST_CASE("have pin uses the workspace without syncing") {
+    auto fx = fixtureOrSkip();
+    if (!fx) return;
+
+    fx->submit({{"a.usda", "a1"}}, "a1");
+    auto settings = fx->settings();
+    settings.pin = Pin::have();
+    AssetResolver resolver(settings);
+    const auto resolved = resolver.resolve(AssetIdentifier::parse("clio:/a.usda"));
+    REQUIRE(resolved);
+    CHECK(readFile(resolved->localPath) == "a1");
+}

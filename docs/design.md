@@ -2,10 +2,22 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.1 — for review |
+| **Status** | Draft v0.2. The C++ core, Python bindings and USD resolver are scaffolded (see [building.md](building.md)). |
 | **Package** | `deda.clio` (Python namespace package) |
-| **Consumers** | Dedaverse, Imagine, future Deda projects, DCC plugins |
+| **Targets** | Python 3.13 · USD 26.08 (primary) and USD 25.08 or later · no DCCs yet |
+| **Consumers** | Standalone Python, the `clio` CLI, and USD. Dedaverse, Imagine and DCC integrations are later work. |
 | **Backing store** | Perforce server (`p4d`), streams depots |
+
+> **Decisions that shape v0.2** (they replace anything older in this document):
+> * **Targets:** Python 3.13 and standalone USD 26.08, with USD 25.08 or
+>   later also supported (the Ar resolver API is identical between them).
+>   No DCC is targeted yet, so DCC-specific builds, loading tests and
+>   fallbacks are deferred.
+> * **The core is C++ (`clio_core`)**, built on the Perforce C++ API. It is
+>   used by the USD resolver plugin and, through nanobind, by Python
+>   (`deda.clio._core`). P4Python, the `p4 -G` fallback and the Rust
+>   extension are dropped.
+> * **No Dedaverse or Imagine integration yet** (§14).
 
 ---
 
@@ -24,10 +36,10 @@ artist vocabulary:
 * **Share drafts** of work in progress without submitting.
 * See **who has what locked**, and **history** for any asset.
 
-Python is the main interface. Performance-critical paths either run inside
-native code that already exists (the P4 C++ API through P4Python, and the
-server's parallel transfer) or in a small native extension of our own
-(`deda.clio._native`) where measurements show it pays off.
+Python is the main interface. Performance-critical work runs in C++:
+`clio_core` talks to Perforce through the P4 C++ API and is shared by the
+Python extension (`deda.clio._core`) and the USD resolver plugin. The
+server's parallel transfer does the heavy byte moving.
 
 ## 2. Goals and non-goals
 
@@ -99,12 +111,13 @@ did.
 │                HistoryCache (SQLite, per server + user)        §9    │
 │                ContentCache (files by digest: thumbnails, …)   §9    │
 │  Views:        FileListView · HistoryView (UI-ready, no Qt)    §9    │
-│  Native (opt): deda.clio._native — hashing, FS scan, diffing (§8.4)  │
 ├──────────────────────────────────────────────────────────────────────┤
 │  Backend protocol (typed, tagged records in / out)                   │
-│   ├─ P4PythonBackend   (default; P4 C++ API, persistent connections) │
-│   ├─ P4CliBackend      (fallback; `p4 -G` marshalled subprocess)     │
-│   └─ FakeBackend       (in-memory, for unit tests)                   │
+│   ├─ CoreBackend  (default; deda.clio._core → clio_core, C++, P4API) │
+│   └─ FakeBackend  (in-memory, for unit tests)                        │
+├──────────────────────────────────────────────────────────────────────┤
+│  clio_core (C++): connections · pins · clio: ids · resolve · caches  │
+│  also linked into the clioUsd resolver plugin (§10.3)                │
 └───────────────┬──────────────────────────────────────────────────────┘
                 │ P4 protocol (TCP/SSL)
         ┌───────▼────────┐        ┌─────────────────┐
@@ -129,16 +142,11 @@ did.
 
 ### 4.2 Why a backend abstraction
 
-* **DCC compatibility.** P4Python is a compiled extension built for one
-  Python minor version. DCCs ship their own Pythons (Maya, Houdini, Blender,
-  and Unreal all differ). When P4Python is not available for an interpreter,
-  `P4CliBackend` falls back to `p4 -G`, which outputs marshalled Python dicts,
-  so no text parsing is needed. It is slower (a process spawn plus a
-  connection per call) but always works.
+* **One implementation of the rules.** `CoreBackend` calls `clio_core`, the
+  same C++ code the USD resolver uses, so Python and USD agree on how every
+  path resolves and how Perforce is called.
 * **Testing.** Service logic is tested against `FakeBackend` in milliseconds.
   Integration tests run against a real, throwaway `p4d` (§13).
-* **Future.** A different transport (for example a native backend written
-  directly against the P4 C++ API) can be added without API changes.
 
 ### 4.3 Package layout
 
@@ -149,7 +157,7 @@ question Q1: confirm this matches how Dedaverse declares `deda`.)*
 
 ```
 clio/
-├── pyproject.toml              # build backend: maturin (if _native) or hatchling
+├── pyproject.toml              # build backend: scikit-build-core (CMake) + nanobind
 ├── src/deda/clio/
 │   ├── __init__.py             # public API; lazy re-exports
 │   ├── _version.py
@@ -173,21 +181,19 @@ clio/
 │   ├── usd/                    # USD prefetch, pins, localize (§10); imports pxr lazily
 │   ├── backends/
 │   │   ├── base.py             # Backend Protocol, Record types
-│   │   ├── p4python.py
-│   │   ├── p4cli.py
+│   │   ├── core.py             # CoreBackend over deda.clio._core
 │   │   └── fake.py
 │   ├── cli/
 │   │   ├── __init__.py
 │   │   └── __main__.py         # `python -m deda.clio.cli`, entry point `clio`
-│   └── _native.pyi             # type stubs for the optional extension
-├── cpp/                        # CMake project (§10.3)
-│   ├── clio_core/              # C++ Perforce + resolution core (no USD, no Python)
-│   ├── clio_usd/               # `clio:` ArResolver plugin, built per USD build
-│   └── tests/                  # C++ unit + integration tests (throwaway p4d)
-├── native/                     # Python extension deda.clio._native (phase 3, §8.4)
-├── tests/
-│   ├── unit/                   # FakeBackend
-│   └── integration/            # real p4d via rsh: port
+│   └── _core.*.so / .pyd       # nanobind extension over clio_core (abi3, Python ≥ 3.13)
+├── CMakeLists.txt · CMakePresets.json · cmake/FindP4API.cmake
+├── cpp/
+│   ├── clio_core/              # C++ core: P4API connections, pins, clio: ids, resolve (no USD, no Python)
+│   ├── python/                 # nanobind module deda.clio._core
+│   ├── clio_usd/               # clioUsd: the clio: ArResolver plugin, built per USD version
+│   └── tests/                  # C++ tests (doctest) incl. a throwaway p4d
+├── tests/python/               # pytest, incl. USD stage tests
 └── docs/
 ```
 
@@ -377,7 +383,7 @@ art work with branching. Clio mitigates this:
 * This check is a batched metadata query (one call for all paths across all
   related streams), so it adds one server round trip, not one per file.
 
-*(Open question Q5: should this be advisory or enforced by default?)*
+*(Open question Q4: should this be advisory or enforced by default?)*
 
 ## 8. Performance
 
@@ -392,9 +398,10 @@ least risk.
 
 ### 8.1 Talk to Perforce efficiently
 
-1. **Use P4Python, not subprocess `p4`.** P4Python is a thin binding over the
-   official P4 C++ API. It returns tagged dicts directly, with no text
-   parsing and no process spawn.
+1. **Use the P4 C++ API directly, not subprocess `p4`.** `clio_core` links
+   P4API and receives tagged records directly, with no text parsing and no
+   process spawn. The Python bindings release the GIL for every call that
+   can touch the network or disk.
 2. **Keep connections open.** Each connect is a TCP (and possibly SSL)
    handshake plus protocol negotiation. A `Session` keeps a pool of
    long-lived connections (for example 1 + N workers). Commands reuse them.
@@ -403,19 +410,18 @@ least risk.
    cache for the CLI and all DCCs on a machine. This is deferred until
    measurements justify it.)*
 3. **Batch everything.** One `fstat`/`edit`/`add` call for 5,000 files, not
-   5,000 calls. Very large file sets go through `-x argfile` (or P4Python
-   `input`) to avoid command-line length limits, and are chunked for memory.
+   5,000 calls. Very large file sets go through `-x argfile` (or command
+   input) to avoid command-line length limits, and are chunked for memory.
 4. **Ask only for what you need.** `p4 fstat -T field,list` limits returned
    fields, and `-m` limits rows. Scope every command to the narrowest path
    (the asset folder), never `//...`.
 5. **Stream large results.** Use a `P4.OutputHandler` to process records as
    they arrive, instead of building a list of a million dicts in memory.
-6. **One connection per thread.** A `P4` object must not be used from two
-   threads at the same time. The pool hands out connections, and parallel
-   *metadata* work (for example status for several assets) runs on separate
-   connections. *(To verify: P4Python's GIL behaviour during `run()` in the
-   version we pin. If it holds the GIL, parallel metadata work moves to a
-   process pool or the native layer.)*
+6. **One connection per thread.** A P4API `ClientApi` must not be used
+   from two threads at the same time. `clio_core` hands out connections
+   from a pool (the scaffold serializes on one connection per workspace),
+   and parallel *metadata* work runs on separate connections, with no GIL
+   involved.
 7. **Cheap "anything new?" checks.** Before a costly refresh, ask for the
    latest change affecting a path (`p4 changes -m1 -s submitted
    //path/...`). If it has not moved since the last refresh, skip the
@@ -458,44 +464,29 @@ hash every file. Clio avoids it:
   the cache in microseconds. A background refresh keeps it current using the
   cheap check in §8.1.7.
 
-### 8.4 Native extension (`deda.clio._native`), used where it measurably helps
+### 8.4 Native code: one C++ core
 
-Rule: **no native code without a benchmark showing a real gain** (for
-example ≥3× on a realistic workload). Likely candidates, in order:
+**Decision:** all native code is C++ in `clio_core`, shared by the Python
+extension and the USD resolver. There is no Rust.
 
-| Candidate | Why Python is slow here | Native approach |
+* **Python bindings:** nanobind, built as one stable-ABI (`abi3`) module for
+  CPython 3.13 and later, and packaged with scikit-build-core.
+* **What goes into C++:** Perforce access (P4API), identifier and pin rules,
+  resolution, caches, and the hot paths from the table below. Python keeps
+  the workflow logic, the CLI and anything that is not performance-bound.
+* **Rule:** move more into C++ only when a benchmark shows a real gain (for
+  example ≥3× on a realistic workload).
+
+| Candidate | Why Python is slow here | C++ approach |
 |---|---|---|
-| **Parallel file hashing (MD5)** of multi-GB files, to compare with server digests | Per-file I/O and hashing in one thread. `hashlib` releases the GIL, but orchestration and small reads add overhead. | Rust: memory-mapped / large-buffer reads, a thread pool, GIL released for the whole batch. |
-| **Directory scan + stat** of 100k+ files | `os.scandir` is decent, but building Python objects per entry adds up. | Rust (`jwalk`-style parallel walk). Returns only the *changed* entries compared with a snapshot passed in from the cache. |
-| **Manifest diffing** (have list vs disk vs server) | Large dict/set operations with many small objects. | Rust sorted-merge on compact arrays. Only the diff crosses into Python. |
-| **Compact record decoding** for very large `fstat` results | Dict per record. | Deferred. Only if profiling shows it. |
+| **Parallel file hashing (MD5)** of multi-GB files, to compare with server digests | Per-file I/O and hashing in one thread, plus orchestration overhead | Large-buffer reads on a thread pool, with the GIL released for the whole batch |
+| **Directory scan + stat** of 100k+ files | Building Python objects per entry adds up | Parallel walk that returns only entries changed since a snapshot from the cache |
+| **Manifest diffing** (have list vs disk vs server) | Large dict/set operations with many small objects | Sorted merge on compact arrays. Only the diff crosses into Python. |
 
-**Technology recommendation: Rust + PyO3, built with maturin, using the
-stable ABI (`abi3`).**
-
-* `abi3` wheels are built **once per OS/architecture** and load in every
-  CPython ≥ the minimum version. That is the key benefit for DCC embedding,
-  where each DCC has a different Python. A version-specific `.pyd` would
-  need a build matrix of DCC × Python × OS.
-* PyO3 releases the GIL easily (`py.allow_threads`) and gives memory safety
-  for file-walking and threading code.
-* The extension is **optional**: every function in `_native` has a pure-Python
-  fallback in the same module interface, and `deda.clio` checks at import
-  time which one is available. A missing or incompatible binary never breaks
-  Clio. It only makes it slower.
-* **Do not** reimplement the Perforce protocol, and do not bind the P4 C++ API
-  from Rust in v1. P4Python already does that. If P4Python's per-Python-
-  version packaging becomes the blocker for DCCs, the next step is a
-  nanobind/C++ backend against the P4 C++ API built with the limited API.
-  That is a planned escape hatch, not a v1 task.
-
-> **Update after the USD decision (§10.2):** Clio now has a C++ core
-> (`clio_core`) that already wraps P4API, hashing, and SQLite for the
-> resolver. Adding Rust for `_native` would mean two native languages to
-> build and maintain. The alternative is to expose `clio_core` to Python
-> with nanobind and drop Rust. The trade-off is that nanobind supports the
-> stable ABI only from Python 3.12, so older DCC Pythons would need a build
-> per Python version. *(Open question Q11.)*
+* **Symbol isolation:** P4API and OpenSSL are linked statically and hidden
+  (`-fvisibility=hidden`, `--exclude-libs,ALL` on Linux). The Python module
+  and the USD plugin each carry a private copy, so they can be loaded in the
+  same process as each other and as Python's own OpenSSL.
 
 ### 8.5 Server and depot recommendations
 
@@ -512,12 +503,12 @@ check and a recommended **typemap** for the admins:
 Also recommended: **P4 Proxy** (or edge servers) for remote artists, so
 repeated syncs of the same large files come from a local cache;
 `net.parallel.max` enabled; and adequate `lbr` storage on fast disks.
-*(Q3: What server version and topology do we target?)*
+*(Q2: What server version and topology do we target?)*
 
 ### 8.6 Python-level hygiene
 
 * **Lazy imports.** The `clio` CLI must start fast (target < 150 ms to first
-  output for `clio --help`). Import P4Python, SQLite, and the CLI framework
+  output for `clio --help`). Import the C++ extension, SQLite, and the CLI framework
   only in the code paths that need them. `deda.clio.__init__` uses
   module-level `__getattr__` for lazy re-exports.
 * **Slotted, frozen dataclasses** for records. Avoid per-file Python objects
@@ -620,7 +611,7 @@ Notes:
   permissions, so caches are never shared across Perforce users.
 * **Server identity** comes from `p4 info` (server ID where set, otherwise
   server address plus server root), so that two servers never share a
-  cache. *(To confirm against the target server's configuration, Q3.)*
+  cache. *(To confirm against the target server's configuration, Q2.)*
 * **Local disk only.** SQLite must not be on a network share. It runs in WAL
   mode with a busy timeout and short write transactions, so several
   processes (CLI, Maya, Houdini) can read and write it at once. If the
@@ -1011,9 +1002,12 @@ artist runs `clio get`):
   same workspace at once. Read-only work (version-store prints, metadata)
   does not take it.
 
-**Isolating Perforce's OpenSSL from the DCC's.** This is the main risk of
-running Perforce in-process. P4API links OpenSSL, and DCCs load their own,
-often different, OpenSSL versions.
+**Isolating Perforce's OpenSSL from the host's.** This is the main risk of
+running Perforce in-process. P4API links OpenSSL, and the host process
+(Python's `ssl` module today, DCCs later) loads its own, often different,
+OpenSSL version. *Status:* implemented and checked on Linux in the
+scaffold. Neither `_core.abi3.so` nor `clioUsd.so` exports any OpenSSL
+symbol.
 * **Linux:** link P4API and OpenSSL **statically** into `clio_usd`, build
   with `-fvisibility=hidden`, and hide all bundled symbols
   (`-Wl,--exclude-libs,ALL` plus a version script exporting only the USD
@@ -1023,9 +1017,9 @@ often different, OpenSSL versions.
   loading the wrong `libssl-*.dll`.
 * **macOS:** two-level namespaces isolate symbols. Link statically and hide
   symbols as on Linux.
-* A **load test per DCC** (open an SSL connection from the resolver inside
-  the running DCC, while the DCC's own SSL features are active) is part of
-  the release checklist for each supported build.
+* When DCCs are targeted (not yet), a **load test per DCC** (open an SSL
+  connection from the resolver inside the running DCC, while the DCC's own
+  SSL features are active) joins the release checklist for each build.
 
 **ArResolver methods Clio implements:**
 
@@ -1052,10 +1046,13 @@ often different, OpenSSL versions.
   * CMake project under `cpp/`.
   * `clio_core` links P4API (`libclient`, `librpc`, `libsupp`, plus OpenSSL)
     and SQLite.
-  * `clio_usd` links `clio_core` and USD (`ar`, `sdf`, `tf`, `vt`, `plug`,
-    `js`), built against each target DCC's USD SDK (Houdini HDK, Maya USD
-    devkit, Omniverse, OpenUSD standalone), because the USD C++ ABI and
-    namespace differ per build.
+  * `clioUsd` links `clio_core` and USD (`ar`, `tf`, `vt`). It is built
+    against standalone OpenUSD: **26.08** (primary) and **25.08 or later**.
+    The `ArResolver` API is identical between 25.08 and 26.08 (verified in
+    the source), so one source tree serves both. Only the binary differs,
+    because the USD C++ ABI changes between releases, so each USD version
+    needs its own build of the plugin. CMake refuses USD older than 25.08.
+    DCC USD builds come later.
   * Registration: `PXR_PLUGINPATH_NAME` pointing at the plugin's
     `plugInfo.json`. `clio doctor` checks that the plugin loads and that the
     `clio` scheme is registered (`Ar.GetRegisteredURISchemes()`).
@@ -1208,7 +1205,7 @@ clio usd localize LAYER --dest DIR   # rewrite clio: paths for delivery (§10.5)
 ```
 
 Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
-`revert`, `shelve`). *(Q4: CLI framework. The recommendation is `click`,
+`revert`, `shelve`). *(Q3: CLI framework. The recommendation is `click`,
 loaded lazily, or `argparse` for zero dependencies.)*
 
 ## 13. Testing strategy
@@ -1221,10 +1218,18 @@ loaded lazily, or `argparse` for zero dependencies.)*
   no admin setup, and runs on CI (Linux, Windows, macOS). The fixtures create
   a streams depot, the typemap from §8.5, and multiple users so locks and
   conflicts can be tested.
-* **Backend parity tests** run the same integration suite against both
-  `P4PythonBackend` and `P4CliBackend`.
-* **Benchmarks** (§8.7) and **native/pure parity tests** for `_native`.
-* **USD tests** use `usd-core` from PyPI. Generated shot/asset layer trees
+* **C++ tests** (`cpp/tests`, doctest) cover `clio_core` directly,
+  including a throwaway `p4d`. **Python tests** (`tests/python`, pytest)
+  cover the bindings and run the same kind of server scenarios.
+* **Test server note:** `p4d` 2026.1 requires every user to have a
+  password, even on a brand-new server. The fixtures set one and log in
+  through Clio's prompt callback, then use a ticket file.
+* **Benchmarks** (§8.7).
+* **USD tests** open real stages through the `clioUsd` plugin, in a
+  subprocess per scenario (USD reads `PXR_PLUGINPATH_NAME` only once). They
+  need a USD build with Python bindings for Python 3.13; `usd-core` wheels
+  have no C++ headers, so they cannot be used to build the plugin.
+  Generated shot/asset layer trees
   (sublayers, references, payloads, variants, expression variables, UDIMs)
   are submitted to the test `p4d`, and the tests check that `prepare` syncs
   exactly the expected files at the expected revisions, in the expected
@@ -1233,9 +1238,11 @@ loaded lazily, or `argparse` for zero dependencies.)*
 
 ## 14. Integration with Dedaverse, Imagine, and DCCs
 
-* Clio depends only on P4Python (optional), `tomli` (py < 3.11), and the
-  optional native wheel. It never imports Dedaverse or Imagine. They depend
-  on Clio.
+> **Deferred.** No Dedaverse, Imagine or DCC integration is targeted yet.
+> The points below keep Clio ready for it.
+
+* Clio's runtime dependency is its own compiled extension (which contains
+  P4API). It never imports Dedaverse or Imagine. They depend on Clio.
 * Extension points use **entry points**: `deda.clio.resolvers` (asset
   resolvers) and `deda.clio.hooks` (pre-save validation, for example "no
   absolute texture paths", "file naming convention"). Hooks run
@@ -1248,13 +1255,12 @@ loaded lazily, or `argparse` for zero dependencies.)*
 
 | Phase | Scope |
 |---|---|
-| **0 — Skeleton** | `pyproject`, namespace package, CI, `FakeBackend`, `p4d` test fixture, error model, config. |
-| **1 — Core workflow** | `P4PythonBackend` + pool, connect/login/setup, get (parallel), lock/unlock, save, status (no cache yet), history backed by the HistoryCache with watermark refresh (§9.3–9.4), CLI for these. Baseline benchmarks. |
+| **0 — Scaffold** *(done)* | CMake project; `clio_core` (P4API connections, pins, `clio:` identifiers, settings, resolve for latest/have/historical pins, version store); `deda.clio._core` (nanobind, abi3); the `clioUsd` resolver plugin; C++, Python and USD tests against a throwaway `p4d`. See [building.md](building.md). |
+| **1 — Core workflow** | Python services over `CoreBackend`: connect/login/setup, get (parallel), lock/unlock, save, status, history backed by the HistoryCache with watermark refresh (§9.3–9.4), CLI for these. Baseline benchmarks. |
 | **2 — Branching** | Streams/task streams, switch, update/publish with binary conflict handling, cross-branch lock check, drafts (shelves). |
-| **3 — Performance** | StatusCache, cheap change checks, optional watcher. Profile, then `_native` (Rust/PyO3 abi3) for hashing/scan/diff if the benchmarks justify it. |
-| **4 — USD prefetch** | `deda.clio.usd.prepare` (option A, §10.2): wave walker, pins, `payloads`/asset policies, version store for historical pins, `prepare_for_edit`, `clio usd prepare/localize` CLI. |
-| **5 — Ecosystem** | UI view models (`FileListView`, `HistoryView`) with the request pipeline, ContentCache (§9.5), asset resolver plugins, validation hooks, `P4CliBackend` for DCC fallback, `clio doctor`, Dedaverse integration. |
-| **6 — USD resolver** | C++ `clio_core` (P4API pool, pins, manifest, coalescer, workspace lock) and the `clio_usd` `clio:` resolver plugin (§10.3), built for the first target USD. Starts with a prototype that settles the resolved-path form (§10.4) and the OpenSSL isolation per DCC. |
+| **3 — Performance** | Connection pool and miss coalescer in `clio_core`; StatusCache (shared SQLite) as the resolver fast path; optional watcher; C++ hashing/scan/diff if benchmarks justify it. |
+| **4 — USD completion** | Settle the resolved-path form (§10.4); write side (edit/lock on save, §10.6); revision-based timestamps; `deda.clio.usd.prepare` (option A); CI builds against USD 26.08 and 25.08. |
+| **5 — Ecosystem** | UI view models (`FileListView`, `HistoryView`) with the request pipeline, ContentCache (§9.5), asset resolver plugins, validation hooks, `clio doctor`. Dedaverse/DCC integration when targeted. |
 
 ### Backlog
 
@@ -1268,35 +1274,33 @@ loaded lazily, or `argparse` for zero dependencies.)*
 1. **Namespace:** Does Dedaverse use a PEP 420 implicit `deda` namespace
    (no `deda/__init__.py`)? If it ships a `deda/__init__.py`, it must be
    removed or turned into a `pkgutil` namespace in both projects.
-2. **Python targets:** Minimum Python version, and which DCCs (and their
-   Python versions) must be supported at launch? This sets the `abi3` floor
-   and whether `P4CliBackend` is needed in Phase 1.
-3. **Server:** Existing Perforce server version and topology (single server,
+2. **Server:** Existing Perforce server version and topology (single server,
    proxy, edge)? Is there already a streams depot, or is this greenfield? Can
    we set `net.parallel.max` and the typemap?
-4. **CLI framework:** `click` (nicer UX, one dependency) or `argparse` (no
+3. **CLI framework:** `click` (nicer UX, one dependency) or `argparse` (no
    dependencies)?
-5. **Cross-branch locking:** Advisory warning or hard block by default?
-6. **Vocabulary:** Do "save / get / lock / draft / publish" suit your
+4. **Cross-branch locking:** Advisory warning or hard block by default?
+5. **Vocabulary:** Do "save / get / lock / draft / publish" suit your
    artists, or do they already know some Perforce terms that should stay?
-7. **Asset identity:** Is an asset a folder (all files under a path), or is
+6. **Asset identity:** Is an asset a folder (all files under a path), or is
    it defined by Dedaverse/Imagine metadata (for example a USD asset or a
    database ID)? This decides how much of the resolver ships in Clio itself.
-8. **USD builds:** Which DCC and USD build should the resolver plugin
-   (§10.3) target first, and which follow? Is there already a primary
-   resolver in use (studio, Omniverse, Houdini's defaults)?
-9. **USD authoring:** Are you happy with relative paths inside assets and
+7. **USD authoring:** Are you happy with relative paths inside assets and
    `clio:` URIs across assets (§10.5), or should everything stay plain
    paths, with Clio relying on pre-open sync only?
-10. **Pins:** Is a Perforce **label** the right way to mark approved
+8. **Pins:** Is a Perforce **label** the right way to mark approved
     versions, or will Dedaverse/Imagine keep their own version records that
     map to change numbers?
-
-11. **Native language:** Keep Rust/PyO3 for the Python extension
-    (`_native`), or use one C++ codebase (`clio_core`) for both the USD
-    resolver and Python bindings (§8.4)?
+9. **P4API licence:** confirm that the Perforce C++ API may be
+    redistributed statically linked inside our wheel and plugin.
 
 ### Decided
+
+* Targets: Python 3.13; standalone USD 26.08, plus USD 25.08 or later; no
+  DCCs yet.
+* Native code: a single C++ core (`clio_core`) for Python (nanobind) and
+  USD. No P4Python, no `p4 -G` fallback, no Rust.
+* No Dedaverse/Imagine integration yet.
 
 * USD: Clio ships a compiled C++ `clio:` resolver that performs Perforce
   operations in-process through P4API (§10.2–10.3). The Python pre-open
