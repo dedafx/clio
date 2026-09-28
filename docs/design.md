@@ -46,7 +46,9 @@ server's parallel transfer) or in a small native extension of our own
 6. **UI-ready data access.** Version history and status can be shown in
    list UIs using cached data and a small, fixed number of server calls
    (see §9).
-7. **Safe by default.** Clio never deletes or reverts local work unless the
+7. **USD-aware retrieval.** A USD stage can be opened with every layer and
+   asset it needs present at the correct version (see §10).
+8. **Safe by default.** Clio never deletes or reverts local work unless the
    user asks for it explicitly.
 
 ### Non-goals (for v1)
@@ -76,7 +78,7 @@ did.
 | **Save** | `p4 submit` | Adds, edits, and deletes are detected and opened automatically. |
 | **Change** | A numbered pending changelist | The CLI hides the default changelist. |
 | **Draft** | A shelved changelist | "Share this without saving it." |
-| **Discard** | `p4 revert` | Always confirmed; can back up first (§10). |
+| **Discard** | `p4 revert` | Always confirmed; can back up first (§11). |
 | **Version** | A file revision / changelist number / label | `crate.ma@v12`, `@label`, `@1234`. |
 | **Publish** | `p4 copy` up to the parent stream | |
 | **Update branch** | `p4 merge` down from the parent stream | |
@@ -134,7 +136,7 @@ did.
   so no text parsing is needed. It is slower (a process spawn plus a
   connection per call) but always works.
 * **Testing.** Service logic is tested against `FakeBackend` in milliseconds.
-  Integration tests run against a real, throwaway `p4d` (§12).
+  Integration tests run against a real, throwaway `p4d` (§13).
 * **Future.** A different transport (for example a native backend written
   directly against the P4 C++ API) can be added without API changes.
 
@@ -151,7 +153,7 @@ clio/
 ├── src/deda/clio/
 │   ├── __init__.py             # public API; lazy re-exports
 │   ├── _version.py
-│   ├── errors.py               # exception hierarchy (§10)
+│   ├── errors.py               # exception hierarchy (§11)
 │   ├── models.py               # frozen, slotted dataclasses
 │   ├── config.py               # layered config (§6)
 │   ├── events.py               # progress / event types, cancellation token
@@ -168,6 +170,7 @@ clio/
 │   │   ├── history.py          # server metadata / history cache (§9)
 │   │   └── content.py          # digest-addressed content cache (§9)
 │   ├── views/                  # UI-ready view models, no Qt dependency (§9)
+│   ├── usd/                    # USD prefetch, pins, localize (§10); imports pxr lazily
 │   ├── backends/
 │   │   ├── base.py             # Backend Protocol, Record types
 │   │   ├── p4python.py
@@ -177,7 +180,8 @@ clio/
 │   │   ├── __init__.py
 │   │   └── __main__.py         # `python -m deda.clio.cli`, entry point `clio`
 │   └── _native.pyi             # type stubs for the optional extension
-├── native/                     # Rust crate for deda.clio._native (phase 2)
+├── native/                     # Rust crate for deda.clio._native (phase 3)
+├── usd_resolver/               # thin C++ `clio:` ArResolver plugin (phase 6, §10.3)
 ├── tests/
 │   ├── unit/                   # FakeBackend
 │   └── integration/            # real p4d via rsh: port
@@ -686,7 +690,9 @@ and done lazily:
 | User clicks "Refresh" | Freshness check plus volatile data for visible rows |
 | Before any action | Live check of the files involved. The cache is not trusted. |
 
-**Push notifications (later, optional).** Perforce does not push events to
+**Decision:** 30–60 s polling is sufficient for the MVP.
+
+**Push notifications (backlog).** Perforce does not push events to
 clients. A studio that wants instant updates can add a server
 `change-commit` trigger that publishes "change N submitted to //path" to a
 small notification service (for example WebSocket or a message queue).
@@ -778,18 +784,273 @@ backend calls per scenario and fail if a change breaks the budget.
   it back into the parent stream) is stored under the parent's paths, so
   it is cached once and shared by every branch made from that parent.
 
-### 9.8 Thumbnails and previews
+### 9.8 Thumbnails and previews (backlog, not in MVP)
+
+> **Decision:** Thumbnails are out of scope for the MVP and stay in the
+> backlog (§15). The design below is kept so that the ContentCache and
+> view models don't block adding them later.
 
 Thumbnails are the most frequent binary request in a UI. The recommended
 convention is a small sidecar image per asset version (for example
 `.clio/thumb.png` next to the asset, submitted with it). Clio then shows it
 through `p4 print` and the ContentCache, and each thumbnail is downloaded
 at most once per machine. Alternatives are Perforce attributes (`p4
-attribute`) or an external thumbnail service. *(Q8: which convention fits
-Dedaverse/Imagine? This affects the save workflow, which would generate
-the thumbnail.)*
+attribute`) or an external thumbnail service. *(Open when this comes out
+of the backlog: which convention fits Dedaverse/Imagine? This affects the
+save workflow, which would generate the thumbnail.)*
 
-## 10. Errors and safety
+## 10. USD integration: make layers present before USD loads them
+
+**Goal.** When a USD stage is opened, every layer it needs (sublayers,
+references, payloads) and, optionally, every non-layer asset (textures,
+clips, volumes) is present on disk at the correct version, *before* USD
+reads it. That applies whether the file is missing, out of date, or needs a
+specific version. This is done through `deda.clio.usd` and, for automatic
+behaviour inside DCCs, through a USD asset resolver plugin.
+
+Everything below was checked against the OpenUSD source (`dev` branch,
+commit `2a9a571`, September 2026). File references are relative to
+`pxr/usd/`.
+
+### 10.1 What the USD source tells us
+
+| Finding | Source | Consequence for Clio |
+|---|---|---|
+| All asset path resolution goes through `ArResolver` (`_CreateIdentifier`, `_Resolve`, `_OpenAsset`, `_GetModificationTimestamp`, `_GetAssetInfo`, `_OpenAssetForWrite`, ...). | `ar/resolver.h` | A resolver is the one place where Clio can step in for *every* asset USD touches. |
+| A resolver can be the **primary** resolver or a **URI resolver** for listed schemes (`"uriSchemes"` in `plugInfo.json`). A URI resolver can never be primary (`canBePrimaryResolver = uriSchemes.empty()`). | `ar/resolver.cpp` ~L244–273 | Clio can own `clio:` paths *without* replacing the resolver a DCC or studio already uses (Houdini, Omniverse, and in-house resolvers are usually primary). |
+| When either the asset path or its anchor has a URI scheme, `CreateIdentifier` is called on that scheme's resolver. | `ar/resolver.h` (docs for `_CreateIdentifier`) | Relative paths inside a `clio:` layer are anchored by Clio, which keeps them in the same version snapshot (§10.4). |
+| Relative paths are anchored to the anchor layer's **resolved path** (`anchor->GetResolvedPath()`), not its identifier. | `sdf/layerUtils.cpp` L193 | The form of Clio's resolved path decides whether children stay under Clio's control. This is the main prototyping question (§10.4). |
+| Resolver contexts (`ArResolverContext`) are bound per stage and per thread. `UsdStage::Open` takes a context, and Pcp rebinds it in worker threads. | `ar/resolver.h` (`_BindContext`), `usd/stage.cpp`, `pcp/layerStack.cpp` ~L1807 | A **Clio context** can carry the version pin (branch, change number, label) for a whole stage. |
+| Sublayers are opened **in parallel** (`WorkDispatcher`, controlled by `PCP_ENABLE_PARALLEL_LAYER_PREFETCH`), and composition runs on worker threads. | `pcp/layerStack.cpp` ~L1806–1830, `pcp/cache.cpp` | The resolver is called from many threads at once. Misses must be coalesced and made thread-safe, not synced one at a time. |
+| USD drops the GIL when opening layers because "if the layer load happening in another thread needs the GIL, we'd deadlock". | `sdf/layer.cpp` L339–341 | A resolver that calls Python needs the GIL on every call from worker threads. That is possible but slow and fragile. |
+| `ArResolver` is exposed to Python only for *calling* it (`Ar.GetResolver().Resolve(...)`). There is no binding to *subclass* it in Python. | `ar/wrapResolver.cpp` | A Clio resolver plugin must be compiled C++, built against each DCC's USD. (Community projects bridge resolvers to Python, but they pay the GIL cost above.) |
+| `_GetModificationTimestamp` is what `SdfLayer::Reload` compares to decide whether to reload a layer. | `ar/resolver.h` | After Clio syncs a newer version, `stage.Reload()` picks it up if Clio reports a new timestamp (for example the change number). |
+| `_RefreshContext` plus `ArNotice::ResolverChanged` tell stages that resolution results have changed. | `ar/resolver.h`, `ar/notice.h` | "Update to latest" in a DCC means Clio syncs, then sends `ResolverChanged` for affected contexts, and the stages recompose. |
+| `_OpenAssetForWrite` / `_CanWriteAssetToPath(whyNot)` are called when layers are saved. | `ar/resolver.h` | Clio can open a layer for edit (and lock it) when USD saves it, or refuse with "locked by Sam in branch crate-damage". |
+| `SdfLayer::GetCompositionAssetDependencies()` returns a layer's direct sublayer/reference/payload paths. `UsdUtilsExtractExternalReferences` also returns them, and `UsdUtilsComputeAllDependencies` walks the full tree (including clips, UDIMs, and expression variables) with an optional `processingFunc` callback. All are available in Python. | `sdf/layer.h` ~L415, `usdUtils/dependencies.h`, `usdUtils/wrapDependencies.cpp` | A pure-Python pre-sync is possible without a compiled plugin (§10.2, option A). |
+| `SdfLayer::GetExpressionVariables()` and asset path expressions (`` `...${VAR}...` ``) can change which file a path points to. | `sdf/layer.h` ~L1085 | Dependency walkers must evaluate expressions with the stage's variables, or use `ComputeAllDependencies`, which does. |
+
+### 10.2 Options
+
+**A. Pre-open sync in Python (`deda.clio.usd.prepare`).** Before
+`Usd.Stage.Open`, Clio walks the dependency tree and syncs what is missing
+or out of date, in batches.
+
+```python
+from deda.clio import usd as clio_usd
+
+report = clio_usd.prepare(
+    session, "shots/sq010/sh0100/shot.usda",
+    pin=clio.Pin.change(18234),      # or Pin.label("approved"), Pin.latest(), Pin.have()
+    payloads="all",                  # "all" | "none" | callable(prim_path, asset) -> bool
+    assets=True,                     # also textures, clips, volumes
+    progress=cb)
+stage = Usd.Stage.Open(report.root_path)   # every layer is already on disk
+```
+
+How it works (the "wave" walker):
+1. Sync the root layer.
+2. Open the synced layers with `Sdf.Layer.FindOrOpen` and collect their
+   `GetCompositionAssetDependencies()`, evaluating expression variables.
+3. Batch every path not yet at the required version into **one** parallel
+   sync call (§8.2) per wave. Repeat until there are no new paths. A
+   typical shot is 3–6 waves deep, so it takes 3–6 server round trips, not
+   one per file.
+4. Collect non-layer assets (`UsdUtils.ExtractExternalReferences` per
+   layer) and sync them in one final batch.
+5. Keep the opened layers alive until `Usd.Stage.Open` runs. USD's layer
+   registry then reuses them, so each layer is parsed only once.
+
+Pros: pure Python, works in every DCC today, no compiled USD plugin, easy to
+debug. Cons: works from layer content, so it is a *superset*. It syncs every
+variant's references, not only the selected ones (can be filtered by the
+`payloads`/filter callbacks). It only covers stages opened through Clio,
+not a file opened from a DCC's own menu. It also cannot react to later
+changes, such as a variant switch that brings in a new payload.
+
+**B. Clio URI resolver plugin (`clio:` scheme), in C++.** Layers refer to
+assets as `clio:/props/crate/crate.usd`. USD calls Clio for every such path.
+Clio makes sure the file is present at the right version, then returns its
+local path.
+
+Pros: automatic and complete. It covers any stage opened in any way,
+variant switches, payload loads, and `Reload()`. It coexists with the DCC's
+primary resolver. Cons: C++ plugin built per USD version; the resolver runs
+on USD worker threads.
+
+**C. Clio primary resolver in C++** (plain file paths, Clio decides
+everything). Not recommended: it conflicts with DCC and studio resolvers
+(only one primary resolver per process), and it would put Clio in the path
+of every file USD touches, including files that have nothing to do with
+Perforce.
+
+**D. Custom `SdfFileFormat` plugin** (for example `.clio` files as
+indirections). Not recommended: it is the wrong layer for this job and does
+not cover non-layer assets.
+
+**Recommendation: A first, then B, both over the same core.**
+* **MVP: option A.** It delivers "open this stage at version X and
+  everything is present" with no compiled USD code, and it is also what the
+  farm and batch tools need (one explicit, logged prefetch step).
+* **Next: option B**, for automatic behaviour inside DCCs. The resolver
+  plugin stays *thin*. All Perforce logic stays in Clio, and the plugin talks
+  to Clio as described in §10.3.
+* Both use the same **resolution core** (pin rules, where versions are
+  stored, the batching pipeline), so a path gives the same file under A and
+  under B.
+
+### 10.3 Resolver plugin design (option B)
+
+```
+USD worker threads ──► ClioResolver (C++, thin, per USD build)
+                         │ fast path: in-process lookup, no server, no IPC
+                         │   manifest: identifier + pin → local path, rev, digest
+                         │ miss / stale:
+                         ▼
+                   local Clio agent (one per machine, §8.1)
+                         │ coalesces misses from all threads & processes
+                         │ one batched parallel sync / p4 print per burst
+                         ▼
+                        p4d
+```
+
+* **Fast path, no IPC.** Most calls are for files that are already present.
+  The plugin answers them from a read-only, memory-mapped manifest (or the
+  SQLite StatusCache) that the agent keeps current. The target is a few
+  microseconds per call, so composition speed is unaffected when everything
+  is up to date.
+* **Slow path through the agent.** A miss is sent over a local socket or
+  named pipe. The calling USD thread blocks until its file is ready. Misses
+  from parallel sublayer loading arrive within milliseconds of each other,
+  and the agent's batching window (§9.5) turns them into one sync. The agent
+  also shares its connection pool and caches across every DCC on the machine.
+  **Consequence:** the per-machine agent, deferred in §8.1, becomes a
+  requirement for option B.
+* **Why not call Python from the plugin:** GIL use on USD worker threads
+  (§10.1). The agent can be Python. It runs in its own process, so it never
+  competes for a DCC's GIL.
+* **ArResolver methods Clio implements:**
+
+| Method | Clio behaviour |
+|---|---|
+| `_CreateIdentifier` | Normalizes `clio:` paths. Anchors relative paths, keeping the anchor's pin (§10.4). |
+| `_Resolve` | Fast-path lookup. On a miss, requests a sync from the agent and waits (with a timeout and a clear error). Returns the local path. |
+| `_ResolveForNewAsset` / `_CanWriteAssetToPath` / `_OpenAssetForWrite` | When a layer is saved: opens the file for add or edit (with lock) through the agent, or refuses with `whyNot` ("locked by Sam"). |
+| `_IsContextDependentPath` | `true` for `clio:` paths, since the pin comes from the context. |
+| `_CreateDefaultContext[ForAsset]`, `_CreateContextFromString` | Build a `ClioResolverContext` (project, branch, pin, policy). The string form, for example `"branch=main;pin=@18234"`, lets DCC UIs and env vars set it. |
+| `_GetAssetInfo` | Fills `version` (revision/change number) and `resolverInfo` (depot path, digest), so DCC UIs can show "crate.usd v12 @18234". |
+| `_GetModificationTimestamp` | Returns a timestamp derived from the revision or change number, so `Reload()` picks up newly synced versions. |
+| `_RefreshContext` | Re-evaluates moving pins ("latest", labels), syncs, and sends `ArNotice::ResolverChanged` for affected contexts. |
+| `_OpenAsset` | Opens the local file (`ArFilesystemAsset`). A later option is to stream pinned versions from the ContentCache without writing to the workspace. |
+
+* **Policies in the context:** `sync` (default: fetch what is needed),
+  `verify` (fail if not present, no server calls, for farm reproducibility),
+  and `offline` (use whatever is on disk and warn).
+* **Build and distribution:** the plugin must be compiled against each
+  DCC's USD (Houdini, Maya-USD, Omniverse, Blender, usd-core/standalone),
+  because the USD C++ ABI and namespace differ per build. Keeping the plugin
+  to a few hundred lines with no Perforce code makes these rebuilds cheap.
+  Registration uses `PXR_PLUGINPATH_NAME` and a `plugInfo.json` declaring
+  `"uriSchemes": ["clio"]`.
+
+### 10.4 Versions, pins, and where files are placed
+
+**Pins** say which version of a path to use:
+
+| Pin | Meaning | Typical use |
+|---|---|---|
+| `latest` | Head revision on the context's branch | Artists working live |
+| `have` | Whatever is in the workspace. No server call. | Offline, or "don't change my files" |
+| `@<change>` | Snapshot of the branch at that change number | Reproducible shot, farm render |
+| `@<label>` | Perforce label (for example `approved`, `delivery_0412`) | Approved or released versions |
+| `#<rev>` on one path | That file's revision | Pinning one asset inside a shot |
+
+Rules:
+1. A stage has **one context pin** (usually `latest`, or `@change` for
+   reproducibility).
+2. A path can **override** it in its asset path:
+   `clio:/props/crate/crate.usd?change=18100` or `?label=approved`.
+   (Query syntax rather than `#`, to avoid confusion with URI fragments.)
+3. **Relative paths inherit the anchor's snapshot pin** (`@change`/`@label`),
+   so an asset's internal sublayers and textures are always a consistent
+   set. A per-file `#rev` pin is *not* inherited, because it would be
+   meaningless for siblings.
+
+**Where versions are placed.**
+* `latest` / `have` → the **workspace**, through a normal sync. This is what
+  the artist sees and edits.
+* Historical pins (`@change`, `@label`, `#rev`) → a **read-only version
+  store** filled with `p4 print` (the ContentCache, §9.3). The workspace is
+  never touched. Several versions of the same asset can exist side by side
+  (two shots pinned to different crate versions in one session), and a
+  version is fetched once per machine.
+* **Safety:** a file the artist has opened for edit is never overwritten
+  by any pin. The resolver returns the artist's local file for `latest` and
+  warns that a pinned version differs from local edits.
+
+**Open prototyping question: the form of the resolved path.** Sdf anchors a
+layer's relative paths to that layer's *resolved path* (`sdf/layerUtils.cpp`
+L193).
+* If Clio returns a plain file path (for example
+  `/cache/…/crate.usd`), relative children are anchored on the filesystem.
+  The primary resolver then handles them, not Clio, and they are not synced
+  or pinned. To make that work, the version store must mirror the depot
+  layout per snapshot and be pre-filled per asset.
+* If Clio returns a `clio:`-form resolved path and opens the local file in
+  `_OpenAsset`, children stay under Clio's control. However, any consumer
+  that uses resolved paths as file paths directly (some renderers do this
+  for textures) would receive a URI.
+* A likely answer is **`clio:` resolved paths for layers, file paths for
+  non-layer assets**. This must be validated in a prototype with Hydra
+  Storm and the renderers you use before the design is fixed.
+
+### 10.5 Authoring conventions (what is written inside layers)
+
+* **Inside an asset** (the asset's own sublayers, geometry, textures):
+  relative paths (`./geo/crate_geo.usdc`). The files stay portable and work
+  without Clio once synced.
+* **Across assets** (shot → asset, set → prop): `clio:` URIs
+  (`clio:/props/crate/crate.usd`). They don't depend on each artist's
+  workspace root, and they can carry a pin.
+* **Deliveries and vendors:** `clio usd localize` rewrites `clio:` paths to
+  plain relative paths, using USD's own `UsdUtilsModifyAssetPaths` /
+  localization APIs (`usdUtils/localizeAsset.h`), so the result opens
+  without Clio.
+* Until option B ships, layers can use plain relative paths everywhere, and
+  option A handles syncing. Adopting `clio:` later is a path rewrite of
+  the cross-asset references only.
+
+### 10.6 Saving layers (write side)
+
+When USD saves a layer from a DCC, the resolver's write hooks let Clio:
+* open the file for edit and lock it if it is a `+l` type, or add it if it
+  is new, in the artist's current change;
+* refuse the save *before* data is lost if someone else holds the lock
+  (`_CanWriteAssetToPath` with a `whyNot` message);
+* never submit. Saving a layer is a local action. Submitting stays an
+  explicit Clio `save`.
+
+Under option A (no plugin), the same behaviour is available as
+`clio_usd.prepare_for_edit(layer_paths)`, which DCC integrations call from
+their save callbacks.
+
+### 10.7 Performance notes
+
+* **Waves, not files.** Option A costs one server round trip per
+  dependency depth level. Option B turns bursts of parallel misses into one
+  batched request. Neither makes a server call per layer.
+* **Nothing to do is nearly free.** The freshness check (§9.4) on the
+  stage's scopes decides whether any sync is needed at all. For `have` and
+  `verify` policies no server call is made.
+* **Parse once.** Option A keeps opened layers alive for `Usd.Stage.Open`.
+  Option B needs no extra parsing.
+* **Payloads stay lazy.** With option B, payloads are synced only when USD
+  loads them (`stage.Load(path)`), which suits large sets. With option A,
+  the `payloads` policy decides up front.
+* **Large binaries** (`.usdc` caches, VDBs, textures) use the parallel
+  transfer from §8.2.
+
+## 11. Errors and safety
 
 * **Exception hierarchy** rooted at `ClioError`: `ConnectionError`,
   `AuthError`, `LockedByOtherError(path, user, workspace, branch)`,
@@ -807,7 +1068,7 @@ the thumbnail.)*
 * **Branch switch** with opened files is refused by default and offers to
   shelve them as a draft first.
 
-## 11. CLI
+## 12. CLI
 
 Entry point `clio` (also `python -m deda.clio.cli`). Human-readable output by
 default, `--json` on every command for tooling, and exit codes documented
@@ -829,13 +1090,16 @@ clio branch update [NAME] | publish [NAME] -m MSG | retire NAME
 clio export ASSET --version V --dest DIR
 clio doctor                     # config, connectivity, server settings, typemap
 clio cache verify [PATH] | cache clear [PATH]   # history/content caches (§9)
+clio usd prepare LAYER [--pin @CHANGE|@LABEL|latest] [--payloads all|none]  # §10.2
+clio usd deps LAYER             # list dependencies and their state, no sync
+clio usd localize LAYER --dest DIR   # rewrite clio: paths for delivery (§10.5)
 ```
 
 Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
 `revert`, `shelve`). *(Q4: CLI framework. The recommendation is `click`,
 loaded lazily, or `argparse` for zero dependencies.)*
 
-## 12. Testing strategy
+## 13. Testing strategy
 
 * **Unit tests** (`tests/unit`) run service logic against `FakeBackend`.
   They are fast and have no server.
@@ -848,8 +1112,14 @@ loaded lazily, or `argparse` for zero dependencies.)*
 * **Backend parity tests** run the same integration suite against both
   `P4PythonBackend` and `P4CliBackend`.
 * **Benchmarks** (§8.7) and **native/pure parity tests** for `_native`.
+* **USD tests** use `usd-core` from PyPI. Generated shot/asset layer trees
+  (sublayers, references, payloads, variants, expression variables, UDIMs)
+  are submitted to the test `p4d`, and the tests check that `prepare` syncs
+  exactly the expected files at the expected revisions, in the expected
+  number of server round trips. The resolver plugin (phase 6) gets the same
+  suite, run inside each target USD build.
 
-## 13. Integration with Dedaverse, Imagine, and DCCs
+## 14. Integration with Dedaverse, Imagine, and DCCs
 
 * Clio depends only on P4Python (optional), `tomli` (py < 3.11), and the
   optional native wheel. It never imports Dedaverse or Imagine. They depend
@@ -862,7 +1132,7 @@ loaded lazily, or `argparse` for zero dependencies.)*
 * The event bus (§5.6) lets Dedaverse drive lock icons, progress bars, and
   notifications without polling.
 
-## 14. Roadmap
+## 15. Roadmap
 
 | Phase | Scope |
 |---|---|
@@ -870,9 +1140,18 @@ loaded lazily, or `argparse` for zero dependencies.)*
 | **1 — Core workflow** | `P4PythonBackend` + pool, connect/login/setup, get (parallel), lock/unlock, save, status (no cache yet), history backed by the HistoryCache with watermark refresh (§9.3–9.4), CLI for these. Baseline benchmarks. |
 | **2 — Branching** | Streams/task streams, switch, update/publish with binary conflict handling, cross-branch lock check, drafts (shelves). |
 | **3 — Performance** | StatusCache, cheap change checks, optional watcher. Profile, then `_native` (Rust/PyO3 abi3) for hashing/scan/diff if the benchmarks justify it. |
-| **4 — Ecosystem** | UI view models (`FileListView`, `HistoryView`) with the request pipeline, ContentCache and thumbnails (§9.5–9.8), asset resolver plugins, validation hooks, `P4CliBackend` for DCC fallback, `clio doctor`, Dedaverse integration. |
+| **4 — USD prefetch** | `deda.clio.usd.prepare` (option A, §10.2): wave walker, pins, `payloads`/asset policies, version store for historical pins, `prepare_for_edit`, `clio usd prepare/localize` CLI. |
+| **5 — Ecosystem** | UI view models (`FileListView`, `HistoryView`) with the request pipeline, ContentCache (§9.5), asset resolver plugins, validation hooks, `P4CliBackend` for DCC fallback, `clio doctor`, Dedaverse integration. |
+| **6 — USD resolver** | Per-machine Clio agent (§8.1) and the thin C++ `clio:` URI resolver plugin (§10.3), built per target USD. Starts with a prototype that settles the resolved-path form (§10.4). |
 
-## 15. Open questions
+### Backlog
+
+* **Thumbnails and previews** (§9.8).
+* **Push notifications** for instant UI refresh (§9.4). MVP polls every
+  30–60 s.
+* **Streaming pinned versions via `ArAsset`** without writing files (§10.3).
+
+## 16. Open questions
 
 1. **Namespace:** Does Dedaverse use a PEP 420 implicit `deda` namespace
    (no `deda/__init__.py`)? If it ships a `deda/__init__.py`, it must be
@@ -891,9 +1170,17 @@ loaded lazily, or `argparse` for zero dependencies.)*
 7. **Asset identity:** Is an asset a folder (all files under a path), or is
    it defined by Dedaverse/Imagine metadata (for example a USD asset or a
    database ID)? This decides how much of the resolver ships in Clio itself.
-8. **Thumbnails:** Should asset versions carry a thumbnail sidecar
-   submitted with the asset (recommended), use Perforce attributes, or come
-   from an external service?
-9. **UI refresh:** Is 30–60 s polling acceptable for artist UIs in v1, or
-   do you want instant updates (a server trigger plus a notification
-   service, §9.4) early on?
+8. **USD builds:** Which DCCs and USD versions must the resolver plugin
+   (option B) support first? Is there already a primary resolver in use
+   (studio, Omniverse, Houdini's defaults)?
+9. **USD authoring:** Are you happy with relative paths inside assets and
+   `clio:` URIs across assets (§10.5), or should everything stay plain
+   paths, with Clio relying on pre-open sync only?
+10. **Pins:** Is a Perforce **label** the right way to mark approved
+    versions, or will Dedaverse/Imagine keep their own version records that
+    map to change numbers?
+
+### Decided
+
+* UI refresh: 30–60 s polling for the MVP. Push notifications are in the backlog.
+* Thumbnails: out of scope for the MVP. Kept in the backlog (§9.8).
