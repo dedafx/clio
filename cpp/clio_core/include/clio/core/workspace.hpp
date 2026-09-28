@@ -11,6 +11,14 @@
 
 namespace clio::core {
 
+/// A local path that belongs to the project: a file in the workspace, or a
+/// version in the version store.
+struct LocalPathMatch {
+    AssetIdentifier id;
+    std::optional<Pin> pin; ///< Set for version-store paths (the version the folder holds).
+    bool inVersionStore = false;
+};
+
 /// Maps clio: identifiers to depot and local paths, and runs the Perforce
 /// operations that put files on disk.
 ///
@@ -32,6 +40,11 @@ public:
     /// Path of a historical version in the read-only version store
     /// (change, label and revision pins, design doc §10.4).
     std::filesystem::path versionStorePath(const AssetIdentifier& id, const Pin& pin) const;
+
+    /// Which project file a local path refers to, or nullopt if it is outside
+    /// both the workspace root and this project's part of the version store.
+    /// Purely lexical: no filesystem or server access.
+    std::optional<LocalPathMatch> matchLocalPath(const std::filesystem::path& path) const;
 
     /// `p4 sync` the files to `pin` (latest, have or a snapshot) in the
     /// workspace. Files that do not exist in the depot are skipped. Files the

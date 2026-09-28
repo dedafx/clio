@@ -122,6 +122,11 @@ AssetIdentifier AssetIdentifier::parse(const std::string& text) {
     return AssetIdentifier(normalizePath(rest, text), parseQuery(query, text));
 }
 
+AssetIdentifier AssetIdentifier::fromRelativePath(const std::string& relativePath,
+                                                  std::optional<Pin> pin) {
+    return AssetIdentifier(normalizePath(relativePath, relativePath), std::move(pin));
+}
+
 AssetIdentifier AssetIdentifier::anchor(const std::string& assetPath, const AssetIdentifier& anchor) {
     if (isClioUri(assetPath)) {
         return parse(assetPath);

@@ -4,7 +4,8 @@ Perforce wrapper for easier version control of art assets.
 Clio gives artists and tools a simple way to get, lock, save and branch
 assets stored in Perforce. It is built around a C++ core (`clio_core`, on
 the Perforce C++ API), used both from Python (`deda.clio`) and by a USD
-asset resolver plugin that fetches `clio:` assets before USD loads them.
+asset resolver plugin that fetches files from Perforce before USD loads them.
+USD files keep ordinary paths, so they open with or without Clio.
 
 * [Design document](docs/design.md)
 * [Using Clio with USD](docs/usd.md)

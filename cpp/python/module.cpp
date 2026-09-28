@@ -183,6 +183,24 @@ NB_MODULE(_core, m) {
             "Return {identifier, pin, depot_path, local_path, warning}, or None if the asset is not "
             "available. 'warning' is set when a local file was used instead of the exact version, "
             "for example because Perforce was unreachable.")
+        .def(
+            "resolve_path",
+            [](AssetResolver& r, const std::filesystem::path& path) -> std::optional<nb::dict> {
+                std::optional<ResolvedAsset> asset;
+                {
+                    nb::gil_scoped_release release;
+                    asset = r.resolvePath(path);
+                }
+                if (!asset) {
+                    return std::nullopt;
+                }
+                return resolvedToDict(*asset);
+            },
+            "path"_a,
+            "Resolve a local path as USD would: a workspace path uses the settings pin, a "
+            "version-store path the version its folder holds. None if not managed or not available.")
+        .def("manages", &AssetResolver::manages, "path"_a,
+             "True if the path is inside the workspace root or this project's version store.")
         .def("resolve_for_new_asset", &AssetResolver::resolveForNewAsset, "identifier"_a)
         .def("refresh", &AssetResolver::refresh);
 }

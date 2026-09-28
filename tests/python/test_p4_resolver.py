@@ -55,3 +55,19 @@ def test_resolves_from_many_threads(p4_server):
 
     for name, content in files.items():
         assert Path(results[name]["local_path"]).read_text() == content
+
+
+def test_resolve_path_maps_local_paths(p4_server):
+    v1 = p4_server.submit({"assets/a.usda": "v1", "assets/b.usda": "b1"}, "v1")
+    p4_server.submit({"assets/b.usda": "b2"}, "v2")
+    resolver = clio.AssetResolver(clio.Settings.parse(p4_server.settings_text(pin=f"@{v1}")))
+
+    a = resolver.resolve_path(p4_server.workspace_root / "assets/a.usda")
+    assert Path(a["local_path"]).is_relative_to(p4_server.version_store)
+    # A sibling of a pinned file, as USD anchors a relative path:
+    b = resolver.resolve_path(Path(a["local_path"]).parent / "b.usda")
+    assert Path(b["local_path"]).read_text() == "b1"
+
+    assert resolver.manages(p4_server.workspace_root / "x.usda")
+    assert not resolver.manages(Path("/somewhere/else.usda"))
+    assert resolver.resolve_path(Path("/somewhere/else.usda")) is None

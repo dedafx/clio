@@ -29,6 +29,11 @@ public:
     /// Parse and normalize. Throws IdentifierError or PinError.
     static AssetIdentifier parse(const std::string& text);
 
+    /// From a '/'-separated path relative to the project root, as found on
+    /// disk under the workspace root or the version store.
+    static AssetIdentifier fromRelativePath(const std::string& relativePath,
+                                            std::optional<Pin> pin = std::nullopt);
+
     /// Anchor `assetPath` to `anchor`, as USD does for relative paths in a
     /// layer. If `assetPath` is itself a clio: URI it is parsed on its own.
     /// Otherwise it is joined to the anchor's directory. A snapshot pin

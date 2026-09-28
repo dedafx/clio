@@ -4,9 +4,9 @@ Clio is a CMake project with three parts:
 
 | Target | What it is | Needs |
 |---|---|---|
-| `clio_core` | Static C++ library: Perforce access (P4API), `clio:` identifiers, pins, resolution | C++17 compiler, P4API, OpenSSL 3 |
+| `clio_core` | Static C++ library: Perforce access (P4API), project paths, pins, resolution | C++17 compiler, P4API, OpenSSL 3 |
 | `deda.clio._core` | Python extension (nanobind, stable ABI for CPython ≥ 3.13) | Python 3.13, nanobind |
-| `clioUsd` | USD asset resolver plugin for the `clio:` scheme | A USD build (26.08, or 25.08 or later) with C++ headers |
+| `clioUsd` | USD asset resolver plugin: USD's default resolver, enhanced to fetch project files from Perforce | A USD build (26.08, or 25.08 or later) with C++ headers |
 
 Targets today: **Python 3.13** and standalone **USD 26.08** (USD 25.08 or
 later also builds). DCCs are not targeted yet.
@@ -118,10 +118,10 @@ export PXR_PLUGINPATH_NAME=$(python3.13 -c "from deda.clio import usd; print(usd
 from pxr import Ar, Usd
 
 settings = "depot=//imagine/main;root=/work/imagine;client=sam_imagine;pin=latest"
-ctx = Ar.GetResolver().CreateContextFromString("clio", settings)
-stage = Usd.Stage.Open("clio:/shots/sq010/sh0100/shot.usda", ctx)
+ctx = Ar.GetResolver().CreateContextFromString(settings)
+stage = Usd.Stage.Open("/work/imagine/shots/sq010/sh0100/shot.usda", ctx)
 ```
 
 Or set `CLIO_RESOLVER_CONTEXT` to the same settings string to give every
 stage a default context. The settings keys are documented in
-`cpp/clio_core/include/clio/core/settings.hpp` and in design doc §10.3.
+`cpp/clio_core/include/clio/core/settings.hpp` and in [usd.md](usd.md).

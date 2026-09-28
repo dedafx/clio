@@ -1,8 +1,14 @@
 """USD integration for Clio.
 
-The ``clio:`` asset resolver is a compiled USD plugin (``clioUsd``) that
-performs Perforce operations itself (design doc §10.3). This module helps
-Python code find and configure it. It does not import ``pxr`` until needed.
+Clio's USD plugin (``clioUsd``) replaces USD's default asset resolver with a
+subclass of it (design doc §10.3). Layers keep ordinary paths, so they open
+in any USD without Clio. With the plugin installed and a Clio context
+bound, files inside the project are fetched from Perforce, at the context's
+version, before USD reads them. Without a Clio context the plugin behaves
+exactly like USD's default resolver.
+
+This module helps Python code find and configure the plugin. It does not
+import ``pxr`` until needed.
 """
 
 from __future__ import annotations
@@ -22,11 +28,12 @@ def plugin_path() -> Path | None:
 
 
 def register_plugin() -> None:
-    """Register the bundled ``clio:`` resolver with USD's plugin registry.
+    """Register the bundled plugin with USD's plugin registry.
 
-    Must run before the first ``clio:`` path is resolved in this process.
-    Prefer setting ``PXR_PLUGINPATH_NAME`` before USD starts, which also
-    covers processes that do not import this module.
+    Must run before USD creates its asset resolver, which happens the first
+    time anything resolves a path (for example opening a stage). Prefer
+    setting ``PXR_PLUGINPATH_NAME`` before USD starts, which also covers
+    processes that do not import this module.
     """
     path = plugin_path()
     if path is None:
@@ -37,7 +44,7 @@ def register_plugin() -> None:
 
 
 def create_context(settings: str):
-    """Create an ``Ar.ResolverContext`` for ``clio:`` paths.
+    """Create an ``Ar.ResolverContext`` that turns Clio on for a stage.
 
     ``settings`` uses the same text form as :class:`deda.clio.Settings`, for
     example ``"depot=//imagine/main;root=/work/imagine;pin=@18234"``. Pass the
@@ -45,4 +52,4 @@ def create_context(settings: str):
     """
     from pxr import Ar
 
-    return Ar.GetResolver().CreateContextFromString("clio", settings)
+    return Ar.GetResolver().CreateContextFromString(settings)

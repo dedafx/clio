@@ -23,14 +23,29 @@ std::optional<ResolvedAsset> AssetResolver::resolve(const AssetIdentifier& id) {
 
     // TODO(design §10.3): route misses through the coalescer so concurrent
     // misses from USD worker threads become one batched sync.
-    std::optional<ResolvedAsset> resolved = _resolveUncached(id, pin);
+    bool serverAnswered = false;
+    std::optional<ResolvedAsset> resolved = _resolveUncached(id, pin, serverAnswered);
     // A fallback answer is not remembered, so the exact version is fetched
-    // once the server is reachable again.
-    if (resolved && resolved->warning.empty()) {
+    // once the server is reachable again. "Not found" is remembered only
+    // when the server said so.
+    const bool remember = resolved ? resolved->warning.empty() : serverAnswered;
+    if (remember) {
         std::lock_guard<std::mutex> lock(_memoMutex);
-        _memo.emplace(key, *resolved);
+        _memo.emplace(key, resolved);
     }
     return resolved;
+}
+
+bool AssetResolver::manages(const std::filesystem::path& localPath) const {
+    return _workspace.matchLocalPath(localPath).has_value();
+}
+
+std::optional<ResolvedAsset> AssetResolver::resolvePath(const std::filesystem::path& localPath) {
+    const auto match = _workspace.matchLocalPath(localPath);
+    if (!match) {
+        return std::nullopt;
+    }
+    return resolve(match->id);
 }
 
 bool AssetResolver::_serverAvailable() const {
@@ -55,7 +70,7 @@ std::optional<ResolvedAsset> AssetResolver::_useWorkspaceFile(ResolvedAsset asse
 }
 
 std::optional<ResolvedAsset> AssetResolver::_resolveUncached(const AssetIdentifier& id,
-                                                             const Pin& pin) {
+                                                             const Pin& pin, bool& serverAnswered) {
     const Policy policy = settings().policy;
     ResolvedAsset asset{id, pin, _workspace.depotPath(id), {}, {}};
     const bool mayContactServer = policy == Policy::Sync && _serverAvailable();
@@ -78,7 +93,9 @@ std::optional<ResolvedAsset> AssetResolver::_resolveUncached(const AssetIdentifi
             return _useWorkspaceFile(asset, policy == Policy::Offline ? "Offline" : unavailable);
         }
         try {
-            if (!_workspace.fetchVersion(id, pin)) {
+            const bool found = _workspace.fetchVersion(id, pin);
+            serverAnswered = true;
+            if (!found) {
                 return std::nullopt; // the file does not exist at that version
             }
             return asset;
@@ -99,6 +116,7 @@ std::optional<ResolvedAsset> AssetResolver::_resolveUncached(const AssetIdentifi
             // A no-op on the server when the file is already current.
             // TODO(design §10.3): skip the call when the file is known current.
             _workspace.sync({id}, pin);
+            serverAnswered = true;
         } catch (const P4Error& e) {
             _markServerUnavailable();
             if (policy != Policy::Verify) {

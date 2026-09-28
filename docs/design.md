@@ -845,9 +845,9 @@ commit `2a9a571`, September 2026). File references are relative to
 | Finding | Source | Consequence for Clio |
 |---|---|---|
 | All asset path resolution goes through `ArResolver` (`_CreateIdentifier`, `_Resolve`, `_OpenAsset`, `_GetModificationTimestamp`, `_GetAssetInfo`, `_OpenAssetForWrite`, ...). | `ar/resolver.h` | A resolver is the one place where Clio can step in for *every* asset USD touches. |
-| A resolver can be the **primary** resolver or a **URI resolver** for listed schemes (`"uriSchemes"` in `plugInfo.json`). A URI resolver can never be primary (`canBePrimaryResolver = uriSchemes.empty()`). | `ar/resolver.cpp` ~L244–273 | Clio can own `clio:` paths *without* replacing the resolver a DCC or studio already uses (Houdini, Omniverse, and in-house resolvers are usually primary). |
-| When either the asset path or its anchor has a URI scheme, `CreateIdentifier` is called on that scheme's resolver. | `ar/resolver.h` (docs for `_CreateIdentifier`) | Relative paths inside a `clio:` layer are anchored by Clio, which keeps them in the same version snapshot (§10.4). |
-| Relative paths are anchored to the anchor layer's **resolved path** (`anchor->GetResolvedPath()`), not its identifier. | `sdf/layerUtils.cpp` L193 | The form of Clio's resolved path decides whether children stay under Clio's control. This is the main prototyping question (§10.4). |
+| A resolver can be the **primary** resolver or a **URI resolver** for listed schemes (`"uriSchemes"` in `plugInfo.json`). A URI resolver can never be primary (`canBePrimaryResolver = uriSchemes.empty()`). | `ar/resolver.cpp` ~L244–273 | Option B would have owned `clio:` paths only. The chosen design (option C, §10.2) is a primary resolver built on `ArDefaultResolver`, so plain paths work with and without Clio. |
+| When either the asset path or its anchor has a URI scheme, `CreateIdentifier` is called on that scheme's resolver. | `ar/resolver.h` (docs for `_CreateIdentifier`) | Relevant only to option B (`clio:` URIs), which was not kept. |
+| Relative paths are anchored to the anchor layer's **resolved path** (`anchor->GetResolvedPath()`), not its identifier. | `sdf/layerUtils.cpp` L193 | Clio returns local file paths and recognises them again, including version-store paths, so relative children keep the pin (§10.4). |
 | Resolver contexts (`ArResolverContext`) are bound per stage and per thread. `UsdStage::Open` takes a context, and Pcp rebinds it in worker threads. | `ar/resolver.h` (`_BindContext`), `usd/stage.cpp`, `pcp/layerStack.cpp` ~L1807 | A **Clio context** can carry the version pin (branch, change number, label) for a whole stage. |
 | Sublayers are opened **in parallel** (`WorkDispatcher`, controlled by `PCP_ENABLE_PARALLEL_LAYER_PREFETCH`), and composition runs on worker threads. | `pcp/layerStack.cpp` ~L1806–1830, `pcp/cache.cpp` | The resolver is called from many threads at once. Misses must be coalesced and made thread-safe, not synced one at a time. |
 | USD drops the GIL when opening layers because "if the layer load happening in another thread needs the GIL, we'd deadlock". | `sdf/layer.cpp` L339–341 | A resolver that calls Python needs the GIL on every call from worker threads. That is possible but slow and fragile. |
@@ -899,30 +899,46 @@ changes, such as a variant switch that brings in a new payload.
 **B. Clio URI resolver plugin (`clio:` scheme), in C++.** Layers refer to
 assets as `clio:/props/crate/crate.usd`. USD calls Clio for every such path.
 Clio makes sure the file is present at the right version, then returns its
-local path. **Chosen** (see the decision below).
+local path. *(Chosen first; replaced by option C, see the decision below.)*
 
 Pros: automatic and complete. It covers any stage opened in any way,
 variant switches, payload loads, and `Reload()`. It coexists with the DCC's
 primary resolver. Cons: C++ plugin built per USD version; the resolver runs
 on USD worker threads.
 
-**C. Clio primary resolver in C++** (plain file paths, Clio decides
-everything). Not recommended: it conflicts with DCC and studio resolvers
-(only one primary resolver per process), and it would put Clio in the path
-of every file USD touches, including files that have nothing to do with
-Perforce.
+**C. Clio primary resolver in C++** (plain file paths; Clio enhances
+USD's default resolver). **Chosen.** The earlier concerns were that it
+conflicts with DCC and studio resolvers (only one primary resolver per
+process) and that it puts Clio in the path of every file USD touches. The
+first does not apply while no DCCs are targeted. The second is handled by
+subclassing `ArDefaultResolver`: Clio only acts on paths inside the project
+and defers to the default behaviour for everything else.
 
 **D. Custom `SdfFileFormat` plugin** (for example `.clio` files as
 indirections). Not recommended: it is the wrong layer for this job and does
 not cover non-layer assets.
 
-**Decision: Clio ships a compiled C++ `clio:` resolver that performs the
-Perforce operations itself, in-process** (option B, with Perforce access
-inside the plugin rather than through an agent).
+**Decision (revised): layers contain plain paths, and Clio's compiled C++
+resolver is the primary resolver, a subclass of `ArDefaultResolver` that
+performs Perforce operations in-process** (option C).
 
-* **Option B is the primary way DCCs open Clio assets.** The resolver
-  checks, syncs, and fetches files directly through the Perforce C++ API
-  (P4API).
+Why the change from `clio:` URIs (option B): Clio must be an enhancement,
+not a barrier. Files with `clio:` paths cannot be opened by plain USD, so
+they could not be shared with anyone without Clio. With plain paths:
+
+* **Without Clio**, any USD opens the files from disk.
+* **With the plugin installed and a Clio context bound**, paths inside the
+  project are fetched from Perforce at the context's pin before USD reads
+  them.
+* **With the plugin but no Clio context**, or when Clio cannot help (a path
+  outside the project, a file not in Perforce, the server unavailable),
+  resolution falls through to `ArDefaultResolver`.
+
+What this gives up: a pin on a single path inside a layer. Pins are set per
+stage, through the context (§10.4).
+
+* **The resolver checks, syncs and fetches files directly** through the
+  Perforce C++ API (P4API).
 * **Option A (`deda.clio.usd.prepare`) is kept** as the pure-Python path for
   environments without a resolver build (a DCC or USD version not yet
   compiled for), for explicit farm prefetch, and as a test oracle.
@@ -930,7 +946,7 @@ inside the plugin rather than through an agent).
   are stored, §10.4). One specification, plus one shared test suite, keeps
   them giving the same file for the same path.
 
-### 10.3 Resolver design (option B, in-process Perforce)
+### 10.3 Resolver design (in-process Perforce)
 
 The C++ code is split in two, so that the part that must be rebuilt for
 every USD build stays small:
@@ -940,8 +956,8 @@ USD worker threads
       │
       ▼
 ┌──────────────────────────────────────────────┐
-│ clio_usd  (ArResolver plugin, per USD build) │  thin adapter: identifiers,
-│   ClioResolver · ClioResolverContext         │  contexts, ArAsset, notices
+│ clioUsd (ArDefaultResolver subclass, per USD)│  thin adapter: project paths,
+│   ClioResolver · ClioResolverContext         │  contexts, fallback, notices
 └──────────────────┬───────────────────────────┘
                    │ plain C++ API (no USD types)
 ┌──────────────────▼───────────────────────────┐
@@ -1051,15 +1067,15 @@ symbol.
 
 | Method | Clio behaviour |
 |---|---|
-| `_CreateIdentifier` | Normalizes `clio:` paths. Anchors relative paths, keeping the anchor's pin (§10.4). |
-| `_Resolve` | Fast path from the manifest. On a miss, fetches through the coalescer and waits (with a timeout). Returns the local path. |
+| `_CreateIdentifier` | Inherited from `ArDefaultResolver`: USD's usual anchoring of relative paths and search paths. |
+| `_Resolve` | If a Clio context is bound and the path is inside the workspace root or the version store (search paths are tried under the workspace root), fetch it through `clio_core` at the pin and return the local file. Otherwise, or if Clio cannot provide it, `ArDefaultResolver::_Resolve`. *(Scaffold: no coalescer yet; one fetch at a time per context.)* |
 | `_ResolveForNewAsset` / `_CanWriteAssetToPath` / `_OpenAssetForWrite` | When a layer is saved: runs `p4 edit` (with lock for `+l` types) or `p4 add` in the artist's pending change, or refuses with `whyNot` ("locked by Sam"). Never submits (§10.6). |
-| `_IsContextDependentPath` | `true` for `clio:` paths, since the pin comes from the context. |
-| `_CreateDefaultContext[ForAsset]`, `_CreateContextFromString` | Build a `ClioResolverContext` (project, branch, pin, policy). The string form, for example `"branch=main;pin=@18234"`, can be set from Python through `Ar.GetResolver().CreateContextFromString("clio", ...)`, from DCC UIs, or from env vars. |
+| `_IsContextDependentPath` | Inherited. Absolute paths are not context dependent, so Sdf resolves them again for each context and a pinned stage gets its own layers. |
+| `_CreateDefaultContext[ForAsset]`, `_CreateContextFromString` | The default resolver's context, plus a `ClioResolverContext` from `$CLIO_RESOLVER_CONTEXT` if set. `CreateContextFromString(settings)` builds a Clio context when the string contains `=`, otherwise the default resolver's search-path context. |
 | `_GetAssetInfo` | Fills `version` (revision/change number) and `resolverInfo` (depot path, digest), so DCC UIs can show "crate.usd v12 @18234". |
 | `_GetModificationTimestamp` | Returns a timestamp derived from the revision or change number, so `Reload()` picks up newly synced versions. |
 | `_RefreshContext` | Re-evaluates moving pins ("latest", labels), syncs, and sends `ArNotice::ResolverChanged` for affected contexts. |
-| `_OpenAsset` | Opens the local file (`ArFilesystemAsset`). A later option is to stream pinned versions without writing files. |
+| `_OpenAsset`, `_GetModificationTimestamp`, `_OpenAssetForWrite` | Inherited: resolved paths are ordinary local files. A later option is to stream pinned versions without writing files. |
 
 * **Policies in the context:** `sync` (default: fetch what is needed),
   `verify` (fail if not present, no server calls, for farm reproducibility),
@@ -1090,8 +1106,10 @@ symbol.
     26.08 and 25.08, and the USD tests pass on both. A plugin built for
     26.08 fails in 25.08, which confirms one build per version.
   * Registration: `PXR_PLUGINPATH_NAME` pointing at the plugin's
-    `plugInfo.json`. `clio doctor` checks that the plugin loads and that the
-    `clio` scheme is registered (`Ar.GetRegisteredURISchemes()`).
+    `plugInfo.json`, which declares `ClioResolver` with base
+    `ArDefaultResolver`. USD picks it as the primary resolver
+    automatically. `clio doctor` will check that the `clioUsd` plugin is
+    loaded.
   * *(To confirm: P4API licence terms for redistributing it statically
     linked inside our plugin.)*
 * **The per-machine agent** (§8.1) is no longer needed for the resolver. It
@@ -1108,18 +1126,16 @@ symbol.
 | `have` | Whatever is in the workspace. No server call. | Offline, or "don't change my files" |
 | `@<change>` | Snapshot of the branch at that change number | Reproducible shot, farm render |
 | `@<label>` | Perforce label (for example `approved`, `delivery_0412`) | Approved or released versions |
-| `#<rev>` on one path | That file's revision | Pinning one asset inside a shot |
+| `#<rev>` | One file's revision | Python API only (`AssetIdentifier`), not USD |
 
 Rules:
-1. A stage has **one context pin** (usually `latest`, or `@change` for
-   reproducibility).
-2. A path can **override** it in its asset path:
-   `clio:/props/crate/crate.usd?change=18100` or `?label=approved`.
-   (Query syntax rather than `#`, to avoid confusion with URI fragments.)
-3. **Relative paths inherit the anchor's snapshot pin** (`@change`/`@label`),
-   so an asset's internal sublayers and textures are always a consistent
-   set. A per-file `#rev` pin is *not* inherited, because it would be
-   meaningless for siblings.
+1. A stage has **one pin, set on its context** (usually `latest`, or
+   `@change` for reproducibility). Layers contain plain paths, so a single
+   path cannot carry its own pin (§10.2).
+2. **Relative paths inside a pinned layer stay at the pin.** The version
+   store mirrors the depot layout for each version, so a relative path
+   anchored next to a pinned layer lands in the same version's folder, and
+   Clio fetches it at that version.
 
 **Where versions are placed.**
 * `latest` / `have` → the **workspace**, through a normal sync. This is what
@@ -1133,37 +1149,34 @@ Rules:
   by any pin. The resolver returns the artist's local file for `latest` and
   warns that a pinned version differs from local edits.
 
-**Open prototyping question: the form of the resolved path.** Sdf anchors a
-layer's relative paths to that layer's *resolved path* (`sdf/layerUtils.cpp`
-L193).
-* If Clio returns a plain file path (for example
-  `/cache/…/crate.usd`), relative children are anchored on the filesystem.
-  The primary resolver then handles them, not Clio, and they are not synced
-  or pinned. To make that work, the version store must mirror the depot
-  layout per snapshot and be pre-filled per asset.
-* If Clio returns a `clio:`-form resolved path and opens the local file in
-  `_OpenAsset`, children stay under Clio's control. However, any consumer
-  that uses resolved paths as file paths directly (some renderers do this
-  for textures) would receive a URI.
-* A likely answer is **`clio:` resolved paths for layers, file paths for
-  non-layer assets**. This must be validated in a prototype with Hydra
-  Storm and the renderers you use before the design is fixed.
+**The form of the resolved path (settled).** Sdf anchors a layer's
+relative paths to that layer's *resolved path* (`sdf/layerUtils.cpp` L193).
+Clio returns ordinary local file paths, so renderers and other consumers
+that read resolved paths as files work unchanged. Relative children stay
+under Clio's control because every local path inside the workspace root or
+the version store is recognised again: a workspace path means "the
+context's pin", and a version-store path means "the version its folder
+holds" (for example `…/change-18234/…`). Tested with nested relative
+sublayers at `latest` and at a change pin.
 
 ### 10.5 Authoring conventions (what is written inside layers)
 
-* **Inside an asset** (the asset's own sublayers, geometry, textures):
-  relative paths (`./geo/crate_geo.usdc`). The files stay portable and work
-  without Clio once synced.
-* **Across assets** (shot → asset, set → prop): `clio:` URIs
-  (`clio:/props/crate/crate.usd`). They don't depend on each artist's
-  workspace root, and they can carry a pin.
-* **Deliveries and vendors:** `clio usd localize` rewrites `clio:` paths to
-  plain relative paths, using USD's own `UsdUtilsModifyAssetPaths` /
-  localization APIs (`usdUtils/localizeAsset.h`), so the result opens
-  without Clio.
-* Until option B ships, layers can use plain relative paths everywhere, and
-  option A handles syncing. Adopting `clio:` later is a path rewrite of
-  the cross-asset references only.
+* **Plain paths only.** Layers must open in USD without Clio.
+* **Relative paths (recommended)** for everything: inside an asset
+  (`./geo/crate_geo.usdc`) and across assets
+  (`../../assets/crate/crate.usda`). A copied folder opens anywhere with no
+  settings.
+* **Project-rooted search paths** (`assets/crate/crate.usda`) also work.
+  Plain USD needs `PXR_AR_DEFAULT_SEARCH_PATH=<project root>`; Clio
+  searches the workspace root automatically. USD first looks next to the
+  current layer, which with Clio can cost one server call per probe (the
+  "not found" answer is remembered until refresh). Relative paths avoid
+  this.
+* **No absolute paths** in shared files: they only work on machines with the
+  same folder layout.
+* **Deliveries:** no path rewriting is needed. Open the stage once with Clio
+  at the version to deliver: every file it needs is then on disk, in the
+  workspace or the version store, with the depot's layout.
 
 ### 10.6 Saving layers (write side)
 
@@ -1295,7 +1308,7 @@ loaded lazily, or `argparse` for zero dependencies.)*
 | **1 — Core workflow** | Python services over `CoreBackend`: connect/login/setup, get (parallel), lock/unlock, save, status, history backed by the HistoryCache with watermark refresh (§9.3–9.4), CLI for these. Baseline benchmarks. |
 | **2 — Branching** | Streams/task streams, switch, update/publish with binary conflict handling, cross-branch lock check, drafts (shelves). |
 | **3 — Performance** | Connection pool and miss coalescer in `clio_core`; time-bounded in-memory caches (§8.3); C++ hashing/scan/diff if benchmarks justify it. Measure; add a persistent store only if the numbers call for it. |
-| **4 — USD completion** | Settle the resolved-path form (§10.4); write side (edit/lock on save, §10.6); revision-based timestamps; `deda.clio.usd.prepare` (option A); CI builds against USD 26.08 and 25.08. |
+| **4 — USD completion** | Write side (edit/lock on save, §10.6); revision-based timestamps; `deda.clio.usd.prepare` (option A); CI builds against USD 26.08 and 25.08. |
 | **5 — Ecosystem** | UI view models (`FileListView`, `HistoryView`) with the request pipeline, ContentCache (§9.5), asset resolver plugins, validation hooks, `clio doctor`. Dedaverse/DCC integration when targeted. |
 
 ### Backlog
@@ -1323,16 +1336,17 @@ loaded lazily, or `argparse` for zero dependencies.)*
 6. **Asset identity:** Is an asset a folder (all files under a path), or is
    it defined by Dedaverse/Imagine metadata (for example a USD asset or a
    database ID)? This decides how much of the resolver ships in Clio itself.
-7. **USD authoring:** Are you happy with relative paths inside assets and
-   `clio:` URIs across assets (§10.5), or should everything stay plain
-   paths, with Clio relying on pre-open sync only?
-8. **Pins:** Is a Perforce **label** the right way to mark approved
+7. **Pins:** Is a Perforce **label** the right way to mark approved
     versions, or will Dedaverse/Imagine keep their own version records that
     map to change numbers?
-9. **P4API licence:** confirm that the Perforce C++ API may be
+8. **P4API licence:** confirm that the Perforce C++ API may be
     redistributed statically linked inside our wheel and plugin.
 
 ### Decided
+
+* USD authoring: layers contain plain paths; Clio's resolver is the primary
+  resolver, a subclass of `ArDefaultResolver`, and enhances it only when a
+  Clio context is bound (§10.2). `clio:` URIs are no longer used in layers.
 
 * Caching: in memory only for the MVP; the server is the authority
   (§8.3). A persistent SQLite store is in the backlog, only if performance

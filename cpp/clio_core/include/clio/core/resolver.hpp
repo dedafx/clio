@@ -62,6 +62,17 @@ public:
     /// verify and offline policies). Throws Error on server or config errors.
     std::optional<ResolvedAsset> resolve(const AssetIdentifier& id);
 
+    /// True if `localPath` is inside the workspace root or this project's
+    /// part of the version store. No filesystem or server access.
+    bool manages(const std::filesystem::path& localPath) const;
+
+    /// Resolve a local path, as written in (or anchored from) a USD layer.
+    /// A workspace path uses the pin from the settings; a version-store path
+    /// uses the version its folder holds, so relative paths inside a pinned
+    /// layer stay at that version. Returns nullopt if the path is not managed
+    /// or the file is not available.
+    std::optional<ResolvedAsset> resolvePath(const std::filesystem::path& localPath);
+
     /// Where a new file for `id` would be written in the workspace. Makes no
     /// server calls.
     std::filesystem::path resolveForNewAsset(const AssetIdentifier& id) const;
@@ -74,7 +85,10 @@ public:
     static constexpr std::chrono::seconds serverRetryInterval{60};
 
 private:
-    std::optional<ResolvedAsset> _resolveUncached(const AssetIdentifier& id, const Pin& pin);
+    /// `serverAnswered` is set when the result, including "not found", came
+    /// from the server and may be remembered.
+    std::optional<ResolvedAsset> _resolveUncached(const AssetIdentifier& id, const Pin& pin,
+                                                  bool& serverAnswered);
     std::optional<ResolvedAsset> _useWorkspaceFile(ResolvedAsset asset, const std::string& reason) const;
     bool _serverAvailable() const;
     void _markServerUnavailable();
@@ -82,7 +96,9 @@ private:
     Workspace _workspace;
     std::atomic<std::int64_t> _serverRetryAt{0}; ///< steady_clock ticks; 0 = available
     std::mutex _memoMutex;
-    std::unordered_map<std::string, ResolvedAsset> _memo;
+    /// Remembered answers, including "not found" answers from the server
+    /// (USD probes paths that do not exist when it looks for search paths).
+    std::unordered_map<std::string, std::optional<ResolvedAsset>> _memo;
 };
 
 } // namespace clio::core

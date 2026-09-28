@@ -44,6 +44,30 @@ std::string pinDirName(const Pin& pin) {
     throw Error("Pin '" + pin.str() + "' is not a historical version");
 }
 
+// `path` relative to `base` if it is inside it, using '/' separators.
+std::optional<std::string> relativeInside(const std::filesystem::path& path,
+                                          const std::filesystem::path& base) {
+    if (base.empty() || !path.is_absolute()) {
+        return std::nullopt;
+    }
+    const auto rel = path.lexically_normal().lexically_relative(base.lexically_normal());
+    const std::string text = rel.generic_string();
+    if (text.empty() || text == "." || text == ".." || text.rfind("../", 0) == 0) {
+        return std::nullopt;
+    }
+    return text;
+}
+
+std::optional<Pin> pinFromDirName(const std::string& name) {
+    try {
+        if (name.rfind("change-", 0) == 0) return Pin::parse("@" + name.substr(7));
+        if (name.rfind("label-", 0) == 0) return Pin::label(name.substr(6));
+        if (name.rfind("rev-", 0) == 0) return Pin::parse("#" + name.substr(4));
+    } catch (const Error&) {
+    }
+    return std::nullopt;
+}
+
 } // namespace
 
 Workspace::Workspace(Settings settings)
@@ -62,6 +86,34 @@ std::filesystem::path Workspace::versionStorePath(const AssetIdentifier& id, con
     const std::string depot = safeDirName(_settings.depotRoot.substr(2));
     return _settings.versionStore / server / depot / pinDirName(pin) /
            std::filesystem::path(id.relativePath());
+}
+
+std::optional<LocalPathMatch> Workspace::matchLocalPath(const std::filesystem::path& path) const {
+    const auto storeBase = _settings.versionStore / safeDirName(_settings.connection.port) /
+                           safeDirName(_settings.depotRoot.substr(2));
+    if (auto rel = relativeInside(path, storeBase)) {
+        const std::size_t slash = rel->find('/');
+        if (slash == std::string::npos) {
+            return std::nullopt;
+        }
+        auto pin = pinFromDirName(rel->substr(0, slash));
+        if (!pin) {
+            return std::nullopt;
+        }
+        try {
+            return LocalPathMatch{AssetIdentifier::fromRelativePath(rel->substr(slash + 1), pin), pin, true};
+        } catch (const Error&) {
+            return std::nullopt;
+        }
+    }
+    if (auto rel = relativeInside(path, _settings.workspaceRoot)) {
+        try {
+            return LocalPathMatch{AssetIdentifier::fromRelativePath(*rel), std::nullopt, false};
+        } catch (const Error&) {
+            return std::nullopt;
+        }
+    }
+    return std::nullopt;
 }
 
 p4::CommandResult Workspace::sync(const std::vector<AssetIdentifier>& ids, const Pin& pin) {

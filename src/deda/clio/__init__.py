@@ -1,7 +1,7 @@
 """Clio: artist-friendly access to assets stored in Perforce.
 
-The core (Perforce access and ``clio:`` asset resolution) is implemented in
-C++ (``deda.clio._core``) and shared with the USD asset resolver plugin, so
+The core (Perforce access and asset resolution) is implemented in C++
+(``deda.clio._core``) and shared with the USD asset resolver plugin, so
 Python and USD resolve every asset path the same way.
 
 ``deda`` is a PEP 420 namespace package: there is no ``deda/__init__.py``.

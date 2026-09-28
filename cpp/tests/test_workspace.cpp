@@ -213,3 +213,51 @@ TEST_CASE("an unreachable server does not stall resolves") {
     // One connect attempt at most (2 s); the second resolve does not retry.
     CHECK(elapsed < std::chrono::seconds(8));
 }
+
+TEST_CASE("local paths map back to project files") {
+    Settings s = Settings::parse("depot=//d/main;root=/work/proj;store=/cache/v;port=perf:1666");
+    Workspace ws(s);
+    const auto storeDir = ws.versionStorePath(AssetIdentifier::parse("clio:/x"), Pin::change(7)).parent_path();
+
+    const auto inWorkspace = ws.matchLocalPath("/work/proj/assets/crate/../crate/crate.usda");
+    REQUIRE(inWorkspace);
+    CHECK(inWorkspace->id.path() == "/assets/crate/crate.usda");
+    CHECK_FALSE(inWorkspace->pin);
+    CHECK_FALSE(inWorkspace->inVersionStore);
+
+    const auto inStore = ws.matchLocalPath(storeDir / "assets/crate/geo.usda");
+    REQUIRE(inStore);
+    CHECK(inStore->id.path() == "/assets/crate/geo.usda");
+    CHECK(*inStore->pin == Pin::change(7));
+    CHECK(inStore->inVersionStore);
+
+    CHECK_FALSE(ws.matchLocalPath("/elsewhere/a.usda"));
+    CHECK_FALSE(ws.matchLocalPath("/work/proj"));
+    CHECK_FALSE(ws.matchLocalPath("/work/project2/a.usda"));
+    CHECK_FALSE(ws.matchLocalPath("relative/a.usda"));
+}
+
+TEST_CASE("a relative file next to a pinned layer is fetched at the same version") {
+    auto fx = fixtureOrSkip();
+    if (!fx) return;
+
+    const auto v1 = fx->submit({{"assets/crate/crate.usda", "crate v1"}, {"assets/crate/geo.usda", "geo v1"}}, "v1");
+    fx->submit({{"assets/crate/geo.usda", "geo v2"}}, "v2");
+
+    AssetResolver resolver(fx->settings());
+    const auto crate = resolver.resolve(
+        AssetIdentifier::parse("clio:/assets/crate/crate.usda?change=" + std::to_string(v1)));
+    REQUIRE(crate);
+    // What USD does with @./geo.usda@ inside the pinned crate layer:
+    const auto geo = resolver.resolvePath(crate->localPath.parent_path() / "geo.usda");
+    REQUIRE(geo);
+    CHECK(readFile(geo->localPath) == "geo v1");
+}
+
+TEST_CASE("paths outside the project are not handled") {
+    auto fx = fixtureOrSkip();
+    if (!fx) return;
+    AssetResolver resolver(fx->settings());
+    CHECK_FALSE(resolver.manages("/tmp/elsewhere.usda"));
+    CHECK_FALSE(resolver.resolvePath("/tmp/elsewhere.usda"));
+}

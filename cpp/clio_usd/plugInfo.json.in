@@ -4,8 +4,7 @@
             "Info": {
                 "Types": {
                     "ClioResolver": {
-                        "bases": ["ArResolver"],
-                        "uriSchemes": ["clio"],
+                        "bases": ["ArDefaultResolver"],
                         "implementsContexts": true
                     }
                 }
