@@ -56,9 +56,13 @@ struct Settings {
     bool operator!=(const Settings& other) const { return !(*this == other); }
 
     /// The default version store: $CLIO_VERSION_STORE, else
-    /// $XDG_CACHE_HOME/clio/versions or ~/.cache/clio/versions
-    /// (%LOCALAPPDATA%\clio\versions on Windows).
+    /// <defaultCacheDir>/versions.
     static std::filesystem::path defaultVersionStore();
+
+    /// Clio's per-user cache folder: $XDG_CACHE_HOME/clio or ~/.cache/clio
+    /// (%LOCALAPPDATA%\clio on Windows). Holds lock files and, by default,
+    /// the version store.
+    static std::filesystem::path defaultCacheDir();
 };
 
 } // namespace clio::core

@@ -2,6 +2,7 @@
 
 #include "clio/core/error.hpp"
 
+#include <charconv>
 #include <cstdlib>
 #include <map>
 
@@ -41,6 +42,19 @@ void validateDepotRoot(const std::string& depot) {
     }
 }
 
+// A whole, non-negative number of seconds. Rejects trailing text such as
+// "10seconds", which std::stol would accept as 10.
+std::chrono::seconds parseSeconds(const std::string& key, const std::string& value) {
+    long long seconds = -1;
+    const char* first = value.data();
+    const char* last = value.data() + value.size();
+    const auto [ptr, ec] = std::from_chars(first, last, seconds);
+    if (value.empty() || ec != std::errc() || ptr != last || seconds < 0) {
+        throw ConfigError(key + " must be a whole number of seconds, got '" + value + "'");
+    }
+    return std::chrono::seconds(seconds);
+}
+
 } // namespace
 
 std::string policyName(Policy policy) {
@@ -62,22 +76,26 @@ Policy parsePolicy(const std::string& text) {
     throw ConfigError("Unknown policy '" + text + "': expected sync, verify or offline");
 }
 
+std::filesystem::path Settings::defaultCacheDir() {
+#ifdef _WIN32
+    if (auto local = getEnv("LOCALAPPDATA"); !local.empty()) {
+        return std::filesystem::path(local) / "clio";
+    }
+#endif
+    if (auto xdg = getEnv("XDG_CACHE_HOME"); !xdg.empty()) {
+        return std::filesystem::path(xdg) / "clio";
+    }
+    if (auto home = getEnv("HOME"); !home.empty()) {
+        return std::filesystem::path(home) / ".cache" / "clio";
+    }
+    return std::filesystem::temp_directory_path() / "clio";
+}
+
 std::filesystem::path Settings::defaultVersionStore() {
     if (auto explicitStore = getEnv("CLIO_VERSION_STORE"); !explicitStore.empty()) {
         return explicitStore;
     }
-#ifdef _WIN32
-    if (auto local = getEnv("LOCALAPPDATA"); !local.empty()) {
-        return std::filesystem::path(local) / "clio" / "versions";
-    }
-#endif
-    if (auto xdg = getEnv("XDG_CACHE_HOME"); !xdg.empty()) {
-        return std::filesystem::path(xdg) / "clio" / "versions";
-    }
-    if (auto home = getEnv("HOME"); !home.empty()) {
-        return std::filesystem::path(home) / ".cache" / "clio" / "versions";
-    }
-    return std::filesystem::temp_directory_path() / "clio" / "versions";
+    return defaultCacheDir() / "versions";
 }
 
 Settings Settings::parse(const std::string& text) {
@@ -129,25 +147,9 @@ Settings Settings::parse(const std::string& text) {
         } else if (key == "policy") {
             settings.policy = parsePolicy(value);
         } else if (key == "connect_timeout") {
-            try {
-                const long seconds = std::stol(value);
-                if (seconds < 0) {
-                    throw std::invalid_argument("negative");
-                }
-                settings.connection.connectTimeout = std::chrono::seconds(seconds);
-            } catch (const std::exception&) {
-                throw ConfigError("connect_timeout must be a number of seconds, got '" + value + "'");
-            }
+            settings.connection.connectTimeout = parseSeconds(key, value);
         } else if (key == "timeout") {
-            try {
-                const long seconds = std::stol(value);
-                if (seconds < 0) {
-                    throw std::invalid_argument("negative");
-                }
-                settings.connection.commandTimeout = std::chrono::seconds(seconds);
-            } catch (const std::exception&) {
-                throw ConfigError("timeout must be a number of seconds, got '" + value + "'");
-            }
+            settings.connection.commandTimeout = parseSeconds(key, value);
         } else {
             throw ConfigError("Unknown setting '" + key + "'");
         }

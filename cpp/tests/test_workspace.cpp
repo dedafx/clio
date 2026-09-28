@@ -3,13 +3,17 @@
 #include "p4d_fixture.hpp"
 
 #include "clio/core/error.hpp"
+#include "clio/core/file_lock.hpp"
 #include "clio/core/resolver.hpp"
 
 #include <doctest/doctest.h>
 
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <fstream>
 #include <sstream>
+#include <thread>
 
 using namespace clio::core;
 using clio::test::P4dFixture;
@@ -260,4 +264,71 @@ TEST_CASE("paths outside the project are not handled") {
     AssetResolver resolver(fx->settings());
     CHECK_FALSE(resolver.manages("/tmp/elsewhere.usda"));
     CHECK_FALSE(resolver.resolvePath("/tmp/elsewhere.usda"));
+}
+
+TEST_CASE("label folders are collision-free and map back to the label") {
+    Settings s = Settings::parse("depot=//d/main;root=/work/proj;store=/cache/v;port=perf:1666");
+    Workspace ws(s);
+    const auto id = AssetIdentifier::parse("clio:/a.usda");
+    const auto colon = ws.versionStorePath(id, Pin::label("approved:prod"));
+    const auto underscore = ws.versionStorePath(id, Pin::label("approved_prod"));
+    CHECK(colon != underscore);
+
+    const auto match = ws.matchLocalPath(colon);
+    REQUIRE(match);
+    CHECK(*match->pin == Pin::label("approved:prod"));
+    // Non-canonical folder names are not treated as labels.
+    CHECK_FALSE(ws.matchLocalPath(colon.parent_path().parent_path() / "label-approved%3aprod" / "a.usda"));
+    CHECK_FALSE(ws.matchLocalPath(colon.parent_path().parent_path() / "label-bad%4" / "a.usda"));
+}
+
+TEST_CASE("an empty port uses the effective P4PORT for the store folder") {
+#ifndef _WIN32
+    setenv("P4PORT", "envserver:1666", 1);
+    Workspace ws(Settings::parse("depot=//d/main;root=/work/proj;store=/cache/v"));
+    CHECK(ws.serverKey() == "envserver_1666");
+    unsetenv("P4PORT");
+#endif
+}
+
+TEST_CASE("stored versions are read-only") {
+    auto fx = fixtureOrSkip();
+    if (!fx) return;
+    const auto v1 = fx->submit({{"a.usda", "v1"}}, "v1");
+    AssetResolver resolver(fx->settings());
+    const auto resolved = resolver.resolve(AssetIdentifier::parse("clio:/a.usda?change=" + std::to_string(v1)));
+    REQUIRE(resolved);
+    const auto perms = std::filesystem::status(resolved->localPath).permissions();
+    CHECK((perms & std::filesystem::perms::owner_write) == std::filesystem::perms::none);
+}
+
+TEST_CASE("a file missing at a pinned version is not a server failure") {
+    auto fx = fixtureOrSkip();
+    if (!fx) return;
+    const auto v1 = fx->submit({{"a.usda", "v1"}}, "v1");
+    AssetResolver resolver(fx->settings());
+    CHECK_FALSE(resolver.resolve(
+        AssetIdentifier::parse("clio:/missing.usda?change=" + std::to_string(v1))));
+    // The server is still used for the next request (no fallback warning).
+    const auto next = resolver.resolve(AssetIdentifier::parse("clio:/a.usda"));
+    REQUIRE(next);
+    CHECK(next->warning.empty());
+}
+
+TEST_CASE("the workspace lock excludes other holders until released") {
+    const auto path = std::filesystem::temp_directory_path() / ("clio-lock-test-" + std::to_string(std::rand()));
+    std::atomic<bool> secondAcquired{false};
+    std::thread second;
+    {
+        FileLock first(path);
+        second = std::thread([&] {
+            FileLock again(path); // a separate open file: blocks like another process would
+            secondAcquired = true;
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        CHECK_FALSE(secondAcquired.load());
+    }
+    second.join();
+    CHECK(secondAcquired.load());
+    std::filesystem::remove(path);
 }

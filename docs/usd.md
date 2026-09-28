@@ -128,7 +128,8 @@ Same stage, with `pin=@1` in the context:
    <store>/<server>/<depot>/change-1/shots/sh010/shot.usda
    ```
    It uses `p4 print` to a temporary file, then renames it, so readers
-   never see a half-written file. Clio returns this path.
+   never see a half-written file. Stored files are made read-only, so
+   nothing edits a version in place. Clio returns this path.
 2. USD anchors `../../assets/crate/crate.usda` next to that file, which
    gives `<store>/.../change-1/assets/crate/crate.usda`. Clio recognises
    the `change-1` folder and fetches the crate **at change 1**. The crate's
@@ -346,6 +347,14 @@ assert Plug.Registry().GetPluginWithName("clioUsd").isLoaded
    location is inside the project, Clio asks the server once, and
    remembers a "not found" answer until refresh. Relative paths avoid
    this.
-7. **The connect time limit is Linux/macOS only** for now.
-8. **One plugin build per USD version.** A plugin built for 26.08 does not
+7. **The connect time limit is Linux/macOS only** for now. The workspace
+   lock and read-only stored files are implemented for Windows too, but
+   are only tested on Linux.
+8. **The version store is organised by server address.** The folder is
+   named after the effective `P4PORT` (from the settings or the Perforce
+   environment). Two spellings of one server's address get separate
+   folders, which is safe. If a server is replaced by a different one at
+   the same address, delete that server's folder in the version store,
+   because its change numbers mean something else now.
+9. **One plugin build per USD version.** A plugin built for 26.08 does not
    work in 25.08, and the other way round.

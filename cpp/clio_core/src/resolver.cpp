@@ -93,10 +93,14 @@ std::optional<ResolvedAsset> AssetResolver::_resolveUncached(const AssetIdentifi
             return _useWorkspaceFile(asset, policy == Policy::Offline ? "Offline" : unavailable);
         }
         try {
-            const bool found = _workspace.fetchVersion(id, pin);
+            const FetchResult result = _workspace.fetchVersion(id, pin);
             serverAnswered = true;
-            if (!found) {
+            if (result == FetchResult::NotFound) {
                 return std::nullopt; // the file does not exist at that version
+            }
+            if (result == FetchResult::KeptExisting && pin.kind() == Pin::Kind::Label) {
+                asset.warning = "Could not replace the stored copy of label " + pin.labelName() +
+                                " (it may be in use); it may be out of date";
             }
             return asset;
         } catch (const P4Error& e) {

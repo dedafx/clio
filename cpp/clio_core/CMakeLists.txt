@@ -7,6 +7,7 @@ configure_file(
     @ONLY)
 
 add_library(clio_core STATIC
+    src/file_lock.cpp
     src/identifier.cpp
     src/pin.cpp
     src/resolver.cpp

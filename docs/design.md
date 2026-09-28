@@ -979,10 +979,11 @@ USD worker threads
   once per platform and compiler, not per USD version, and linked
   statically into each `clio_usd` build. It has its own C++ unit tests and
   runs against the same throwaway `p4d` as the Python tests (§13).
-* **`clio_usd`** is the only code that includes USD headers: the
-  `ArResolver` subclass, the context class, and `plugInfo.json` with
-  `"uriSchemes": ["clio"]`. It is kept to a few hundred lines, so building
-  it for a new DCC or USD version is cheap.
+* **`clioUsd`** is the only code that includes USD headers: `ClioResolver`
+  (a subclass of `ArDefaultResolver`, registered as the primary resolver;
+  no URI scheme), the context class, and `plugInfo.json` declaring
+  `ClioResolver` with base `ArDefaultResolver`. It is kept to a few hundred
+  lines, so building it for a new DCC or USD version is cheap.
 
 **How a resolve works**
 
@@ -1040,7 +1041,8 @@ artist runs `clio get`):
   cache file to keep consistent. Both sides get their answers from the
   server, which keeps them in agreement.
 * Workspace-changing operations (sync, edit, add) take a **per-workspace
-  file lock**, shared by Python and C++, so two processes never sync the
+  file lock** (`flock`/`LockFileEx` on a file in Clio's user cache folder;
+  implemented for sync), shared by Python and C++, so two processes never sync the
   same workspace at once. Read-only work (version-store prints, metadata)
   does not take it.
 
@@ -1070,7 +1072,7 @@ symbol.
 | `_CreateIdentifier` | Inherited from `ArDefaultResolver`: USD's usual anchoring of relative paths and search paths. |
 | `_Resolve` | If a Clio context is bound and the path is inside the workspace root or the version store (search paths are tried under the workspace root), fetch it through `clio_core` at the pin and return the local file. Otherwise, or if Clio cannot provide it, `ArDefaultResolver::_Resolve`. *(Scaffold: no coalescer yet; one fetch at a time per context.)* |
 | `_ResolveForNewAsset` / `_CanWriteAssetToPath` / `_OpenAssetForWrite` | When a layer is saved: runs `p4 edit` (with lock for `+l` types) or `p4 add` in the artist's pending change, or refuses with `whyNot` ("locked by Sam"). Never submits (§10.6). |
-| `_IsContextDependentPath` | Inherited. Absolute paths are not context dependent, so Sdf resolves them again for each context and a pinned stage gets its own layers. |
+| `_IsContextDependentPath` | `true` for project paths while a Clio context is bound, because they resolve to a different file for each pin. Sdf then looks layers up by resolved path, so stages opened at different pins in one process never share a layer. Otherwise inherited. |
 | `_CreateDefaultContext[ForAsset]`, `_CreateContextFromString` | The default resolver's context, plus a `ClioResolverContext` from `$CLIO_RESOLVER_CONTEXT` if set. `CreateContextFromString(settings)` builds a Clio context when the string contains `=`, otherwise the default resolver's search-path context. |
 | `_GetAssetInfo` | Fills `version` (revision/change number) and `resolverInfo` (depot path, digest), so DCC UIs can show "crate.usd v12 @18234". |
 | `_GetModificationTimestamp` | Returns a timestamp derived from the revision or change number, so `Reload()` picks up newly synced versions. |

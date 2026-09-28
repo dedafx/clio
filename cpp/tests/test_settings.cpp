@@ -38,6 +38,8 @@ TEST_CASE("invalid settings are rejected") {
                              "depot=//d/main/;root=/w", "depot=//d/...;root=/w",
                              "depot=//d;root=/w;bogus=1", "depot=//d;root=/w;policy=maybe",
                              "depot=//d;root=/w;timeout=-1", "depot=//d;root=/w;pin=#3",
+                             "depot=//d;root=/w;timeout=10seconds", "depot=//d;root=/w;connect_timeout=5s",
+                             "depot=//d;root=/w;timeout=", "depot=//d;root=/w;timeout= 7x",
                              "depot=//d;depot=//e;root=/w", "depot=//d;root"}) {
         CAPTURE(text);
         CHECK_THROWS_AS(Settings::parse(text), clio::core::Error);

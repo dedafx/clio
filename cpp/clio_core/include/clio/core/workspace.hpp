@@ -19,6 +19,13 @@ struct LocalPathMatch {
     bool inVersionStore = false;
 };
 
+/// Outcome of fetching a historical version into the version store.
+enum class FetchResult {
+    Fetched,      ///< Written (or replaced) from the server.
+    NotFound,     ///< The file does not exist at that version.
+    KeptExisting, ///< Fetched, but an existing stored copy could not be replaced and was kept.
+};
+
 /// Maps clio: identifiers to depot and local paths, and runs the Perforce
 /// operations that put files on disk.
 ///
@@ -53,8 +60,16 @@ public:
 
     /// `p4 print` one historical version into the version store. Writes to a
     /// temporary file first and renames it, so readers never see a partial
-    /// file. Returns false if the file does not exist at that version.
-    bool fetchVersion(const AssetIdentifier& id, const Pin& pin);
+    /// file. Stored files are made read-only, so nothing edits a version in
+    /// place.
+    FetchResult fetchVersion(const AssetIdentifier& id, const Pin& pin);
+
+    /// The version-store folder name for this server: the effective P4PORT
+    /// (configured, or from the Perforce environment), made safe for a path.
+    const std::string& serverKey() const { return _serverKey; }
+
+    /// Lock file serializing changes to this workspace across processes.
+    std::filesystem::path lockPath() const;
 
     /// Run any command on this workspace's connection (serialized).
     p4::CommandResult run(const std::string& command,
@@ -65,6 +80,7 @@ private:
     Settings _settings;
     std::mutex _mutex;
     p4::Connection _connection;
+    std::string _serverKey;
 };
 
 } // namespace clio::core

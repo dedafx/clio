@@ -43,6 +43,7 @@ protected:
     ArResolverContext _CreateDefaultContextForAsset(const std::string& assetPath) const override;
     ArResolverContext _CreateContextFromString(const std::string& contextStr) const override;
     void _RefreshContext(const ArResolverContext& context) override;
+    bool _IsContextDependentPath(const std::string& assetPath) const override;
 
     ArAssetInfo _GetAssetInfo(const std::string& assetPath,
                               const ArResolvedPath& resolvedPath) const override;

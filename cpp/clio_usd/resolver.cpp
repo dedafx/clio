@@ -157,6 +157,23 @@ ArResolverContext ClioResolver::_CreateContextFromString(const std::string& cont
     return ArResolverContext(ctx);
 }
 
+bool ClioResolver::_IsContextDependentPath(const std::string& assetPath) const {
+    if (ArDefaultResolver::_IsContextDependentPath(assetPath)) {
+        return true;
+    }
+    // A project path resolves to a different file for each pin (workspace or
+    // version store). Telling Sdf so makes it look layers up by resolved
+    // path, so a stage opened at one pin never reuses a layer opened at
+    // another pin in the same process.
+    try {
+        if (const auto core = _GetCoreResolver()) {
+            return !_ProjectPath(*core, assetPath).empty();
+        }
+    } catch (const std::exception&) {
+    }
+    return false;
+}
+
 void ClioResolver::_RefreshContext(const ArResolverContext& context) {
     const auto* ctx = context.Get<ClioResolverContext>();
     if (!ctx || ctx->IsEmpty()) {

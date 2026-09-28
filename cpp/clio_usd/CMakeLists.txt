@@ -4,7 +4,10 @@
 #   <dir>/clioUsd.so
 #   <dir>/clioUsd/resources/plugInfo.json    <- add this folder to PXR_PLUGINPATH_NAME
 
-find_package(pxr CONFIG REQUIRED)
+# pxr_DIR (or $PXR_ROOT) may be the USD install prefix, where USD's build
+# script puts pxrConfig.cmake, or a lib/cmake/pxr folder inside it.
+find_package(pxr CONFIG REQUIRED
+    HINTS "${pxr_DIR}" "${pxr_DIR}/lib/cmake/pxr" "$ENV{PXR_ROOT}" "$ENV{PXR_ROOT}/lib/cmake/pxr")
 
 set(CLIO_USD_MIN_VERSION 2508) # USD 25.08
 math(EXPR _clio_pxr_version "${PXR_MINOR_VERSION} * 100 + ${PXR_PATCH_VERSION}")

@@ -94,6 +94,11 @@ public:
     bool isConnected() const;
     void disconnect();
 
+    /// The P4PORT this connection uses: the configured port, or the one
+    /// from the Perforce environment (P4PORT, P4CONFIG, P4ENVIRO). Makes no
+    /// server calls.
+    std::string effectivePort() const;
+
     const ConnectionOptions& options() const { return _options; }
 
 private:

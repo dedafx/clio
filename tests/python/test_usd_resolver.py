@@ -224,3 +224,35 @@ def test_refresh_and_reload_pick_up_a_new_version(p4_server):
     assert proc.returncode == 0, err
 
     assert json.loads(out.strip().splitlines()[-1]) == {"before": 1, "after": 2}
+
+
+_MULTI_CONTEXT_SCRIPT = textwrap.dedent(
+    """
+    import json, sys
+    from pxr import Ar, Usd
+
+    resolver = Ar.GetResolver()
+    latest = resolver.CreateContextFromString(sys.argv[1])
+    pinned = resolver.CreateContextFromString(sys.argv[2])
+    values = []
+    for ctx in (latest, pinned, latest):
+        stage = Usd.Stage.Open(sys.argv[3], ctx)
+        values.append([stage.GetPrimAtPath("/Crate").GetAttribute("version").Get(),
+                       stage.GetPrimAtPath("/Geo").GetAttribute("version").Get()])
+    print(json.dumps(values))
+    """
+)
+
+
+def test_one_process_keeps_stages_at_different_pins_apart(p4_server):
+    resources = _plugin_resources()
+    v1 = _submit_v1_v2(p4_server)
+
+    out = subprocess.run(
+        [sys.executable, "-c", _MULTI_CONTEXT_SCRIPT, p4_server.settings_text(),
+         p4_server.settings_text(pin=f"@{v1}"), os.fspath(_shot(p4_server))],
+        env=_env(resources), capture_output=True, text=True, check=False,
+    )
+    assert out.returncode == 0, out.stderr
+
+    assert json.loads(out.stdout.strip().splitlines()[-1]) == [[2, 2], [1, 1], [2, 2]]

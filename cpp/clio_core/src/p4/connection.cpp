@@ -299,6 +299,17 @@ void Connection::disconnect() {
     }
 }
 
+std::string Connection::effectivePort() const {
+    if (!_options.port.empty()) {
+        return _options.port;
+    }
+    initializeP4Libraries();
+    ClientApi client; // reads the environment; does not connect
+    if (!_options.cwd.empty()) client.SetCwd(_options.cwd.c_str());
+    const StrPtr& port = client.GetPort();
+    return std::string(port.Text(), port.Length());
+}
+
 void Connection::_connect() {
     initializeP4Libraries();
 
