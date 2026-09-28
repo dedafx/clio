@@ -93,7 +93,7 @@ The wheel is tagged `cp313-abi3`. With the plugin it contains
 ```bash
 python3.13 -m pip install pytest
 export CLIO_TEST_P4D=/path/to/p4d
-python3.13 -m pytest                 # USD tests need pxr importable (PYTHONPATH=$PXR_ROOT/lib/python)
+python3.13 -m pytest    # USD tests need pxr importable: PYTHONPATH=$PXR_ROOT/lib/python3.13/site-packages
 ```
 
 Tests that need a server are skipped when `CLIO_TEST_P4D` is not set, and

@@ -11,7 +11,8 @@ math(EXPR _clio_pxr_version "${PXR_MINOR_VERSION} * 100 + ${PXR_PATCH_VERSION}")
 if(_clio_pxr_version LESS CLIO_USD_MIN_VERSION)
     message(FATAL_ERROR "clioUsd needs USD 25.08 or later, found ${PXR_VERSION}")
 endif()
-message(STATUS "Building clioUsd against USD ${PXR_MINOR_VERSION}.${PXR_PATCH_VERSION}")
+string(REGEX REPLACE "^([0-9])$" "0\\1" _clio_pxr_patch "${PXR_PATCH_VERSION}")
+message(STATUS "Building clioUsd against USD ${PXR_MINOR_VERSION}.${_clio_pxr_patch}")
 
 add_library(clioUsd MODULE
     resolver.cpp
