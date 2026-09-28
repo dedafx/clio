@@ -31,8 +31,10 @@ struct ResolvedAsset {
 /// Resolution rules shared by the USD plugin and Python (design doc §10.4),
 /// with no USD or Python dependency.
 ///
-///   latest   sync into the workspace (policy sync), then use the workspace file
-///   have     use the workspace file; never contacts the server
+///   have     (default) use the file on disk; if it is not on disk, sync it
+///            (policy sync): at the latest revision if it was never synced,
+///            or the workspace's revision if it was deleted from disk
+///   latest   sync to the head revision (policy sync), then use the workspace file
 ///   @change, #rev
 ///            use the version store; fetch with p4 print if missing
 ///   @label   use the version store, but fetch again once per process,

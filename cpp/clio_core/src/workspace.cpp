@@ -194,11 +194,14 @@ std::optional<LocalPathMatch> Workspace::matchLocalPath(const std::filesystem::p
     return std::nullopt;
 }
 
-p4::CommandResult Workspace::sync(const std::vector<AssetIdentifier>& ids, const Pin& pin) {
+p4::CommandResult Workspace::sync(const std::vector<AssetIdentifier>& ids, const Pin& pin, bool force) {
     if (pin.kind() == Pin::Kind::Revision) {
         throw Error("A revision pin is fetched into the version store, not synced");
     }
     std::vector<std::string> args{"-q"};
+    if (force) {
+        args.push_back("-f");
+    }
     args.reserve(ids.size() + 1);
     for (const auto& id : ids) {
         args.push_back(depotPath(id) + pin.p4RevSpec());

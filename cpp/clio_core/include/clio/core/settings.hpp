@@ -32,7 +32,7 @@ Policy parsePolicy(const std::string& text);
 ///   store    local directory for historical versions (default: user cache)
 ///   port, user, client, tickets
 ///            Perforce settings; empty means the standard P4 environment
-///   pin      default pin: latest (default), have, @change, @label
+///   pin      default pin: have (default), latest, @change, @label
 ///   policy   sync (default), verify, offline
 ///   timeout  command timeout in seconds (default 120, 0 = none)
 ///   connect_timeout
@@ -42,7 +42,7 @@ struct Settings {
     std::string depotRoot;
     std::filesystem::path workspaceRoot;
     std::filesystem::path versionStore;
-    Pin pin = Pin::latest();
+    Pin pin = Pin::have();
     Policy policy = Policy::Sync;
 
     /// Parse the text form. Throws ConfigError or PinError.

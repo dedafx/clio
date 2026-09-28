@@ -170,6 +170,7 @@ TEST_CASE("when Perforce is unavailable, local files are used with a warning") {
 
     auto settings = fx->settings();
     settings.connection.port = "localhost:1"; // nothing listens here
+    settings.pin = Pin::latest();             // a pin that needs the server
     AssetResolver resolver(settings);
 
     SUBCASE("latest uses the workspace file") {
@@ -204,6 +205,7 @@ TEST_CASE("an unreachable server does not stall resolves") {
     auto settings = fx->settings();
     settings.connection.port = "10.255.255.1:1666"; // non-routable: packets are dropped
     settings.connection.connectTimeout = std::chrono::seconds(2);
+    settings.pin = Pin::latest(); // a pin that needs the server
     AssetResolver resolver(settings);
 
     const auto start = std::chrono::steady_clock::now();
@@ -331,4 +333,44 @@ TEST_CASE("the workspace lock excludes other holders until released") {
     second.join();
     CHECK(secondAcquired.load());
     std::filesystem::remove(path);
+}
+
+TEST_CASE("have: a file on disk is loaded as it is; a file not on disk is synced") {
+    auto fx = fixtureOrSkip();
+    if (!fx) return;
+
+    fx->submit({{"a.usda", "a1"}, {"b.usda", "b1"}, {"c.usda", "c1"}}, "v1");
+    fx->submit({{"a.usda", "a2"}, {"b.usda", "b2"}, {"c.usda", "c2"}}, "v2");
+    fx->connection().runOrThrow("sync", {"-q", "//depot/proj/a.usda#1"});    // on disk, older than head
+    fx->connection().runOrThrow("sync", {"-q", "//depot/proj/b.usda#none"}); // never synced here
+    std::filesystem::remove(fx->workspaceRoot() / "c.usda");                 // deleted outside Perforce
+
+    AssetResolver resolver(fx->settings()); // default pin: have
+    REQUIRE(resolver.settings().pin == Pin::have());
+
+    const auto a = resolver.resolve(AssetIdentifier::parse("clio:/a.usda"));
+    REQUIRE(a);
+    CHECK(readFile(a->localPath) == "a1"); // the version on disk wins over head
+
+    const auto b = resolver.resolve(AssetIdentifier::parse("clio:/b.usda"));
+    REQUIRE(b);
+    CHECK(readFile(b->localPath) == "b2"); // missing: synced at head
+
+    const auto c = resolver.resolve(AssetIdentifier::parse("clio:/c.usda"));
+    REQUIRE(c);
+    CHECK(readFile(c->localPath) == "c2"); // deleted: the workspace's revision restored
+
+    CHECK_FALSE(resolver.resolve(AssetIdentifier::parse("clio:/not-in-perforce.usda")));
+}
+
+TEST_CASE("have with the offline policy never syncs") {
+    auto fx = fixtureOrSkip();
+    if (!fx) return;
+    fx->submit({{"a.usda", "a1"}}, "v1");
+    fx->clearWorkspace();
+    auto settings = fx->settings();
+    settings.policy = Policy::Offline;
+    AssetResolver resolver(settings);
+    CHECK_FALSE(resolver.resolve(AssetIdentifier::parse("clio:/a.usda")));
+    CHECK_FALSE(std::filesystem::exists(fx->workspaceRoot() / "a.usda"));
 }

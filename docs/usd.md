@@ -88,14 +88,16 @@ The test suite (`tests/python/test_usd_resolver.py`) uses this depot:
 Change 1 submitted version 1 of each file. A later change submitted
 version 2 of the crate and geo.
 
-### Opening at the latest version
+### Opening with the default pin (`have`)
 
 ```python
 ctx = clio_usd.create_context("depot=//depot/proj;root=/ws;...")
 stage = Usd.Stage.Open("/ws/shots/sh010/shot.usda", ctx)
 ```
 
-The workspace starts empty.
+The rule is simple: **a file already on disk is loaded as it is; a file not
+on this machine yet is synced as its layer is resolved.** Here the
+workspace starts empty, so every file is synced.
 
 1. **USD uses Clio's resolver.** With the plugin installed, Clio replaces
    USD's default resolver with a subclass of it (`ClioResolver`).
@@ -104,17 +106,27 @@ The workspace starts empty.
    including on USD's worker threads.
 3. **The root layer is resolved.** `/ws/shots/sh010/shot.usda` is inside
    the workspace root, so Clio handles it:
-   * the pin is `latest` (the default);
-   * the path maps to `//depot/proj/shots/sh010/shot.usda`;
-   * Clio runs `p4 sync -q //depot/proj/shots/sh010/shot.usda#head` through
-     the Perforce C++ API, inside the USD process;
+   * the pin is `have` (the default);
+   * the file is not on disk, so Clio maps the path to
+     `//depot/proj/shots/sh010/shot.usda` and runs
+     `p4 sync -q //depot/proj/shots/sh010/shot.usda#head` through the
+     Perforce C++ API, inside the USD process;
    * Clio returns `/ws/shots/sh010/shot.usda`, which now exists.
+
+   Had the file already been on disk, at any revision, Clio would have
+   returned it without contacting the server.
 4. **Sublayers resolve the same way.** USD reads the shot, anchors
    `../../assets/crate/crate.usda` next to it, and asks Clio for
    `/ws/assets/crate/crate.usda`. Clio syncs it. Then the crate's
    `./geo.usda` is synced too.
 5. **The stage shows version 2**, and the three files are in your
    workspace, exactly as if you had run `p4 sync` on them.
+
+If the crate had already been on disk at version 1 and the geo had not,
+the stage would show crate version 1 (on disk) and geo version 2 (synced).
+The test `test_have_loads_files_on_disk_as_they_are_and_syncs_missing_ones`
+covers exactly this. To bring files already on disk up to date as well,
+use `pin=latest`.
 
 ### Opening at a changelist
 
@@ -160,8 +172,8 @@ The **pin** is set on the context and applies to the whole stage.
 
 | Pin | Meaning | Files come from |
 |---|---|---|
-| `latest` (default) | Head revision | `p4 sync` into your workspace |
-| `have` | Whatever is already in your workspace. No server call. | Your workspace |
+| `have` (default) | The file on disk, whatever its revision. A file not on disk yet is synced at the latest revision (or restored, if it was deleted outside Perforce). | Your workspace |
+| `latest` | Head revision, even for files already on disk | `p4 sync` into your workspace |
 | `@<change>` | The depot as of that changelist | Version store (`p4 print`) |
 | `@<label>` | The revisions tagged by a Perforce label | Version store, fetched again once per process |
 
@@ -187,7 +199,7 @@ passed to USD's default resolver as a search path, as before.
 | `port`, `user` | no | Perforce server and user. Default: your Perforce environment (`P4PORT`, `P4USER`, `P4CONFIG`, ...) |
 | `tickets` | no | Ticket file, if not the default (`P4TICKETS` or `~/.p4tickets`) |
 | `store` | no | Version store folder. Default: `$CLIO_VERSION_STORE`, else `$XDG_CACHE_HOME/clio/versions`, else `~/.cache/clio/versions` (`%LOCALAPPDATA%\clio\versions` on Windows) |
-| `pin` | no | `latest` (default), `have`, `@<change>`, `@<label>` |
+| `pin` | no | `have` (default), `latest`, `@<change>`, `@<label>` |
 | `policy` | no | `sync` (default), `verify` or `offline` (below) |
 | `timeout` | no | Seconds before a Perforce command is cancelled. Default `120`, `0` = none |
 | `connect_timeout` | no | Seconds to wait for an unreachable server before falling back to local files. Default `10`, `0` = the OS default (can be over 2 minutes) |
@@ -204,7 +216,7 @@ clio.Settings.parse(settings)   # raises clio.ConfigError with the reason
 | Policy | Contacts the server? | Use it for |
 |---|---|---|
 | `sync` | Yes, to fetch what is missing or out of date. Falls back to local files, with a warning, if the server is unavailable. | Everyday work |
-| `verify` | No. A file must already be on disk at the required version. Never falls back. | Render farms and reproducible builds, after a prefetch step |
+| `verify` | No. A file must already be on disk at the required version. Never falls back. | Render farms and reproducible builds, after a prefetch step (planned: version manifests, design §10.8) |
 | `offline` | No. Uses what is on disk (for historical pins: the version store, then the workspace). | Working without a connection |
 
 ### A default context for every stage

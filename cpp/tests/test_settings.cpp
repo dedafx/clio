@@ -46,6 +46,14 @@ TEST_CASE("invalid settings are rejected") {
     }
 }
 
+TEST_CASE("the default pin is have") {
+    const auto s = Settings::parse("depot=//d/main;root=/w;store=/s");
+    CHECK(s.pin == Pin::have());
+    CHECK(s.str() == "depot=//d/main;root=/w;store=/s");
+    CHECK(Settings::parse("depot=//d/main;root=/w;store=/s;pin=latest").str() ==
+          "depot=//d/main;root=/w;store=/s;pin=latest");
+}
+
 TEST_CASE("version store defaults to the user cache") {
     const auto s = Settings::parse("depot=//d/main;root=/w");
     CHECK_FALSE(s.versionStore.empty());

@@ -115,10 +115,28 @@ def test_latest_fetches_the_stage_and_its_relative_sublayers(p4_server):
     p4_server.clear_workspace()
     assert not _shot(p4_server).exists()
 
-    result, _ = _open_stage(p4_server.settings_text(), _shot(p4_server), plugin=resources)
+    result, _ = _open_stage(p4_server.settings_text(pin="latest"), _shot(p4_server), plugin=resources)
 
     assert (result["value"], result["geo"]) == (2, 2)
     assert (p4_server.workspace_root / "assets/crate/geo.usda").is_file()
+
+
+def test_have_loads_files_on_disk_as_they_are_and_syncs_missing_ones(p4_server):
+    """The default pin: the version on disk is the version loaded; a file not
+    yet on this machine is synced as its layer is resolved."""
+    resources = _plugin_resources()
+    _submit_v1_v2(p4_server)
+    conn = p4_server.connection()
+    conn.run_or_throw("sync", ["-q", "//depot/proj/assets/crate/crate.usda#1"])  # on disk at v1
+    conn.run_or_throw("sync", ["-q", "//depot/proj/assets/crate/geo.usda#none"])  # not on disk
+    geo = p4_server.workspace_root / "assets/crate/geo.usda"
+    assert not geo.exists()
+
+    result, _ = _open_stage(p4_server.settings_text(), _shot(p4_server), plugin=resources)
+
+    assert result["value"] == 1  # crate: the version on disk, although head is 2
+    assert result["geo"] == 2    # geo: synced (latest) while the stage loaded
+    assert geo.is_file()
 
 
 def test_change_pin_keeps_relative_sublayers_at_that_version(p4_server):
@@ -177,7 +195,8 @@ def test_plugin_without_a_clio_context_behaves_like_the_default_resolver(p4_serv
 def test_stage_opens_from_local_files_when_perforce_is_unavailable(p4_server):
     resources = _plugin_resources()
     _submit_v1_v2(p4_server)
-    settings = p4_server.settings_text(port="localhost:1")  # nothing listens here
+    # latest needs the server for every file; nothing listens on this port.
+    settings = p4_server.settings_text(port="localhost:1", pin="latest")
 
     result, stderr = _open_stage(settings, _shot(p4_server), plugin=resources)
 
@@ -212,7 +231,8 @@ def test_refresh_and_reload_pick_up_a_new_version(p4_server):
     }, "v1")
 
     proc = subprocess.Popen(
-        [sys.executable, "-c", _REFRESH_SCRIPT, p4_server.settings_text(), os.fspath(_shot(p4_server))],
+        [sys.executable, "-c", _REFRESH_SCRIPT, p4_server.settings_text(pin="latest"),
+         os.fspath(_shot(p4_server))],
         env=_env(resources), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     assert proc.stdout.readline().strip() == "READY"
@@ -249,7 +269,7 @@ def test_one_process_keeps_stages_at_different_pins_apart(p4_server):
     v1 = _submit_v1_v2(p4_server)
 
     out = subprocess.run(
-        [sys.executable, "-c", _MULTI_CONTEXT_SCRIPT, p4_server.settings_text(),
+        [sys.executable, "-c", _MULTI_CONTEXT_SCRIPT, p4_server.settings_text(pin="latest"),
          p4_server.settings_text(pin=f"@{v1}"), os.fspath(_shot(p4_server))],
         env=_env(resources), capture_output=True, text=True, check=False,
     )

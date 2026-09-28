@@ -115,6 +115,33 @@ std::optional<ResolvedAsset> AssetResolver::_resolveUncached(const AssetIdentifi
     }
 
     asset.localPath = _workspace.workspacePath(id);
+
+    if (pin.kind() == Pin::Kind::Have) {
+        // The file on disk is the version to use, whatever its revision.
+        if (std::filesystem::exists(asset.localPath)) {
+            return asset;
+        }
+        // Not on disk: fetch it, if the policy allows the server.
+        if (mayContactServer) {
+            try {
+                // Never synced to this workspace: take the latest revision.
+                _workspace.sync({id}, Pin::latest());
+                if (!std::filesystem::exists(asset.localPath)) {
+                    // Perforce thinks it is here, but it was deleted from
+                    // disk: restore the revision the workspace has.
+                    _workspace.sync({id}, Pin::have(), /*force=*/true);
+                }
+                serverAnswered = true;
+            } catch (const P4Error&) {
+                _markServerUnavailable();
+            }
+        }
+        if (!std::filesystem::exists(asset.localPath)) {
+            return std::nullopt;
+        }
+        return asset;
+    }
+
     if (pin.kind() == Pin::Kind::Latest && mayContactServer) {
         try {
             // A no-op on the server when the file is already current.

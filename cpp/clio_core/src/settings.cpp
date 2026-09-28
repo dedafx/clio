@@ -183,7 +183,7 @@ std::string Settings::str() const {
     if (!connection.user.empty()) add("user", connection.user);
     if (!connection.client.empty()) add("client", connection.client);
     if (!connection.ticketFile.empty()) add("tickets", connection.ticketFile);
-    if (pin != Pin::latest()) add("pin", pin.str());
+    if (pin != Pin::have()) add("pin", pin.str());
     if (policy != Policy::Sync) add("policy", policyName(policy));
     if (connection.connectTimeout != p4::ConnectionOptions{}.connectTimeout) {
         add("connect_timeout", std::to_string(connection.connectTimeout.count()));

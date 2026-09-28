@@ -55,8 +55,10 @@ public:
 
     /// `p4 sync` the files to `pin` (latest, have or a snapshot) in the
     /// workspace. Files that do not exist in the depot are skipped. Files the
-    /// user has opened are never overwritten (Perforce refuses to).
-    p4::CommandResult sync(const std::vector<AssetIdentifier>& ids, const Pin& pin);
+    /// user has opened are never overwritten (Perforce refuses to). `force`
+    /// rewrites files Perforce believes are already there (`sync -f`), for
+    /// example a file deleted from disk outside Perforce.
+    p4::CommandResult sync(const std::vector<AssetIdentifier>& ids, const Pin& pin, bool force = false);
 
     /// `p4 print` one historical version into the version store. Writes to a
     /// temporary file first and renames it, so readers never see a partial

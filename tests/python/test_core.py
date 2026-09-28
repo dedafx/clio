@@ -50,7 +50,7 @@ def test_settings_canonical_form():
     assert a == b
     assert str(a) == "depot=//d/main;root=/w;store=/s;policy=verify"
     assert a.policy == clio.Policy.VERIFY
-    assert a.pin == clio.Pin.latest()
+    assert a.pin == clio.Pin.have()  # the default: the file on disk, synced only if missing
 
 
 def test_connection_does_not_prompt_without_callback():

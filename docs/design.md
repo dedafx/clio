@@ -1124,15 +1124,15 @@ symbol.
 
 | Pin | Meaning | Typical use |
 |---|---|---|
-| `latest` | Head revision on the context's branch | Artists working live |
-| `have` | Whatever is in the workspace. No server call. | Offline, or "don't change my files" |
+| `have` (default) | The file on disk, whatever its revision. A file not on disk yet is synced at head; a file deleted outside Perforce is restored at the workspace's revision. No server call for files already on disk. | Everyday work: "load what I have, fetch what I'm missing" |
+| `latest` | Head revision, synced even for files already on disk | "Give me the newest of everything" |
 | `@<change>` | Snapshot of the branch at that change number | Reproducible shot, farm render |
 | `@<label>` | Perforce label (for example `approved`, `delivery_0412`) | Approved or released versions |
 | `#<rev>` | One file's revision | Python API only (`AssetIdentifier`), not USD |
 
 Rules:
-1. A stage has **one pin, set on its context** (usually `latest`, or
-   `@change` for reproducibility). Layers contain plain paths, so a single
+1. A stage has **one pin, set on its context** (usually `have`, `latest`,
+   or `@change` / a manifest (§10.8) for reproducibility). Layers contain plain paths, so a single
    path cannot carry its own pin (§10.2).
 2. **Relative paths inside a pinned layer stay at the pin.** The version
    store mirrors the depot layout for each version, so a relative path
@@ -1209,6 +1209,172 @@ their save callbacks.
   the `payloads` policy decides up front.
 * **Large binaries** (`.usdc` caches, VDBs, textures) use the parallel
   transfer from §8.2.
+
+### 10.8 Version manifests: the same files on every machine (sketch)
+
+**Problem.** `have` and `latest` depend on the machine: `have` loads
+whatever each workspace holds, and `latest` depends on *when* each machine
+resolves. A farm render split over 500 machines must load **exactly the same
+file revisions** on every frame, on every machine, even while artists keep
+submitting. A change-number pin (`@18234`) is close, but it cannot express
+what an artist actually looked at: a mix of revisions synced at different
+times, or files newer than any single change on their branch.
+
+**Idea.** Before a stage is loaded for batch work, Clio writes a
+**manifest**: the exact revision of every file the stage can load. Every
+machine then loads through the manifest and nothing else. The manifest is
+the unit of reproducibility: the same manifest gives the same pixels, today
+or in a year.
+
+#### What a manifest contains
+
+```jsonc
+{
+  "clio_manifest": 1,
+  "created": "2026-09-28T14:02:11Z",
+  "created_by": "sam@sam-ws01",
+  "server": "ssl:perforce:1666",              // effective P4PORT (§8.3)
+  "depot": "//imagine/main",
+  "root_layer": "shots/sq010/sh0100/shot.usda", // relative to the depot root
+  "source_pin": "have",                         // how revisions were chosen
+  "usd_version": "26.08",
+  "files": {
+    "shots/sq010/sh0100/shot.usda": {"rev": 14, "change": 18230, "digest": "9f2c…", "size": 2481, "type": "text"},
+    "assets/crate/crate.usda":      {"rev": 7,  "change": 18102, "digest": "41ab…", "size": 931,  "type": "text"},
+    "assets/crate/geo.usdc":        {"rev": 3,  "change": 17990, "digest": "c07e…", "size": 48213377, "type": "binary+Fl"},
+    "assets/crate/tex/albedo.exr":  {"rev": 5,  "change": 18011, "digest": "d1f0…", "size": 67108864, "type": "binary+Fl"}
+  }
+}
+```
+
+* One entry per file, keyed by path relative to the depot root. It records
+  the **revision** and, for integrity, the server's **digest** (MD5, from
+  `p4 fstat -Ol`) and size.
+* The manifest is small JSON, human-readable and diffable. Its own
+  SHA-256 is the job's version ID ("render job 551 used manifest
+  `3b9e…`").
+
+#### Creating a manifest (on the artist's or the submitter's machine)
+
+```python
+from deda.clio import usd as clio_usd
+
+manifest = clio_usd.Manifest.create(
+    "/work/imagine/shots/sq010/sh0100/shot.usda",
+    settings="depot=//imagine/main;root=/work/imagine",
+    pin="have",            # or "latest", "@18234", "@approved"
+    include="all",         # every dependency, including unselected variants and unloaded payloads
+)
+manifest.save("sh0100.clio-manifest.json")
+```
+
+```
+clio usd manifest create shots/sq010/sh0100/shot.usda --pin have -o sh0100.clio-manifest.json
+```
+
+1. **Find every dependency.** Resolve the root layer, then walk all
+   dependencies with USD's `UsdUtils.ComputeAllDependencies`, which covers
+   sublayers, references, payloads, variants, clips, UDIMs and asset-valued
+   attributes such as textures. It walks layer contents, so the result is a
+   *superset* of what one render loads. That is deliberate: a variant
+   switch or payload load on the farm must not find a file missing from the
+   manifest. Resolving through Clio during the walk also fetches anything
+   missing, with the manifest's pin.
+2. **Record revisions, in one server call per batch.** Run `p4 fstat -Ol -T
+   haveRev,headRev,headChange,digest,fileSize,headType` on the whole file
+   list. Which revision is recorded depends on the pin:
+
+   | Pin | Revision recorded |
+   |---|---|
+   | `have` | The workspace's have-revision (what the artist is looking at) |
+   | `latest` | Head at creation time (all files read in one `fstat`, so they come from one moment) |
+   | `@change` / `@label` | The revision at that change or label |
+
+3. **Refuse what the farm cannot reproduce.** A file that is not in
+   Perforce, is opened for edit, or whose local digest differs from the
+   server digest for its have-revision (edited without checkout) cannot be
+   fetched on another machine. Creation fails and lists these files, with a
+   hint: submit them, or shelve them. A later option is a `"shelf": 18301`
+   field per file, so the farm can fetch unsubmitted work from a shelf.
+4. **Write and store the manifest.** It goes next to the render job, and
+   can also be submitted to Perforce (for example under
+   `//imagine/main/manifests/…`), so any render can be reproduced later.
+
+#### Loading through a manifest (on every farm machine)
+
+The context names the manifest instead of a pin:
+
+```
+depot=//imagine/main;root=/farm/ws;manifest=/jobs/551/sh0100.clio-manifest.json;policy=verify
+```
+
+* **Materialize once per machine, before rendering:**
+
+  ```
+  clio usd manifest fetch /jobs/551/sh0100.clio-manifest.json
+  ```
+
+  This downloads every listed revision with batched, parallel `p4 print`
+  (§8.2) and checks every file's digest against the manifest. Farm machines
+  should reach Perforce through a P4 Proxy near the farm, so 500 machines
+  fetching the same files hit the proxy's cache and not the commit server.
+* **Where the files go.** The layout mirrors the depot, as the version
+  store already does for changes (§10.4), so relative paths keep working:
+
+  ```
+  <store>/<server>/<depot>/manifest-<sha256 prefix>/shots/sq010/sh0100/shot.usda
+  <store>/<server>/<depot>/manifest-<sha256 prefix>/assets/crate/geo.usdc
+  ```
+
+  Large files are stored once in a content-addressed pool
+  (`<store>/objects/<md5>`) and hard-linked into each manifest's tree. Two
+  manifests that share a 48 MB `geo.usdc` store it once, and a second job
+  with a similar manifest fetches only the difference.
+* **Resolve.** For a path inside the project or the manifest's tree, the
+  resolver looks up the manifest entry and returns the file from the
+  manifest's tree. A path whose relative path is **not in the manifest**
+  fails under `policy=verify`, with a clear error. That is the integrity
+  guarantee: nothing outside the manifest is ever loaded. Under
+  `policy=sync` it would be fetched at the manifest's `source_pin` and
+  reported as a warning, for interactive use.
+* **Render** with `policy=verify`: no server calls during the render. That
+  gives deterministic results and no server load mid-render. Resolution
+  answers come from the manifest in memory.
+
+#### Guarantees and limits
+
+* **Same manifest, same bytes:** every file is checked against its digest
+  when fetched, and stored read-only (§8.3).
+* **Anything not in the manifest fails loudly** under `verify`, rather than
+  silently loading the machine's own copy.
+* **Obliterated or archived revisions** cannot be fetched again. `clio usd
+  manifest check` asks the server whether every revision is still
+  available, so it is worth running before a long re-render.
+* **Dynamic paths** that USD computes at load time, for example asset path
+  expressions using stage variables set by the render, must be resolvable
+  when the manifest is created. The dependency walk evaluates expression
+  variables with the stage's defaults. Paths that depend on values set
+  only at render time must be listed explicitly (`--extra PATH…`).
+
+#### API sketch
+
+```python
+class Manifest:
+    @classmethod
+    def create(cls, root_layer, settings, pin="have", include="all", extra=()) -> "Manifest": ...
+    @classmethod
+    def load(cls, path) -> "Manifest": ...
+    def save(self, path) -> None: ...
+    def fetch(self, *, progress=None, parallel=8) -> FetchReport: ...   # materialize + verify digests
+    def check(self) -> CheckReport: ...                                  # still fetchable?
+    def diff(self, other) -> ManifestDiff: ...                           # what changed between two jobs
+    @property
+    def sha256(self) -> str: ...
+```
+
+In C++, `clio_core` gets a `Manifest` type (parse, look up, materialize)
+that the resolver uses when the context names a manifest. Creation, which
+needs `UsdUtils`, lives in Python (`deda.clio.usd`) and in the `clio` CLI.
 
 ## 11. Errors and safety
 
@@ -1311,6 +1477,7 @@ loaded lazily, or `argparse` for zero dependencies.)*
 | **2 — Branching** | Streams/task streams, switch, update/publish with binary conflict handling, cross-branch lock check, drafts (shelves). |
 | **3 — Performance** | Connection pool and miss coalescer in `clio_core`; time-bounded in-memory caches (§8.3); C++ hashing/scan/diff if benchmarks justify it. Measure; add a persistent store only if the numbers call for it. |
 | **4 — USD completion** | Write side (edit/lock on save, §10.6); revision-based timestamps; `deda.clio.usd.prepare` (option A); CI builds against USD 26.08 and 25.08. |
+| **4½ — Version manifests** | `Manifest` create/save/load/fetch/check/diff (§10.8), `manifest=` context setting, content-addressed pool, `clio usd manifest` CLI, farm guide (proxy + `policy=verify`). |
 | **5 — Ecosystem** | UI view models (`FileListView`, `HistoryView`) with the request pipeline, ContentCache (§9.5), asset resolver plugins, validation hooks, `clio doctor`. Dedaverse/DCC integration when targeted. |
 
 ### Backlog
@@ -1343,8 +1510,19 @@ loaded lazily, or `argparse` for zero dependencies.)*
     map to change numbers?
 8. **P4API licence:** confirm that the Perforce C++ API may be
     redistributed statically linked inside our wheel and plugin.
+9. **Manifests, storage:** Where should manifests live: next to the render
+    job only, or also submitted to Perforce so any render can be reproduced
+    later?
+10. **Manifests, unsubmitted work:** Should the farm be able to render
+    unsubmitted work through shelves, or must everything in a manifest be
+    submitted?
 
 ### Decided
+
+* Default pin is `have`: a file on disk is loaded as it is; a file not on
+  disk is synced as its layer is resolved. `latest` updates everything.
+* Farm/batch loads go through a version manifest created before loading
+  (§10.8, design sketch).
 
 * USD authoring: layers contain plain paths; Clio's resolver is the primary
   resolver, a subclass of `ArDefaultResolver`, and enhances it only when a

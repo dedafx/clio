@@ -8,8 +8,8 @@ namespace clio::core {
 /// Which version of an asset to use (design doc §10.4).
 ///
 /// Text forms accepted by Pin::parse and produced by Pin::str:
-///   "latest"   head revision on the branch
-///   "have"     whatever is in the workspace, no server call
+///   "have"     the file on disk; a file not on disk yet is synced (default)
+///   "latest"   head revision on the branch, synced even if a file is on disk
 ///   "@18234"   snapshot at a submitted change number
 ///   "@approved" snapshot at a label
 ///   "#12"      a single file's revision
