@@ -180,8 +180,11 @@ clio/
 │   │   ├── __init__.py
 │   │   └── __main__.py         # `python -m deda.clio.cli`, entry point `clio`
 │   └── _native.pyi             # type stubs for the optional extension
-├── native/                     # Rust crate for deda.clio._native (phase 3)
-├── usd_resolver/               # thin C++ `clio:` ArResolver plugin (phase 6, §10.3)
+├── cpp/                        # CMake project (§10.3)
+│   ├── clio_core/              # C++ Perforce + resolution core (no USD, no Python)
+│   ├── clio_usd/               # `clio:` ArResolver plugin, built per USD build
+│   └── tests/                  # C++ unit + integration tests (throwaway p4d)
+├── native/                     # Python extension deda.clio._native (phase 3, §8.4)
 ├── tests/
 │   ├── unit/                   # FakeBackend
 │   └── integration/            # real p4d via rsh: port
@@ -486,6 +489,14 @@ stable ABI (`abi3`).**
   nanobind/C++ backend against the P4 C++ API built with the limited API.
   That is a planned escape hatch, not a v1 task.
 
+> **Update after the USD decision (§10.2):** Clio now has a C++ core
+> (`clio_core`) that already wraps P4API, hashing, and SQLite for the
+> resolver. Adding Rust for `_native` would mean two native languages to
+> build and maintain. The alternative is to expose `clio_core` to Python
+> with nanobind and drop Rust. The trade-off is that nanobind supports the
+> stable ABI only from Python 3.12, so older DCC Pythons would need a build
+> per Python version. *(Open question Q11.)*
+
 ### 8.5 Server and depot recommendations
 
 Clio does not configure the server, but it will provide a `clio doctor`
@@ -614,7 +625,9 @@ Notes:
   mode with a busy timeout and short write transactions, so several
   processes (CLI, Maya, Houdini) can read and write it at once. If the
   optional per-machine agent (§8.1.2) is built later, it becomes the single
-  owner of the cache and the other processes ask it instead.
+  owner of the cache and the other processes ask it instead. The C++
+  resolver (§10.3) reads and writes the same databases, using the same
+  versioned schema.
 * **ContentCache is content-addressed.** A file's revision is identified by
   its server digest (MD5) and size. Identical content, such as a file copied
   to a branch, is stored once and never downloaded twice. Content comes from
@@ -871,7 +884,7 @@ changes, such as a variant switch that brings in a new payload.
 **B. Clio URI resolver plugin (`clio:` scheme), in C++.** Layers refer to
 assets as `clio:/props/crate/crate.usd`. USD calls Clio for every such path.
 Clio makes sure the file is present at the right version, then returns its
-local path.
+local path. **Chosen** (see the decision below).
 
 Pros: automatic and complete. It covers any stage opened in any way,
 variant switches, payload loads, and `Reload()`. It coexists with the DCC's
@@ -888,70 +901,169 @@ Perforce.
 indirections). Not recommended: it is the wrong layer for this job and does
 not cover non-layer assets.
 
-**Recommendation: A first, then B, both over the same core.**
-* **MVP: option A.** It delivers "open this stage at version X and
-  everything is present" with no compiled USD code, and it is also what the
-  farm and batch tools need (one explicit, logged prefetch step).
-* **Next: option B**, for automatic behaviour inside DCCs. The resolver
-  plugin stays *thin*. All Perforce logic stays in Clio, and the plugin talks
-  to Clio as described in §10.3.
-* Both use the same **resolution core** (pin rules, where versions are
-  stored, the batching pipeline), so a path gives the same file under A and
-  under B.
+**Decision: Clio ships a compiled C++ `clio:` resolver that performs the
+Perforce operations itself, in-process** (option B, with Perforce access
+inside the plugin rather than through an agent).
 
-### 10.3 Resolver plugin design (option B)
+* **Option B is the primary way DCCs open Clio assets.** The resolver
+  checks, syncs, and fetches files directly through the Perforce C++ API
+  (P4API).
+* **Option A (`deda.clio.usd.prepare`) is kept** as the pure-Python path for
+  environments without a resolver build (a DCC or USD version not yet
+  compiled for), for explicit farm prefetch, and as a test oracle.
+* Both use the same **resolution rules** (pins, anchoring, where versions
+  are stored, §10.4). One specification, plus one shared test suite, keeps
+  them giving the same file for the same path.
+
+### 10.3 Resolver design (option B, in-process Perforce)
+
+The C++ code is split in two, so that the part that must be rebuilt for
+every USD build stays small:
 
 ```
-USD worker threads ──► ClioResolver (C++, thin, per USD build)
-                         │ fast path: in-process lookup, no server, no IPC
-                         │   manifest: identifier + pin → local path, rev, digest
-                         │ miss / stale:
-                         ▼
-                   local Clio agent (one per machine, §8.1)
-                         │ coalesces misses from all threads & processes
-                         │ one batched parallel sync / p4 print per burst
-                         ▼
-                        p4d
+USD worker threads
+      │
+      ▼
+┌──────────────────────────────────────────────┐
+│ clio_usd  (ArResolver plugin, per USD build) │  thin adapter: identifiers,
+│   ClioResolver · ClioResolverContext         │  contexts, ArAsset, notices
+└──────────────────┬───────────────────────────┘
+                   │ plain C++ API (no USD types)
+┌──────────────────▼───────────────────────────┐
+│ clio_core  (static library, no USD, no Python)│
+│   Config (reads the same clio.toml)          │
+│   P4 connection pool (P4API ClientApi)       │
+│   Pin + anchoring rules (§10.4)              │
+│   Manifest / status lookup (SQLite, §8.3)    │
+│   Miss coalescer: single-flight + batching   │
+│   Sync / print / edit / add / lock ops       │
+│   Workspace lock (shared with Python Clio)   │
+└──────────────────┬───────────────────────────┘
+                   │ P4 protocol (TCP/SSL)
+                   ▼
+                  p4d
 ```
 
-* **Fast path, no IPC.** Most calls are for files that are already present.
-  The plugin answers them from a read-only, memory-mapped manifest (or the
-  SQLite StatusCache) that the agent keeps current. The target is a few
-  microseconds per call, so composition speed is unaffected when everything
-  is up to date.
-* **Slow path through the agent.** A miss is sent over a local socket or
-  named pipe. The calling USD thread blocks until its file is ready. Misses
-  from parallel sublayer loading arrive within milliseconds of each other,
-  and the agent's batching window (§9.5) turns them into one sync. The agent
-  also shares its connection pool and caches across every DCC on the machine.
-  **Consequence:** the per-machine agent, deferred in §8.1, becomes a
-  requirement for option B.
-* **Why not call Python from the plugin:** GIL use on USD worker threads
-  (§10.1). The agent can be Python. It runs in its own process, so it never
-  competes for a DCC's GIL.
-* **ArResolver methods Clio implements:**
+* **`clio_core`** holds all Perforce and resolution logic. It is built
+  once per platform and compiler, not per USD version, and linked
+  statically into each `clio_usd` build. It has its own C++ unit tests and
+  runs against the same throwaway `p4d` as the Python tests (§13).
+* **`clio_usd`** is the only code that includes USD headers: the
+  `ArResolver` subclass, the context class, and `plugInfo.json` with
+  `"uriSchemes": ["clio"]`. It is kept to a few hundred lines, so building
+  it for a new DCC or USD version is cheap.
+
+**How a resolve works**
+
+1. **Fast path (no server).** `_Resolve` works out the depot path and pin
+   (context + anchor + query) and looks it up in the in-memory manifest,
+   which is loaded from the workspace's StatusCache and kept for the life of
+   the context. If the file is present at the required revision, the local
+   path is returned. The target is microseconds, so composition speed is
+   unchanged when everything is up to date.
+2. **Miss (file missing or stale).** The request goes to the **coalescer**:
+   * *Single-flight:* concurrent requests for the same file share one fetch.
+   * *Batching window* (for example 10–30 ms, configurable): misses from
+     USD's parallel sublayer loading (§10.1) are collected into **one**
+     `sync` (latest/have pins, into the workspace) or one `print` batch
+     (historical pins, into the version store). The calling USD thread
+     waits for its own file only.
+   * Transfers for large files use parallel transfer where the pinned P4API
+     version supports it. *(To verify: P4API parallel sync needs a
+     client-side transfer implementation, which P4Python and `p4` provide.
+     Otherwise Clio splits a batch across pooled connections itself.)*
+3. **Freshness.** For `latest`, a manifest entry is trusted for the
+   context's polling interval (30–60 s, §9.4). The watermark check then
+   decides whether anything needs re-checking. `_RefreshContext` forces a
+   check and sends `ArNotice::ResolverChanged` if results changed.
+
+**Threading.** USD calls the resolver from many threads (§10.1). P4API
+objects must not be shared between threads, so `clio_core` keeps a small
+**connection pool** (default 2–4 per process). The coalescer, not the USD
+threads, owns the connections. No Python is involved and the GIL is never
+taken.
+
+**Credentials and prompts.** The resolver never prompts. A USD worker
+thread has no UI, and prompting there would hang the DCC. It uses the
+user's existing Perforce ticket (`P4TICKETS`), `P4CONFIG`/`P4ENVIRO`, and
+`clio.toml`. If there is no valid ticket, it fails that resolve with an
+error ("Clio: not logged in to perforce:1666, run `clio login`") and
+treats the context as `offline` until the next refresh, so one missing
+login doesn't cause a flood of errors.
+
+**Blocking and timeouts.** A resolve that needs the network blocks a USD
+thread, so every server call has a timeout (configurable, default for
+example 60 s for metadata, and progress-based for transfers: fail only if
+no bytes arrive for N seconds). On failure the resolver returns an empty
+resolved path and posts a clear error, and USD reports the missing layer
+as usual. Policies (`sync`, `verify`, `offline`) behave as below.
+
+**Shared state with Python Clio.** The resolver and the Python API may
+work on the same workspace at the same time (a DCC resolving while the
+artist runs `clio get`):
+* Both read the same config (`clio.toml`, §6). The C++ side uses a TOML
+  parser such as toml++ (header-only).
+* Both use the same SQLite caches (§8.3, §9.3). The schema is versioned,
+  documented in one place, and covered by cross-language tests. The C++ side
+  writes only through short WAL transactions.
+* Workspace-changing operations (sync, edit, add) take a **per-workspace
+  file lock**, shared by Python and C++, so two processes never sync the
+  same workspace at once. Read-only work (version-store prints, metadata)
+  does not take it.
+
+**Isolating Perforce's OpenSSL from the DCC's.** This is the main risk of
+running Perforce in-process. P4API links OpenSSL, and DCCs load their own,
+often different, OpenSSL versions.
+* **Linux:** link P4API and OpenSSL **statically** into `clio_usd`, build
+  with `-fvisibility=hidden`, and hide all bundled symbols
+  (`-Wl,--exclude-libs,ALL` plus a version script exporting only the USD
+  plugin entry points). Without this, symbol clashes can crash the DCC.
+* **Windows:** DLL symbols are not process-global, so a statically linked
+  OpenSSL is private to the plugin. Link statically anyway, to avoid
+  loading the wrong `libssl-*.dll`.
+* **macOS:** two-level namespaces isolate symbols. Link statically and hide
+  symbols as on Linux.
+* A **load test per DCC** (open an SSL connection from the resolver inside
+  the running DCC, while the DCC's own SSL features are active) is part of
+  the release checklist for each supported build.
+
+**ArResolver methods Clio implements:**
 
 | Method | Clio behaviour |
 |---|---|
 | `_CreateIdentifier` | Normalizes `clio:` paths. Anchors relative paths, keeping the anchor's pin (§10.4). |
-| `_Resolve` | Fast-path lookup. On a miss, requests a sync from the agent and waits (with a timeout and a clear error). Returns the local path. |
-| `_ResolveForNewAsset` / `_CanWriteAssetToPath` / `_OpenAssetForWrite` | When a layer is saved: opens the file for add or edit (with lock) through the agent, or refuses with `whyNot` ("locked by Sam"). |
+| `_Resolve` | Fast path from the manifest. On a miss, fetches through the coalescer and waits (with a timeout). Returns the local path. |
+| `_ResolveForNewAsset` / `_CanWriteAssetToPath` / `_OpenAssetForWrite` | When a layer is saved: runs `p4 edit` (with lock for `+l` types) or `p4 add` in the artist's pending change, or refuses with `whyNot` ("locked by Sam"). Never submits (§10.6). |
 | `_IsContextDependentPath` | `true` for `clio:` paths, since the pin comes from the context. |
-| `_CreateDefaultContext[ForAsset]`, `_CreateContextFromString` | Build a `ClioResolverContext` (project, branch, pin, policy). The string form, for example `"branch=main;pin=@18234"`, lets DCC UIs and env vars set it. |
+| `_CreateDefaultContext[ForAsset]`, `_CreateContextFromString` | Build a `ClioResolverContext` (project, branch, pin, policy). The string form, for example `"branch=main;pin=@18234"`, can be set from Python through `Ar.GetResolver().CreateContextFromString("clio", ...)`, from DCC UIs, or from env vars. |
 | `_GetAssetInfo` | Fills `version` (revision/change number) and `resolverInfo` (depot path, digest), so DCC UIs can show "crate.usd v12 @18234". |
 | `_GetModificationTimestamp` | Returns a timestamp derived from the revision or change number, so `Reload()` picks up newly synced versions. |
 | `_RefreshContext` | Re-evaluates moving pins ("latest", labels), syncs, and sends `ArNotice::ResolverChanged` for affected contexts. |
-| `_OpenAsset` | Opens the local file (`ArFilesystemAsset`). A later option is to stream pinned versions from the ContentCache without writing to the workspace. |
+| `_OpenAsset` | Opens the local file (`ArFilesystemAsset`). A later option is to stream pinned versions without writing files. |
 
 * **Policies in the context:** `sync` (default: fetch what is needed),
   `verify` (fail if not present, no server calls, for farm reproducibility),
   and `offline` (use whatever is on disk and warn).
-* **Build and distribution:** the plugin must be compiled against each
-  DCC's USD (Houdini, Maya-USD, Omniverse, Blender, usd-core/standalone),
-  because the USD C++ ABI and namespace differ per build. Keeping the plugin
-  to a few hundred lines with no Perforce code makes these rebuilds cheap.
-  Registration uses `PXR_PLUGINPATH_NAME` and a `plugInfo.json` declaring
-  `"uriSchemes": ["clio"]`.
+* **Python access.** `deda.clio.usd` builds contexts from strings, so it
+  needs no compiled Python module. A wrapped `ClioResolverContext` class for
+  Python (through USD's `ArWrapResolverContextForPython`) is optional and
+  would need its own per-USD build.
+* **Build and distribution:**
+  * CMake project under `cpp/`.
+  * `clio_core` links P4API (`libclient`, `librpc`, `libsupp`, plus OpenSSL)
+    and SQLite.
+  * `clio_usd` links `clio_core` and USD (`ar`, `sdf`, `tf`, `vt`, `plug`,
+    `js`), built against each target DCC's USD SDK (Houdini HDK, Maya USD
+    devkit, Omniverse, OpenUSD standalone), because the USD C++ ABI and
+    namespace differ per build.
+  * Registration: `PXR_PLUGINPATH_NAME` pointing at the plugin's
+    `plugInfo.json`. `clio doctor` checks that the plugin loads and that the
+    `clio` scheme is registered (`Ar.GetRegisteredURISchemes()`).
+  * *(To confirm: P4API licence terms for redistributing it statically
+    linked inside our plugin.)*
+* **The per-machine agent** (§8.1) is no longer needed for the resolver. It
+  stays an optional later improvement: one set of connections and caches
+  shared across every DCC on a machine.
 
 ### 10.4 Versions, pins, and where files are placed
 
@@ -1142,7 +1254,7 @@ loaded lazily, or `argparse` for zero dependencies.)*
 | **3 — Performance** | StatusCache, cheap change checks, optional watcher. Profile, then `_native` (Rust/PyO3 abi3) for hashing/scan/diff if the benchmarks justify it. |
 | **4 — USD prefetch** | `deda.clio.usd.prepare` (option A, §10.2): wave walker, pins, `payloads`/asset policies, version store for historical pins, `prepare_for_edit`, `clio usd prepare/localize` CLI. |
 | **5 — Ecosystem** | UI view models (`FileListView`, `HistoryView`) with the request pipeline, ContentCache (§9.5), asset resolver plugins, validation hooks, `P4CliBackend` for DCC fallback, `clio doctor`, Dedaverse integration. |
-| **6 — USD resolver** | Per-machine Clio agent (§8.1) and the thin C++ `clio:` URI resolver plugin (§10.3), built per target USD. Starts with a prototype that settles the resolved-path form (§10.4). |
+| **6 — USD resolver** | C++ `clio_core` (P4API pool, pins, manifest, coalescer, workspace lock) and the `clio_usd` `clio:` resolver plugin (§10.3), built for the first target USD. Starts with a prototype that settles the resolved-path form (§10.4) and the OpenSSL isolation per DCC. |
 
 ### Backlog
 
@@ -1170,9 +1282,9 @@ loaded lazily, or `argparse` for zero dependencies.)*
 7. **Asset identity:** Is an asset a folder (all files under a path), or is
    it defined by Dedaverse/Imagine metadata (for example a USD asset or a
    database ID)? This decides how much of the resolver ships in Clio itself.
-8. **USD builds:** Which DCCs and USD versions must the resolver plugin
-   (option B) support first? Is there already a primary resolver in use
-   (studio, Omniverse, Houdini's defaults)?
+8. **USD builds:** Which DCC and USD build should the resolver plugin
+   (§10.3) target first, and which follow? Is there already a primary
+   resolver in use (studio, Omniverse, Houdini's defaults)?
 9. **USD authoring:** Are you happy with relative paths inside assets and
    `clio:` URIs across assets (§10.5), or should everything stay plain
    paths, with Clio relying on pre-open sync only?
@@ -1180,7 +1292,15 @@ loaded lazily, or `argparse` for zero dependencies.)*
     versions, or will Dedaverse/Imagine keep their own version records that
     map to change numbers?
 
+11. **Native language:** Keep Rust/PyO3 for the Python extension
+    (`_native`), or use one C++ codebase (`clio_core`) for both the USD
+    resolver and Python bindings (§8.4)?
+
 ### Decided
+
+* USD: Clio ships a compiled C++ `clio:` resolver that performs Perforce
+  operations in-process through P4API (§10.2–10.3). The Python pre-open
+  sync is kept for environments without a resolver build.
 
 * UI refresh: 30–60 s polling for the MVP. Push notifications are in the backlog.
 * Thumbnails: out of scope for the MVP. Kept in the backlog (§9.8).
