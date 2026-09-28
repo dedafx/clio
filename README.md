@@ -7,6 +7,7 @@ the Perforce C++ API), used both from Python (`deda.clio`) and by a USD
 asset resolver plugin that fetches `clio:` assets before USD loads them.
 
 * [Design document](docs/design.md)
+* [Using Clio with USD](docs/usd.md)
 * [Building and testing](docs/building.md)
 
 Targets: Python 3.13, USD 26.08 (and 25.08 or later).

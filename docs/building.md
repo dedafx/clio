@@ -103,6 +103,8 @@ from a CMake build tree.
 
 ## 5. Using the resolver
 
+See [usd.md](usd.md) for the full guide. In short:
+
 ```bash
 export PXR_PLUGINPATH_NAME=$(python3.13 -c "from deda.clio import usd; print(usd.plugin_path())")
 ```
