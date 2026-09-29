@@ -8,6 +8,7 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -20,11 +21,30 @@ using clio::test::P4dFixture;
 
 namespace {
 
+// File contents with CRLF line endings turned into LF: on Windows, Perforce
+// writes text files with the platform's line endings.
 std::string readFile(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     std::ostringstream out;
     out << in.rdbuf();
-    return out.str();
+    std::string text = out.str();
+    text.erase(std::remove(text.begin(), text.end(), '\r'), text.end());
+    return text;
+}
+
+// An absolute path on this platform: "/work/proj" is not absolute on Windows.
+std::string absPath(const std::string& posixPath) {
+#ifdef _WIN32
+    return "C:" + posixPath;
+#else
+    return posixPath;
+#endif
+}
+
+// Settings for tests that need no server, rooted at /work/proj.
+Settings offlineSettings() {
+    return Settings::parse("depot=//d/main;root=" + absPath("/work/proj") + ";store=" + absPath("/cache/v") +
+                           ";port=perf:1666");
 }
 
 std::unique_ptr<P4dFixture> fixtureOrSkip() {
@@ -221,11 +241,10 @@ TEST_CASE("an unreachable server does not stall resolves") {
 }
 
 TEST_CASE("local paths map back to project files") {
-    Settings s = Settings::parse("depot=//d/main;root=/work/proj;store=/cache/v;port=perf:1666");
-    Workspace ws(s);
+    Workspace ws(offlineSettings());
     const auto storeDir = ws.versionStorePath(AssetIdentifier::parse("clio:/x"), Pin::change(7)).parent_path();
 
-    const auto inWorkspace = ws.matchLocalPath("/work/proj/assets/crate/../crate/crate.usda");
+    const auto inWorkspace = ws.matchLocalPath(absPath("/work/proj/assets/crate/../crate/crate.usda"));
     REQUIRE(inWorkspace);
     CHECK(inWorkspace->id.path() == "/assets/crate/crate.usda");
     CHECK_FALSE(inWorkspace->pin);
@@ -237,11 +256,22 @@ TEST_CASE("local paths map back to project files") {
     CHECK(*inStore->pin == Pin::change(7));
     CHECK(inStore->inVersionStore);
 
-    CHECK_FALSE(ws.matchLocalPath("/elsewhere/a.usda"));
-    CHECK_FALSE(ws.matchLocalPath("/work/proj"));
-    CHECK_FALSE(ws.matchLocalPath("/work/project2/a.usda"));
+    CHECK_FALSE(ws.matchLocalPath(absPath("/elsewhere/a.usda")));
+    CHECK_FALSE(ws.matchLocalPath(absPath("/work/proj")));
+    CHECK_FALSE(ws.matchLocalPath(absPath("/work/project2/a.usda")));
     CHECK_FALSE(ws.matchLocalPath("relative/a.usda"));
 }
+
+#ifdef _WIN32
+TEST_CASE("Windows paths match whatever the case and separators") {
+    Workspace ws(offlineSettings());
+    const auto match = ws.matchLocalPath(R"(c:\WORK\Proj\Assets\crate.usda)");
+    REQUIRE(match);
+    // The project path keeps the spelling it was given.
+    CHECK(match->id.path() == "/Assets/crate.usda");
+    CHECK_FALSE(ws.matchLocalPath("D:/work/proj/a.usda"));
+}
+#endif
 
 TEST_CASE("a relative file next to a pinned layer is fetched at the same version") {
     auto fx = fixtureOrSkip();
@@ -264,17 +294,23 @@ TEST_CASE("paths outside the project are not handled") {
     auto fx = fixtureOrSkip();
     if (!fx) return;
     AssetResolver resolver(fx->settings());
-    CHECK_FALSE(resolver.manages("/tmp/elsewhere.usda"));
-    CHECK_FALSE(resolver.resolvePath("/tmp/elsewhere.usda"));
+    CHECK_FALSE(resolver.manages(absPath("/tmp/elsewhere.usda")));
+    CHECK_FALSE(resolver.resolvePath(absPath("/tmp/elsewhere.usda")));
 }
 
 TEST_CASE("label folders are collision-free and map back to the label") {
-    Settings s = Settings::parse("depot=//d/main;root=/work/proj;store=/cache/v;port=perf:1666");
-    Workspace ws(s);
+    Workspace ws(offlineSettings());
     const auto id = AssetIdentifier::parse("clio:/a.usda");
     const auto colon = ws.versionStorePath(id, Pin::label("approved:prod"));
     const auto underscore = ws.versionStorePath(id, Pin::label("approved_prod"));
     CHECK(colon != underscore);
+    // Different folders even on case-insensitive file systems.
+    const auto upper = ws.versionStorePath(id, Pin::label("Prod"));
+    const auto lower = ws.versionStorePath(id, Pin::label("prod"));
+    CHECK(upper.parent_path().filename() == "label-%50rod");
+    CHECK(lower.parent_path().filename() == "label-prod");
+    REQUIRE(ws.matchLocalPath(upper));
+    CHECK(*ws.matchLocalPath(upper)->pin == Pin::label("Prod"));
 
     const auto match = ws.matchLocalPath(colon);
     REQUIRE(match);

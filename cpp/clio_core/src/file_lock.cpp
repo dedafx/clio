@@ -26,7 +26,6 @@ FileLock::FileLock(const std::filesystem::path& path) {
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
 #ifdef _WIN32
-    // TODO: not yet tested on Windows.
     HANDLE handle = CreateFileW(path.wstring().c_str(), GENERIC_READ | GENERIC_WRITE,
                                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                                 OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);

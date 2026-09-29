@@ -9,6 +9,8 @@ set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 function(clio_set_warnings target)
     if(MSVC)
         target_compile_options(${target} PRIVATE /W4 /permissive-)
+        # std::getenv is fine here: Clio never keeps the returned pointer.
+        target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS)
     else()
         target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
     endif()

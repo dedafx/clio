@@ -10,6 +10,13 @@
 #include <system_error>
 
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
 #include <process.h>
 #define CLIO_GETPID _getpid
 #else
@@ -34,14 +41,16 @@ std::string safeDirName(const std::string& text) {
 }
 
 // Reversible, collision-free folder name for any label: bytes outside
-// [A-Za-z0-9_.-] become %XX. ("approved:prod" -> "approved%3Aprod", while
-// "approved_prod" stays as it is.)
+// [a-z0-9_.-] become %XX. ("approved:prod" -> "approved%3Aprod", while
+// "approved_prod" stays as it is.) Upper case is encoded too, so labels that
+// differ only in case ("Prod", "prod") get different folders on
+// case-insensitive file systems (Windows, macOS).
 std::string encodeLabel(const std::string& label) {
     static const char* hex = "0123456789ABCDEF";
     std::string out;
     for (unsigned char c : label) {
-        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+        const bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                        c == '-' || c == '_' || c == '.';
         if (ok) {
             out += static_cast<char>(c);
         } else {
@@ -95,13 +104,44 @@ std::string pinDirName(const Pin& pin) {
     throw Error("Pin '" + pin.str() + "' is not a historical version");
 }
 
-// `path` relative to `base` if it is inside it, using '/' separators.
+// Whether two path components name the same entry. Windows paths are
+// case-insensitive: USD may pass "c:/work/proj/..." for a root of "C:\Work\Proj".
+bool sameComponent(const std::filesystem::path& a, const std::filesystem::path& b) {
+#ifdef _WIN32
+    const std::wstring& x = a.native();
+    const std::wstring& y = b.native();
+    return CompareStringOrdinal(x.c_str(), static_cast<int>(x.size()), y.c_str(),
+                                static_cast<int>(y.size()), TRUE) == CSTR_EQUAL;
+#else
+    return a == b;
+#endif
+}
+
+// `path` relative to `base` if it is inside it, using '/' separators. The
+// result keeps the spelling of `path`.
 std::optional<std::string> relativeInside(const std::filesystem::path& path,
                                           const std::filesystem::path& base) {
     if (base.empty() || !path.is_absolute()) {
         return std::nullopt;
     }
-    const auto rel = path.lexically_normal().lexically_relative(base.lexically_normal());
+    const auto normPath = path.lexically_normal();
+    const auto normBase = base.lexically_normal();
+    auto it = normPath.begin();
+    for (const auto& part : normBase) {
+        if (part.empty()) {
+            continue; // trailing separator
+        }
+        if (it == normPath.end() || !sameComponent(*it, part)) {
+            return std::nullopt;
+        }
+        ++it;
+    }
+    std::filesystem::path rel;
+    for (; it != normPath.end(); ++it) {
+        if (!it->empty()) {
+            rel /= *it;
+        }
+    }
     const std::string text = rel.generic_string();
     if (text.empty() || text == "." || text == ".." || text.rfind("../", 0) == 0) {
         return std::nullopt;

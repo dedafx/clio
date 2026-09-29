@@ -36,6 +36,26 @@ OpenSSL 3 development libraries must be installed (for example
 and hides its symbols (`CLIO_OPENSSL_STATIC=ON`), so it cannot clash with
 the OpenSSL that Python or a host application loads.
 
+#### Windows
+
+* Use the **`_dyn`** API, `r26.1/bin.ntx64/p4api_vs2022_dyn_openssl3.zip`
+  (and `p4d.exe` for the tests). "dyn" means the dynamic C runtime (`/MD`),
+  which Python and USD use. The `_static` API (`/MT`) will not link.
+* The Windows API does not include OpenSSL. Build static OpenSSL for the
+  `/MD` runtime with vcpkg and point CMake at it:
+
+  ```bat
+  vcpkg install openssl:x64-windows-static-md
+  set OPENSSL_ROOT_DIR=C:\vcpkg\installed\x64-windows-static-md
+  ```
+* Run CMake, pip and `build_usd.py` from an "x64 Native Tools" prompt (or
+  after `vcvars64.bat`).
+* The Python headers must match the interpreter. A python.org 3.13 install
+  that has ever had the free-threaded option installed can be left with a
+  `pyconfig.h` that defines `Py_GIL_DISABLED`, and links then fail with
+  `cannot open file 'python313t.lib'`. Repair that Python install, or use
+  another 3.13 (for example the `python` NuGet package).
+
 ### USD (only for the resolver plugin)
 
 The plugin must be built against the same USD build it will run in.
@@ -98,8 +118,10 @@ python3.13 -m pytest
 
 The USD tests need `pxr` importable. USD's build script installs the Python
 modules in a version-dependent place: `$PXR_ROOT/lib/python3.13/site-packages`
-for 26.08, and `$PXR_ROOT/lib/python` for 25.08. The script prints the path
-at the end of the build.
+for 26.08 (`%PXR_ROOT%\Lib\site-packages` on Windows), and
+`$PXR_ROOT/lib/python` for 25.08. The script prints the path at the end of
+the build. On Windows, also put `%PXR_ROOT%\bin` and `%PXR_ROOT%\lib` on
+`PATH` so USD's DLLs load.
 
 Tests that need a server are skipped when `CLIO_TEST_P4D` is not set, and
 the USD tests are skipped when `pxr` or the plugin is missing. Set

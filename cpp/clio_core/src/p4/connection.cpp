@@ -9,8 +9,19 @@
 #include <cerrno>
 #include <cstring>
 #include <mutex>
+#include <system_error>
 
-#ifndef _WIN32
+#ifdef _WIN32
+// Lean: the full windows.h defines macros such as SetPort that clash with P4API.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
@@ -81,62 +92,107 @@ bool splitTcpPort(std::string port, std::string& host, std::string& service) {
     return !host.empty() && !service.empty();
 }
 
+// Socket calls that differ between Winsock and POSIX.
+#ifdef _WIN32
+using Socket = SOCKET;
+constexpr Socket invalidSocket = INVALID_SOCKET;
+
+int lastSocketError() { return WSAGetLastError(); }
+bool connectInProgress(int error) { return error == WSAEWOULDBLOCK; }
+void closeSocket(Socket s) { closesocket(s); }
+void setNonBlocking(Socket s) {
+    u_long on = 1;
+    ioctlsocket(s, FIONBIO, &on);
+}
+std::string resolveErrorText(int rc) { return std::system_category().message(rc); }
+
+// Waits for a non-blocking connect. Returns false on timeout. Uses select
+// because WSAPoll does not report failed connects on older Windows 10.
+bool waitForConnect(Socket s, int timeoutMs) {
+    fd_set writable, failed;
+    FD_ZERO(&writable);
+    FD_ZERO(&failed);
+    FD_SET(s, &writable);
+    FD_SET(s, &failed);
+    timeval tv{timeoutMs / 1000, (timeoutMs % 1000) * 1000};
+    return select(0, nullptr, &writable, &failed, &tv) > 0;
+}
+#else
+using Socket = int;
+constexpr Socket invalidSocket = -1;
+
+int lastSocketError() { return errno; }
+bool connectInProgress(int error) { return error == EINPROGRESS; }
+void closeSocket(Socket s) { close(s); }
+void setNonBlocking(Socket s) { fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK); }
+std::string resolveErrorText(int rc) { return gai_strerror(rc); }
+
+bool waitForConnect(Socket s, int timeoutMs) {
+    pollfd pfd{s, POLLOUT, 0};
+    return poll(&pfd, 1, timeoutMs) == 1;
+}
+#endif
+
 // Try a TCP connection with a time limit. Returns an error message, or ""
 // if the server accepted the connection.
 std::string checkReachable(const std::string& port, std::chrono::seconds timeout) {
-#ifdef _WIN32
-    // TODO: Windows implementation (Winsock). Until then, rely on P4API.
-    (void)port;
-    (void)timeout;
-    return {};
-#else
     std::string host, service;
     if (timeout.count() <= 0 || !splitTcpPort(port, host, service)) {
         return {};
     }
+#ifdef _WIN32
+    // Balanced by process exit; WSAStartup is reference counted, so this is
+    // safe alongside P4API's own initialization.
+    static const bool winsockReady = [] {
+        WSADATA data;
+        return WSAStartup(MAKEWORD(2, 2), &data) == 0;
+    }();
+    if (!winsockReady) {
+        return {}; // leave it to P4API
+    }
+#endif
     addrinfo hints{};
     hints.ai_socktype = SOCK_STREAM;
     addrinfo* addresses = nullptr;
     if (const int rc = getaddrinfo(host.c_str(), service.c_str(), &hints, &addresses); rc != 0) {
-        return "cannot resolve " + host + ": " + gai_strerror(rc);
+        return "cannot resolve " + host + ": " + resolveErrorText(rc);
     }
+    const auto socketErrorText = [&](int error) {
+        return "cannot reach " + host + ":" + service + ": " + std::system_category().message(error);
+    };
     std::string failure = "cannot reach " + host + ":" + service;
     const int timeoutMs = static_cast<int>(timeout.count() * 1000);
     for (addrinfo* ai = addresses; ai; ai = ai->ai_next) {
-        const int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) {
+        const Socket s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (s == invalidSocket) {
             continue;
         }
-        fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
-        int rc = connect(fd, ai->ai_addr, ai->ai_addrlen);
-        if (rc != 0 && errno == EINPROGRESS) {
-            pollfd pfd{fd, POLLOUT, 0};
-            rc = poll(&pfd, 1, timeoutMs);
-            if (rc == 1) {
-                int soError = 0;
-                socklen_t len = sizeof(soError);
-                getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &len);
-                rc = soError == 0 ? 0 : -1;
-                if (soError != 0) {
-                    failure = "cannot reach " + host + ":" + service + ": " + std::strerror(soError);
-                }
-            } else {
+        setNonBlocking(s);
+        bool connected = connect(s, ai->ai_addr, static_cast<int>(ai->ai_addrlen)) == 0;
+        if (!connected) {
+            if (const int error = lastSocketError(); !connectInProgress(error)) {
+                failure = socketErrorText(error);
+            } else if (!waitForConnect(s, timeoutMs)) {
                 failure = "no answer from " + host + ":" + service + " within " +
                           std::to_string(timeout.count()) + " s";
-                rc = -1;
+            } else {
+                int soError = 0;
+                socklen_t len = sizeof(soError);
+                getsockopt(s, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soError), &len);
+                connected = soError == 0;
+                if (!connected) {
+                    failure = socketErrorText(soError);
+                }
             }
-        } else if (rc != 0) {
-            failure = "cannot reach " + host + ":" + service + ": " + std::strerror(errno);
         }
-        close(fd);
-        if (rc == 0) {
+        closeSocket(s);
+        if (connected) {
             freeaddrinfo(addresses);
             return {};
         }
     }
     freeaddrinfo(addresses);
     return failure;
-#endif
 }
 
 // Collects everything a command reports. Never prompts: Clio runs in
