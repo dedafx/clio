@@ -1,0 +1,19 @@
+{
+    "Plugins": [
+        {
+            "Info": {
+                "Types": {
+                    "ClioResolver": {
+                        "bases": ["ArDefaultResolver"],
+                        "implementsContexts": true
+                    }
+                }
+            },
+            "LibraryPath": "@CLIO_USD_LIBRARY_PATH@",
+            "Name": "clioUsd",
+            "ResourcePath": "resources",
+            "Root": "..",
+            "Type": "library"
+        }
+    ]
+}

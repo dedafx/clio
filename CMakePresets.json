@@ -1,0 +1,39 @@
+{
+    "version": 6,
+    "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+    "configurePresets": [
+        {
+            "name": "dev",
+            "displayName": "Core + Python + tests",
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+                "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+                "CLIO_BUILD_PYTHON": "ON",
+                "CLIO_BUILD_TESTS": "ON",
+                "CLIO_P4API_ROOT": "$env{CLIO_P4API_ROOT}"
+            }
+        },
+        {
+            "name": "dev-usd",
+            "displayName": "Core + Python + USD plugin + tests",
+            "inherits": "dev",
+            "cacheVariables": {
+                "CLIO_BUILD_USD": "ON",
+                "pxr_DIR": "$env{PXR_ROOT}"
+            }
+        }
+    ],
+    "buildPresets": [
+        { "name": "dev", "configurePreset": "dev" },
+        { "name": "dev-usd", "configurePreset": "dev-usd" }
+    ],
+    "testPresets": [
+        {
+            "name": "dev",
+            "configurePreset": "dev",
+            "output": { "outputOnFailure": true }
+        }
+    ]
+}
