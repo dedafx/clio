@@ -321,12 +321,100 @@ TEST_CASE("label folders are collision-free and map back to the label") {
 }
 
 TEST_CASE("an empty port uses the effective P4PORT for the store folder") {
-#ifndef _WIN32
+#ifdef _WIN32
+    _putenv_s("P4PORT", "envserver:1666");
+#else
     setenv("P4PORT", "envserver:1666", 1);
-    Workspace ws(Settings::parse("depot=//d/main;root=/work/proj;store=/cache/v"));
-    CHECK(ws.serverKey() == "envserver_1666");
+#endif
+    Workspace ws(Settings::parse("depot=//d/main;root=" + absPath("/work/proj") + ";store=" + absPath("/cache/v")));
+    CHECK(ws.serverKey() == "envserver%3A1666");
+#ifdef _WIN32
+    _putenv_s("P4PORT", "");
+#else
     unsetenv("P4PORT");
 #endif
+}
+
+TEST_CASE("store folders never mix depot roots or servers") {
+    const auto id = AssetIdentifier::parse("clio:/a.usda");
+    const auto store = [&](const std::string& depot, const std::string& port) {
+        Workspace ws(Settings::parse("depot=" + depot + ";root=" + absPath("/work/proj") +
+                                     ";store=" + absPath("/cache/v") + ";port=" + port));
+        return ws.versionStorePath(id, Pin::change(7));
+    };
+    // "//d/main" and "//d_main" used to share the folder "d_main".
+    const auto slash = store("//d/main", "perf:1666");
+    const auto underscore = store("//d_main", "perf:1666");
+    CHECK(slash != underscore);
+    Workspace mainWs(Settings::parse("depot=//d_main;root=" + absPath("/work/proj") + ";store=" +
+                                     absPath("/cache/v") + ";port=perf:1666"));
+    CHECK_FALSE(mainWs.matchLocalPath(slash));
+
+    // A long port (an rsh: command line) is shortened, and stays unique.
+    const std::string longPort = "rsh:/opt/perforce/bin/p4d -r /var/lib/perforce/servers/";
+    const auto a = store("//d/main", longPort + "alpha -L log -J off -i");
+    const auto b = store("//d/main", longPort + "bravo -L log -J off -i");
+    CHECK(a != b);
+    const auto serverFolder = a.parent_path().parent_path().parent_path().filename().string();
+    CHECK(serverFolder.size() <= 64);
+    CHECK(serverFolder.find('~') != std::string::npos);
+}
+
+TEST_CASE("depot paths escape the characters Perforce reserves") {
+    Workspace ws(offlineSettings());
+    CHECK(ws.depotPath(AssetIdentifier::parse("clio:/tex/crate@2x#1%*.png")) ==
+          "//d/main/tex/crate%402x%231%25%2A.png");
+}
+
+TEST_CASE("files with reserved characters in their names resolve") {
+    auto fx = fixtureOrSkip();
+    if (!fx) return;
+    const auto v1 = fx->submit({{"tex/crate@2x.usda", "v1"}, {"tex/50%.usda", "p1"}}, "v1");
+    fx->submit({{"tex/other@2x.usda", "other"}}, "v2"); // must not be fetched below
+    fx->clearWorkspace();
+
+    AssetResolver resolver(fx->settings());
+    const auto latest = resolver.resolve(AssetIdentifier::parse("clio:/tex/crate@2x.usda"));
+    REQUIRE(latest);
+    CHECK(latest->localPath == fx->workspaceRoot() / "tex" / "crate@2x.usda");
+    CHECK(readFile(latest->localPath) == "v1");
+    CHECK_FALSE(std::filesystem::exists(fx->workspaceRoot() / "tex" / "other@2x.usda"));
+
+    const auto pinned = resolver.resolve(AssetIdentifier::parse("clio:/tex/50%.usda?change=" + std::to_string(v1)));
+    REQUIRE(pinned);
+    CHECK(readFile(pinned->localPath) == "p1");
+}
+
+TEST_CASE("a stored label used while the server is unavailable carries a warning") {
+    const auto store = std::filesystem::temp_directory_path() /
+                       ("clio-label-test-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    auto settings = Settings::parse("depot=//d/main;root=" + absPath("/work/proj") + ";port=localhost:1");
+    settings.versionStore = store;
+    settings.connection.connectTimeout = std::chrono::seconds(2);
+
+    // Copies stored earlier, when the server was reachable.
+    Workspace ws(settings);
+    for (const char* name : {"a.usda", "b.usda"}) {
+        const auto path = ws.versionStorePath(AssetIdentifier::parse(std::string("clio:/") + name), Pin::label("approved"));
+        std::filesystem::create_directories(path.parent_path());
+        std::ofstream(path) << "stored";
+    }
+
+    AssetResolver resolver(settings);
+    // The first resolve tries the server, fails and starts the retry interval.
+    const auto a = resolver.resolve(AssetIdentifier::parse("clio:/a.usda?label=approved"));
+    REQUIRE(a);
+    CHECK_FALSE(a->warning.empty());
+    // During the retry interval the server is not asked, but the answer is
+    // still flagged and not remembered.
+    for (int i = 0; i < 2; ++i) {
+        const auto b = resolver.resolve(AssetIdentifier::parse("clio:/b.usda?label=approved"));
+        REQUIRE(b);
+        CHECK(b->warning.find("may be out of date") != std::string::npos);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(store, ec);
 }
 
 TEST_CASE("stored versions are read-only") {

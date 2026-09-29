@@ -32,6 +32,20 @@ TEST_CASE("invalid identifiers are rejected") {
     }
 }
 
+TEST_CASE("identifiers name one file inside the project") {
+    // "..." is a Perforce wildcard: syncing it would fetch a whole folder.
+    // A drive would make the path leave the workspace root on Windows.
+    for (const char* text : {"clio:/...", "clio:/props/...", "clio:/props/a...b.usd", "clio:/C:/outside.usda",
+                             "clio:/c:\\outside.usda", "clio:/a/../D:/x.usd"}) {
+        CAPTURE(text);
+        CHECK_THROWS_AS(AssetIdentifier::parse(text), IdentifierError);
+    }
+    CHECK_THROWS_AS(AssetIdentifier::fromRelativePath("C:/outside.usda"), IdentifierError);
+    // Characters Perforce reserves are allowed; depot paths escape them.
+    CHECK(AssetIdentifier::parse("clio:/tex/crate@2x.png").path() == "/tex/crate@2x.png");
+    CHECK(AssetIdentifier::parse("clio:/a..b/c.usd").path() == "/a..b/c.usd");
+}
+
 TEST_CASE("relative paths anchor to the anchor's directory") {
     const auto anchor = AssetIdentifier::parse("clio:/props/crate/crate.usd");
     CHECK(AssetIdentifier::anchor("./geo/crate_geo.usdc", anchor).str() ==

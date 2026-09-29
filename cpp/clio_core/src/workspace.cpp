@@ -28,27 +28,24 @@ namespace clio::core {
 
 namespace {
 
-// Make a string safe to use as one directory name.
-std::string safeDirName(const std::string& text) {
-    std::string out;
-    out.reserve(text.size());
+// Stable 64-bit FNV-1a hash, the same in every build of clio_core.
+std::uint64_t fnv1a64(const std::string& text) {
+    std::uint64_t hash = 1469598103934665603ull;
     for (unsigned char c : text) {
-        const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                        (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
-        out += ok ? static_cast<char>(c) : '_';
+        hash = (hash ^ c) * 1099511628211ull;
     }
-    return out.empty() ? std::string("default") : out;
+    return hash;
 }
 
-// Reversible, collision-free folder name for any label: bytes outside
+// Reversible, collision-free folder name for any text: bytes outside
 // [a-z0-9_.-] become %XX. ("approved:prod" -> "approved%3Aprod", while
-// "approved_prod" stays as it is.) Upper case is encoded too, so labels that
+// "approved_prod" stays as it is.) Upper case is encoded too, so names that
 // differ only in case ("Prod", "prod") get different folders on
 // case-insensitive file systems (Windows, macOS).
-std::string encodeLabel(const std::string& label) {
+std::string encodeDirName(const std::string& text) {
     static const char* hex = "0123456789ABCDEF";
     std::string out;
-    for (unsigned char c : label) {
+    for (unsigned char c : text) {
         const bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
                         c == '-' || c == '_' || c == '.';
         if (ok) {
@@ -60,6 +57,51 @@ std::string encodeLabel(const std::string& label) {
         }
     }
     return out;
+}
+
+// Folder name for a server or depot root. Short names are encodeDirName();
+// long ones (an rsh: port can be a whole command line) keep a readable
+// prefix plus a hash of the full text, so paths stay within Windows limits.
+// '~' is never produced by encodeDirName, so the two forms cannot collide.
+std::string namespaceDirName(const std::string& text) {
+    constexpr std::size_t maxLength = 64;
+    std::string encoded = encodeDirName(text);
+    if (encoded.empty()) {
+        return "default";
+    }
+    if (encoded.size() <= maxLength) {
+        return encoded;
+    }
+    std::size_t cut = 40;
+    // Do not split a %XX escape.
+    if (const std::size_t pct = encoded.rfind('%', cut - 1); pct != std::string::npos && pct + 3 > cut) {
+        cut = pct;
+    }
+    char hash[17];
+    std::snprintf(hash, sizeof(hash), "%016llx", static_cast<unsigned long long>(fnv1a64(text)));
+    return encoded.substr(0, cut) + "~" + hash;
+}
+
+// `root` joined with an asset's project path, one segment at a time. A
+// segment that std::filesystem would treat as a new root (a drive, for
+// example) is refused, so the result is always inside `root`. Identifiers
+// already reject these; this keeps the guarantee local to path building.
+std::filesystem::path underRoot(std::filesystem::path root, const AssetIdentifier& id) {
+    const std::string rel = id.relativePath();
+    std::size_t start = 0;
+    while (start <= rel.size()) {
+        std::size_t end = rel.find('/', start);
+        if (end == std::string::npos) {
+            end = rel.size();
+        }
+        const std::filesystem::path segment(rel.substr(start, end - start));
+        if (segment.has_root_name() || segment.has_root_directory() || segment == "..") {
+            throw IdentifierError("Asset path '" + id.path() + "' leaves the project root");
+        }
+        root /= segment;
+        start = end + 1;
+    }
+    return root;
 }
 
 std::optional<std::string> decodeLabel(const std::string& encoded) {
@@ -86,7 +128,7 @@ std::optional<std::string> decodeLabel(const std::string& encoded) {
         i += 2;
     }
     // Only the canonical encoding maps back, so each folder has one label.
-    return encodeLabel(out) == encoded ? std::optional<std::string>(out) : std::nullopt;
+    return encodeDirName(out) == encoded ? std::optional<std::string>(out) : std::nullopt;
 }
 
 std::string pinDirName(const Pin& pin) {
@@ -94,7 +136,7 @@ std::string pinDirName(const Pin& pin) {
     case Pin::Kind::Change:
         return "change-" + std::to_string(pin.number());
     case Pin::Kind::Label:
-        return "label-" + encodeLabel(pin.labelName());
+        return "label-" + encodeDirName(pin.labelName());
     case Pin::Kind::Revision:
         return "rev-" + std::to_string(pin.number());
     case Pin::Kind::Latest:
@@ -176,39 +218,46 @@ Workspace::Workspace(Settings settings)
         } catch (const Error&) {
         }
     }
-    _serverKey = safeDirName(port);
+    _serverKey = namespaceDirName(port);
 }
 
 std::filesystem::path Workspace::lockPath() const {
-    // Stable 64-bit FNV-1a hash, the same in every build of clio_core.
-    std::uint64_t hash = 1469598103934665603ull;
     const std::string key = _serverKey + "\n" + _settings.connection.client + "\n" +
                             _settings.workspaceRoot.lexically_normal().generic_string();
-    for (unsigned char c : key) {
-        hash = (hash ^ c) * 1099511628211ull;
-    }
     char name[32];
-    std::snprintf(name, sizeof(name), "%016llx.lock", static_cast<unsigned long long>(hash));
+    std::snprintf(name, sizeof(name), "%016llx.lock", static_cast<unsigned long long>(fnv1a64(key)));
     return Settings::defaultCacheDir() / "locks" / name;
 }
 
 std::string Workspace::depotPath(const AssetIdentifier& id) const {
-    return _settings.depotRoot + id.path();
+    // Perforce reserves @ # % * in file names; they are written as %XX.
+    std::string path = _settings.depotRoot;
+    for (const char c : id.path()) {
+        switch (c) {
+        case '@': path += "%40"; break;
+        case '#': path += "%23"; break;
+        case '%': path += "%25"; break;
+        case '*': path += "%2A"; break;
+        default: path += c; break;
+        }
+    }
+    return path;
 }
 
 std::filesystem::path Workspace::workspacePath(const AssetIdentifier& id) const {
-    return _settings.workspaceRoot / std::filesystem::path(id.relativePath());
+    return underRoot(_settings.workspaceRoot, id);
+}
+
+std::filesystem::path Workspace::_storeBase() const {
+    return _settings.versionStore / _serverKey / namespaceDirName(_settings.depotRoot.substr(2));
 }
 
 std::filesystem::path Workspace::versionStorePath(const AssetIdentifier& id, const Pin& pin) const {
-    const std::string depot = safeDirName(_settings.depotRoot.substr(2));
-    return _settings.versionStore / _serverKey / depot / pinDirName(pin) /
-           std::filesystem::path(id.relativePath());
+    return underRoot(_storeBase() / pinDirName(pin), id);
 }
 
 std::optional<LocalPathMatch> Workspace::matchLocalPath(const std::filesystem::path& path) const {
-    const auto storeBase = _settings.versionStore / _serverKey /
-                           safeDirName(_settings.depotRoot.substr(2));
+    const auto storeBase = _storeBase();
     if (auto rel = relativeInside(path, storeBase)) {
         const std::size_t slash = rel->find('/');
         if (slash == std::string::npos) {

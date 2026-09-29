@@ -108,7 +108,7 @@ unsigned long P4dFixture::submit(const std::map<std::string, std::string>& files
         std::filesystem::create_directories(local.parent_path());
         std::ofstream(local, std::ios::binary | std::ios::trunc) << content;
         if (!exists) {
-            _connection->runOrThrow("add", {local.string()});
+            _connection->runOrThrow("add", {"-f", local.string()}); // -f: names may contain @ # % *
         }
     }
     const auto result = _connection->runOrThrow("submit", {"-d", description});

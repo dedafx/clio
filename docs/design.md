@@ -1071,13 +1071,13 @@ symbol.
 |---|---|
 | `_CreateIdentifier` | Inherited from `ArDefaultResolver`: USD's usual anchoring of relative paths and search paths. |
 | `_Resolve` | If a Clio context is bound and the path is inside the workspace root or the version store (search paths are tried under the workspace root), fetch it through `clio_core` at the pin and return the local file. Otherwise, or if Clio cannot provide it, `ArDefaultResolver::_Resolve`. *(Scaffold: no coalescer yet; one fetch at a time per context.)* |
-| `_ResolveForNewAsset` / `_CanWriteAssetToPath` / `_OpenAssetForWrite` | When a layer is saved: runs `p4 edit` (with lock for `+l` types) or `p4 add` in the artist's pending change, or refuses with `whyNot` ("locked by Sam"). Never submits (§10.6). |
+| `_ResolveForNewAsset` / `_CanWriteAssetToPath` / `_OpenAssetForWrite` | *Planned (phase 4); inherited today, so saving writes the local file only.* When a layer is saved: runs `p4 edit` (with lock for `+l` types) or `p4 add` in the artist's pending change, or refuses with `whyNot` ("locked by Sam"). Never submits (§10.6). |
 | `_IsContextDependentPath` | `true` for project paths while a Clio context is bound, because they resolve to a different file for each pin. Sdf then looks layers up by resolved path, so stages opened at different pins in one process never share a layer. Otherwise inherited. |
 | `_CreateDefaultContext[ForAsset]`, `_CreateContextFromString` | The default resolver's context, plus a `ClioResolverContext` from `$CLIO_RESOLVER_CONTEXT` if set. `CreateContextFromString(settings)` builds a Clio context when the string contains `=`, otherwise the default resolver's search-path context. |
-| `_GetAssetInfo` | Fills `version` (revision/change number) and `resolverInfo` (depot path, digest), so DCC UIs can show "crate.usd v12 @18234". |
-| `_GetModificationTimestamp` | Returns a timestamp derived from the revision or change number, so `Reload()` picks up newly synced versions. |
-| `_RefreshContext` | Re-evaluates moving pins ("latest", labels), syncs, and sends `ArNotice::ResolverChanged` for affected contexts. |
-| `_OpenAsset`, `_GetModificationTimestamp`, `_OpenAssetForWrite` | Inherited: resolved paths are ordinary local files. A later option is to stream pinned versions without writing files. |
+| `_GetAssetInfo` | Fills `assetName` (project path), `version` (the pin, for example `@18234`) and `resolverInfo` (`depotPath`, `pin`), with no server calls, so DCC UIs can show "crate.usd @18234". *(Planned: the revision number and digest.)* |
+| `_GetModificationTimestamp` | *Planned (phase 4): a timestamp derived from the revision or change number.* Inherited today: the local file's modification time. Perforce sets that to the sync time by default, so `Reload()` already picks up a newly synced version (tested), but a client with the `modtime` option would not. |
+| `_RefreshContext` | Forgets remembered answers (so moving pins such as "latest" and labels are checked again on the next resolve) and sends `ArNotice::ResolverChanged` for the context. |
+| `_OpenAsset` | Inherited: resolved paths are ordinary local files. A later option is to stream pinned versions without writing files. |
 
 * **Policies in the context:** `sync` (default: fetch what is needed),
   `verify` (fail if not present, no server calls, for farm reproducibility),

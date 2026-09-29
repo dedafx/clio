@@ -86,7 +86,17 @@ std::optional<ResolvedAsset> AssetResolver::_resolveUncached(const AssetIdentifi
         // Change and revision pins name content that never changes, so a
         // stored file is reused. A label can be moved by an admin, so it is
         // fetched from the server again once per process (design §8.3).
-        if (stored && (pin.kind() != Pin::Kind::Label || !mayContactServer)) {
+        if (stored && pin.kind() != Pin::Kind::Label) {
+            return asset;
+        }
+        if (stored && !mayContactServer) {
+            if (policy == Policy::Sync) {
+                // The server is down (or in its retry interval): the label
+                // may have moved. The warning also keeps this answer out of
+                // the memo, so the label is fetched once the server is back.
+                asset.warning = unavailable + "; using the stored copy of label " + pin.labelName() +
+                                ", which may be out of date";
+            }
             return asset;
         }
         if (!mayContactServer) {

@@ -38,7 +38,8 @@ public:
 
     const Settings& settings() const { return _settings; }
 
-    /// Depot path, for example //imagine/main/props/crate/crate.usd
+    /// Depot path, for example //imagine/main/props/crate/crate.usd. The
+    /// characters Perforce reserves (@ # % *) are escaped as %XX.
     std::string depotPath(const AssetIdentifier& id) const;
 
     /// Path of the file inside the client workspace (latest and have pins).
@@ -67,7 +68,8 @@ public:
     FetchResult fetchVersion(const AssetIdentifier& id, const Pin& pin);
 
     /// The version-store folder name for this server: the effective P4PORT
-    /// (configured, or from the Perforce environment), made safe for a path.
+    /// (configured, or from the Perforce environment), encoded reversibly as
+    /// a folder name (a long port is shortened with a hash).
     const std::string& serverKey() const { return _serverKey; }
 
     /// Lock file serializing changes to this workspace across processes.
@@ -79,6 +81,9 @@ public:
                           const std::optional<std::string>& input = std::nullopt);
 
 private:
+    /// This server's and depot root's folder in the version store.
+    std::filesystem::path _storeBase() const;
+
     Settings _settings;
     std::mutex _mutex;
     p4::Connection _connection;

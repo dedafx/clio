@@ -359,14 +359,18 @@ assert Plug.Registry().GetPluginWithName("clioUsd").isLoaded
    location is inside the project, Clio asks the server once, and
    remembers a "not found" answer until refresh. Relative paths avoid
    this.
-7. **The connect time limit is Linux/macOS only** for now. The workspace
-   lock and read-only stored files are implemented for Windows too, but
-   are only tested on Linux.
+7. **Some file names are not handled.** A path containing `...` (a
+   Perforce wildcard) or starting with a drive such as `C:` is refused,
+   and on Windows so is any `:`. Other characters Perforce reserves
+   (`@ # % *`) work; Clio escapes them in depot paths.
 8. **The version store is organised by server address.** The folder is
    named after the effective `P4PORT` (from the settings or the Perforce
    environment). Two spellings of one server's address get separate
    folders, which is safe. If a server is replaced by a different one at
    the same address, delete that server's folder in the version store,
-   because its change numbers mean something else now.
+   because its change numbers mean something else now. Server, depot and
+   label folder names use a reversible `%XX` encoding (upper case
+   included, for case-insensitive file systems); names longer than 64
+   characters are shortened, with a hash of the full name after `~`.
 9. **One plugin build per USD version.** A plugin built for 26.08 does not
    work in 25.08, and the other way round.

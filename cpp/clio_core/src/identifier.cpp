@@ -20,6 +20,28 @@ bool startsWithNoCase(const std::string& text, const std::string& prefix) {
            });
 }
 
+// Rejects path segments that could name something other than one file under
+// the project root: Perforce's "..." wildcard, which would widen a sync to a
+// whole folder, and a drive such as "C:", which std::filesystem would treat
+// as a new root on Windows. Characters with a meaning in depot syntax
+// (@ # % *) are allowed; Workspace::depotPath escapes them.
+void checkSegment(const std::string& part, bool first, const std::string& original) {
+    if (part.find("...") != std::string::npos) {
+        throw IdentifierError("Asset path '" + original + "' contains '...', a Perforce wildcard");
+    }
+    const bool drive = first && part.size() == 2 && part[1] == ':' &&
+                       std::isalpha(static_cast<unsigned char>(part[0]));
+    if (drive) {
+        throw IdentifierError("Asset path '" + original + "' names a drive; use a path in the project");
+    }
+#ifdef _WIN32
+    // Anywhere else on Windows, ':' names an alternate data stream.
+    if (part.find(':') != std::string::npos) {
+        throw IdentifierError("Asset path '" + original + "' contains ':'");
+    }
+#endif
+}
+
 // Normalize a '/'-separated path. `path` may be absolute or relative; the
 // result is always absolute within the project root. Throws if ".." escapes.
 std::string normalizePath(std::string path, const std::string& original) {
@@ -39,6 +61,7 @@ std::string normalizePath(std::string path, const std::string& original) {
             }
             parts.pop_back();
         } else if (!part.empty() && part != ".") {
+            checkSegment(part, parts.empty(), original);
             parts.push_back(std::move(part));
         }
         start = end + 1;
