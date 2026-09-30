@@ -332,11 +332,63 @@ Configuration is layered, and later layers win:
 
 Authentication uses **Perforce tickets only**. Clio never stores passwords.
 `clio login` wraps `p4 login` (including SSO where the server is set up for
-it) and `p4 trust` for SSL fingerprints, with a clear prompt.
+it) and `p4 trust` for SSL fingerprints, with a clear prompt. *(Phase 1:
+`clio login` and `clio setup` log in with a password prompt; SSO and
+`p4 trust` are not implemented yet. See §6.1.)*
 
 Workspaces are created on demand with a predictable name,
 `{user}_{host}_{project}`, and a root taken from config. `clio setup` does
 the first-time setup in one step.
+
+### 6.1 Ticket lifetime and re-login *(to revisit)*
+
+**Goal:** artists should not have to think about Perforce tickets. Today
+(phase 1) the ticket file is hidden, and nothing asks for a password after
+`clio login`, but an **expired ticket** stops every command with
+`AuthError` ("Run 'clio login'"). In a DCC session that runs past the
+expiry, the next save fails.
+
+**What Perforce allows** (checked against p4d 2026.1 and its `p4 help`):
+
+* A ticket cannot be renewed with the ticket itself. `p4 login` asks for
+  the password even while a valid ticket exists, so a password-based login
+  can never be silent without storing the password, which Clio does not do.
+* Group settings decide the lifetime: `Timeout` (total life, can be
+  `unlimited`) and `IdleTimeout` (invalidated after this long without a
+  command). A user gets the highest limit of their groups.
+* Single sign-on: with a server `auth-check-sso` trigger and a client
+  `P4LOGINSSO` script that prints proof of identity (for example a Windows
+  domain or Kerberos token), `p4 login` issues a normal ticket with no
+  password prompt. The SSO message is sent in clear text, so it needs an
+  `ssl:` port. Browser-based identity providers (Helix Authentication
+  Service with SAML/OIDC) may still open a browser when the provider's
+  session has lapsed.
+* Tickets are valid only on the machine that asked for them unless
+  `login -a` is used.
+
+**Options:**
+
+| Option | Where | Artist experience | Trade-off |
+|---|---|---|---|
+| A. `Timeout: unlimited` + `IdleTimeout` (e.g. 7 days) for the artists' group | Server config, no Clio code | Log in once per machine; again only after a week without using Perforce | The ticket file becomes a long-lived credential (limited to that machine) |
+| B. Re-login on expiry | Clio CLI (and a session hook) | On `AuthError`, the CLI asks for the password, logs in and retries the command: one step instead of a failure | Still a password prompt when the ticket expires |
+| C. Silent SSO login | Server trigger + client `P4LOGINSSO` + Clio | Never asked: Clio logs in on expiry and refreshes early when `login -s` shows little time left | Needs an identity provider; silent only if its check is silent |
+| D. Password in the OS keychain | Clio | Never asked | Against the "Clio never stores passwords" rule. Rejected. |
+
+**Proposed plan (not scheduled):**
+
+1. Ask the Perforce admin for option A for the artists' group. This removes
+   most re-logins with no code.
+2. Implement B: CLI prompt and retry on `AuthError`; a `Session` login
+   callback so Dedaverse or a DCC panel can show its own dialog instead of
+   failing (phase 5 UI work); a warning when the ticket has little time
+   left.
+3. If the studio has SSO: implement C, enabled when `P4LOGINSSO` is set.
+   First verify that `clio_core`'s P4API connection runs the `P4LOGINSSO`
+   script the way the `p4` command does (not tested yet), and that the USD
+   resolver, which never prompts, can use it from worker threads.
+4. Also still open from this section: `p4 trust` for `ssl:` servers in
+   `clio setup` (not implemented in phase 1).
 
 ## 7. Branching model
 
@@ -1492,6 +1544,8 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
 
 ### Backlog
 
+* **Tickets without re-login** (§6.1): re-login and retry on expiry, silent
+  SSO login, `p4 trust` in setup. Revisit with the Perforce admin (Q11).
 * **Persistent local cache (SQLite)** for status and history, only if
   in-memory caching proves too slow (§8.3).
 * **Thumbnails and previews** (§9.8).
@@ -1525,6 +1579,11 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
 10. **Manifests, unsubmitted work:** Should the farm be able to render
     unsubmitted work through shelves, or must everything in a manifest be
     submitted?
+11. **Ticket lifetime (§6.1):** Can the artists' group get `Timeout:
+    unlimited` with an `IdleTimeout` (for example 7 days)? Does the studio
+    have an identity provider for Perforce single sign-on
+    (`auth-check-sso`), and is it silent (Windows domain, Kerberos) or
+    browser-based?
 
 ### Decided
 
