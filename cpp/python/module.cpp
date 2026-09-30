@@ -126,7 +126,7 @@ NB_MODULE(_core, m) {
             "__init__",
             [](p4::Connection* self, const std::string& port, const std::string& user,
                const std::string& client, const std::string& cwd, const std::string& tickets,
-               int timeout, std::optional<nb::callable> prompt) {
+               int timeout, int connectTimeout, std::optional<nb::callable> prompt) {
                 p4::ConnectionOptions options;
                 options.port = port;
                 options.user = user;
@@ -134,6 +134,7 @@ NB_MODULE(_core, m) {
                 options.cwd = cwd;
                 options.ticketFile = tickets;
                 options.commandTimeout = std::chrono::seconds(timeout);
+                options.connectTimeout = std::chrono::seconds(connectTimeout);
                 if (prompt) {
                     // Called from run() with the GIL released; take it back.
                     auto callback = std::make_shared<nb::callable>(std::move(*prompt));
@@ -150,7 +151,7 @@ NB_MODULE(_core, m) {
                 new (self) p4::Connection(std::move(options));
             },
             "port"_a = "", "user"_a = "", "client"_a = "", "cwd"_a = "", "tickets"_a = "",
-            "timeout"_a = 120, "prompt"_a = nb::none(),
+            "timeout"_a = 120, "connect_timeout"_a = 10, "prompt"_a = nb::none(),
             "prompt(text, no_echo) -> str | None answers Perforce prompts such as the "
             "password for 'login'. Without it, Clio never prompts.")
         .def("run", &p4::Connection::run, "command"_a, "args"_a = std::vector<std::string>{},

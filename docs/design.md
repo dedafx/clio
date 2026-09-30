@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.2. The C++ core, Python bindings and USD resolver are scaffolded (see [building.md](building.md)). |
+| **Status** | Draft v0.3. Phase 0 (C++ core, Python bindings, USD resolver) and phase 1 (Python workflow services, `clio` CLI, history cache) are implemented; see [workflow.md](workflow.md), [usd.md](usd.md) and [building.md](building.md). |
 | **Package** | `deda.clio` (Python namespace package) |
 | **Targets** | Python 3.13 · USD 26.08 (primary) and USD 25.08 or later · no DCCs yet |
 | **Consumers** | Standalone Python, the `clio` CLI, and USD. Dedaverse, Imagine and DCC integrations are later work. |
@@ -1396,9 +1396,16 @@ needs `UsdUtils`, lives in Python (`deda.clio.usd`) and in the `clio` CLI.
 
 ## 12. CLI
 
-Entry point `clio` (also `python -m deda.clio.cli`). Human-readable output by
-default, `--json` on every command for tooling, and exit codes documented
-per error class.
+Entry point `clio` (also `python -m deda.clio.cli`), built with **click**.
+Human-readable output by default, `--json` on every command for tooling, and
+exit codes documented per error class ([workflow.md](workflow.md)). Path
+arguments are relative to the current folder; `//...` is a depot path.
+
+*Implemented in phase 1:* `setup`, `login`, `logout`, `whoami`, `status`,
+`get`, `lock`, `unlock`, `who`, `save`, `discard`, `history`, and `activity
+[PATH]` (recent changes in a folder, §9.1). `status` is live, not cached:
+the status cache comes with phase 3. The rest of the list below belongs to
+later phases.
 
 ```
 clio setup                      # first-time: login, trust, create workspace
@@ -1422,13 +1429,16 @@ clio usd localize LAYER --dest DIR   # rewrite clio: paths for delivery (§10.5)
 ```
 
 Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
-`revert`, `shelve`). *(Q3: CLI framework. The recommendation is `click`,
-loaded lazily, or `argparse` for zero dependencies.)*
+`revert`, `shelve`) *(not implemented yet)*.
 
 ## 13. Testing strategy
 
-* **Unit tests** (`tests/unit`) run service logic against `FakeBackend`.
-  They are fast and have no server.
+* **Unit tests** run service logic against `FakeBackend`, which answers
+  from scripted rules and records every call. It does not emulate
+  Perforce: behaviour that depends on Perforce is tested against a real
+  server (below). The fake covers what a server makes hard to trigger,
+  such as a submit trigger rejecting a change. They are fast and have no
+  server.
 * **Integration tests** (`tests/integration`) run against a real, throwaway
   `p4d` started per test session with an `rsh:` port
   (`P4PORT="rsh:p4d -r <tmp> -L log -i"`). That needs no network listener and
@@ -1473,7 +1483,7 @@ loaded lazily, or `argparse` for zero dependencies.)*
 | Phase | Scope |
 |---|---|
 | **0 — Scaffold** *(done)* | CMake project; `clio_core` (P4API connections, pins, `clio:` identifiers, settings, resolve for latest/have/historical pins, version store); `deda.clio._core` (nanobind, abi3); the `clioUsd` resolver plugin; C++, Python and USD tests against a throwaway `p4d`. See [building.md](building.md). |
-| **1 — Core workflow** | Python services over `CoreBackend`: connect/login/setup, get (parallel), lock/unlock, save, status, history backed by the HistoryCache with watermark refresh (§9.3–9.4), CLI for these. Baseline benchmarks. |
+| **1 — Core workflow** *(done)* | Python services over `CoreBackend`: connect/login/setup, get (parallel), lock/unlock, save, status, discard, history and folder activity backed by the HistoryCache with watermark refresh (§9.3–9.4), and the `clio` CLI for these ([workflow.md](workflow.md)). Baseline benchmarks ([benchmarks.md](benchmarks.md)). *Deferred:* per-file progress (P4API's progress hook is not exposed yet), a status cache (phase 3), `clio doctor` (phase 5). |
 | **2 — Branching** | Streams/task streams, switch, update/publish with binary conflict handling, cross-branch lock check, drafts (shelves). |
 | **3 — Performance** | Connection pool and miss coalescer in `clio_core`; time-bounded in-memory caches (§8.3); C++ hashing/scan/diff if benchmarks justify it. Measure; add a persistent store only if the numbers call for it. |
 | **4 — USD completion** | Write side (edit/lock on save, §10.6); revision-based timestamps; `deda.clio.usd.prepare` (option A); CI builds against USD 26.08 and 25.08. |
@@ -1497,8 +1507,7 @@ loaded lazily, or `argparse` for zero dependencies.)*
 2. **Server:** Existing Perforce server version and topology (single server,
    proxy, edge)? Is there already a streams depot, or is this greenfield? Can
    we set `net.parallel.max` and the typemap?
-3. **CLI framework:** `click` (nicer UX, one dependency) or `argparse` (no
-   dependencies)?
+3. ~~**CLI framework**~~ *Decided: `click` (see below).*
 4. **Cross-branch locking:** Advisory warning or hard block by default?
 5. **Vocabulary:** Do "save / get / lock / draft / publish" suit your
    artists, or do they already know some Perforce terms that should stay?
@@ -1518,6 +1527,9 @@ loaded lazily, or `argparse` for zero dependencies.)*
     submitted?
 
 ### Decided
+
+* CLI: `click` (Q3). It is the one runtime dependency besides Clio's own
+  extension, and only the CLI imports it.
 
 * Default pin is `have`: a file on disk is loaded as it is; a file not on
   disk is synced as its layer is resolved. `latest` updates everything.
