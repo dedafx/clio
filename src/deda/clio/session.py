@@ -51,6 +51,7 @@ class Session:
         self._lock = threading.Lock()
         self._executor: ThreadPoolExecutor | None = None
         self._info: dict[str, str] | None = None
+        self._stream = ""
 
     # --- lifecycle ------------------------------------------------------
 
@@ -105,14 +106,22 @@ class Session:
 
     @cached_property
     def paths(self) -> ProjectPaths:
-        """The project's depot root and workspace root."""
-        depot = self.config.depot.rstrip("/")
-        root = self.config.root
+        """The project's depot root and workspace root.
+
+        For a stream workspace the depot root is the workspace's current
+        stream, so paths follow a branch switch (design doc §7.1); it wins
+        over the ``depot`` setting. Otherwise ``depot`` and ``root`` come from
+        the config, or from the workspace. One ``p4 client -o`` per session.
+        """
+        result = self.backend.run("client", ["-o", self.client])
+        spec = result.records[0] if result.records and not result.errors else {}
+        exists = bool(spec.get("Access") or spec.get("Update"))
+        self._stream = spec.get("Stream", "") if exists else ""
+        depot = self._stream or self.config.depot.rstrip("/")
+        root = self.config.root or (spec.get("Root", "") if exists else "")
         if not depot or not root:
-            spec = self._client_spec(self.client)
-            if not spec.get("Access") and not spec.get("Update"):
+            if not exists:
                 raise NotInWorkspaceError(f"Workspace {self.client} does not exist", hint="Run 'clio setup'")
-            root = root or spec.get("Root", "")
             depot = depot or self._depot_from_spec(spec)
         if not depot.startswith("//"):
             raise ConfigError(f"The project depot path must start with //, got '{depot}'")
@@ -129,6 +138,29 @@ class Session:
         from deda.clio.history import History
 
         return History(self)
+
+    @cached_property
+    def branches(self):  # -> deda.clio.branches.Branches
+        from deda.clio.branches import Branches
+
+        return Branches(self)
+
+    @cached_property
+    def drafts(self):  # -> deda.clio.drafts.Drafts
+        from deda.clio.drafts import Drafts
+
+        return Drafts(self)
+
+    @property
+    def stream(self) -> str:
+        """The workspace's stream (current branch), or "" for a workspace
+        with a classic view."""
+        _ = self.paths  # reads the workspace once
+        return self._stream
+
+    def forget_workspace_state(self) -> None:
+        """Re-read the workspace (after a branch switch)."""
+        self.__dict__.pop("paths", None)
 
     def _client_spec(self, name: str) -> dict[str, str]:
         result = self.backend.run("client", ["-o", name])
@@ -235,6 +267,6 @@ class Session:
         if isinstance(self.backend, CoreBackend):
             self.backend = CoreBackend(self.config)
         self._info = None
-        for attr in ("paths", "workspace", "history"):
+        for attr in ("paths", "workspace", "history", "branches", "drafts"):
             self.__dict__.pop(attr, None)
 

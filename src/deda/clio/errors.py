@@ -19,6 +19,7 @@ __all__ = [
     "ClioError",
     "ConfigError",
     "ConfirmationRequiredError",
+    "ConflictError",
     "IdentifierError",
     "LockedByOtherError",
     "NotInWorkspaceError",
@@ -66,11 +67,14 @@ class LockedByOtherError(WorkflowError):
 
     exit_code = 5
 
-    def __init__(self, message: str, *, path: str, user: str, workspace: str, **kwargs) -> None:
+    def __init__(self, message: str, *, path: str, user: str, workspace: str, branch: str = "", **kwargs) -> None:
         super().__init__(message, **kwargs)
         self.path = path
         self.user = user
         self.workspace = workspace
+        #: The branch (stream) where the file is locked, when it is not the
+        #: current one.
+        self.branch = branch
 
 
 class OutOfDateError(WorkflowError):
@@ -109,6 +113,18 @@ class ConfirmationRequiredError(WorkflowError):
     """A destructive action was called without ``confirm=True``."""
 
     exit_code = 9
+
+
+class ConflictError(WorkflowError):
+    """The branch and its parent both changed the same files; a choice is
+    needed for each (design doc §7.2). Nothing was changed."""
+
+    exit_code = 12
+
+    def __init__(self, message: str, *, conflicts: Sequence = (), **kwargs) -> None:
+        super().__init__(message, **kwargs)
+        #: The :class:`~deda.clio.models.Conflict` for each file.
+        self.conflicts = tuple(conflicts)
 
 
 class NotInWorkspaceError(WorkflowError):

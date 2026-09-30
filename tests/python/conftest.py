@@ -139,10 +139,8 @@ def make_session(p4_server: P4Server, tmp_path: Path):
     def make(user: str = USER, **settings) -> clio.Session:
         if user != USER:
             add_user(p4_server, user)
-        options = {"parallel_threads": 1, "tickets": os.fspath(p4_server.tickets), **settings}
-        session = clio.connect(
-            port=p4_server.port, user=user, depot=DEPOT_ROOT, root=os.fspath(tmp_path / f"{user}_root"), **options,
-        )
+        options = {"parallel_threads": 1, "tickets": os.fspath(p4_server.tickets), "depot": DEPOT_ROOT, **settings}
+        session = clio.connect(port=p4_server.port, user=user, root=os.fspath(tmp_path / f"{user}_root"), **options)
         session.setup(name=f"{user}_clio")
         sessions.append(session)
         return session
@@ -150,3 +148,29 @@ def make_session(p4_server: P4Server, tmp_path: Path):
     yield make
     for session in sessions:
         session.close()
+
+
+STREAM_DEPOT = "//imagine"
+MAINLINE = "//imagine/main"
+
+
+@pytest.fixture
+def streams_project(p4_server: P4Server) -> str:
+    """A streams depot //imagine with a //imagine/main mainline."""
+    admin = p4_server.connection()
+    admin.run_or_throw("depot", ["-i"], "Depot: imagine\nType: stream\nStreamDepth: //imagine/1\nMap: imagine/...\n")
+    admin.run_or_throw("stream", ["-i"], (
+        f"Stream: {MAINLINE}\nOwner: {USER}\nName: main\nParent: none\nType: mainline\nParentView: noinherit\n"
+        "Options: allsubmit unlocked notoparent nofromparent mergedown\nPaths:\n\tshare ...\n"
+    ))
+    return MAINLINE
+
+
+@pytest.fixture
+def make_stream_session(make_session, streams_project):
+    """make_stream_session(user) -> a Session on a workspace of //imagine/main."""
+
+    def make(user: str = USER, **settings) -> clio.Session:
+        return make_session(user, depot=MAINLINE, stream=MAINLINE, **settings)
+
+    return make

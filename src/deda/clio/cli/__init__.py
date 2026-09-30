@@ -6,7 +6,7 @@ relative to the current folder; ``//...`` paths are depot paths.
 Exit codes: 0 success, 1 other Clio error, 2 usage error, 3 not logged in,
 4 server unreachable, 5 locked by someone else, 6 out of date, 7 nothing to
 save, 8 refused by the server, 9 cancelled or not confirmed, 10 outside the
-workspace, 11 configuration error.
+workspace, 11 configuration error, 12 conflicts need a choice (branch update).
 """
 
 from __future__ import annotations
@@ -106,9 +106,14 @@ def handles_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
             if state is not None and state.out.as_json:
                 payload = {"error": type(e).__name__, "message": getattr(e, "message", str(e)),
                            "hint": getattr(e, "hint", ""), "p4_messages": list(getattr(e, "p4_messages", ()))}
+                if isinstance(e, clio.ConflictError):
+                    payload["conflicts"] = _jsonable(e.conflicts)
                 click.echo(json.dumps(payload, indent=2))
             else:
                 click.secho(f"error: {getattr(e, 'message', str(e))}", fg="red", err=True)
+                if isinstance(e, clio.ConflictError):
+                    for conflict in e.conflicts:
+                        click.echo(f"  conflict  {conflict.asset_path}  (theirs: {conflict.theirs})", err=True)
                 if hint := getattr(e, "hint", ""):
                     click.echo(f"hint: {hint}", err=True)
                 for text in getattr(e, "p4_messages", ()):
@@ -276,7 +281,14 @@ def get(state: State, paths: tuple[str, ...], version: str | None, preview: bool
 def lock(state: State, paths: tuple[str, ...], allow_out_of_date: bool) -> None:
     """Lock files so nobody else can change them."""
     locks = state.session.workspace.lock(*paths, allow_out_of_date=allow_out_of_date, local_base=Path.cwd())
-    state.out.emit(locks, lambda: [click.echo(f"locked  {lk.asset_path}") for lk in locks])
+
+    def human() -> None:
+        for lk in locks:
+            click.echo(f"locked  {lk.asset_path}")
+            for holder in lk.elsewhere:
+                click.secho(f"  warning: also open by {holder}", fg="yellow", err=True)
+
+    state.out.emit(locks, human)
 
 
 @cli.command()
@@ -404,6 +416,186 @@ def activity(state: State, path: str, limit: int) -> None:
             click.echo(f"change {c.number:<6} {when}  {c.user:<12} {first}")
 
     state.out.emit(page, human)
+
+
+# --- branches (design doc §7) ------------------------------------------------
+
+
+@cli.group()
+def branch() -> None:
+    """Branches (Perforce streams): list, create, switch, update, publish."""
+
+
+@branch.command("list")
+@pass_state
+@handles_errors
+def branch_list(state: State) -> None:
+    """List the project's branches (* marks yours)."""
+    branches = state.session.branches.list()
+
+    def human() -> None:
+        for b in branches:
+            parent = f"  <- {b.parent.rsplit('/', 1)[-1]}" if b.parent else ""
+            click.echo(f"{'*' if b.is_current else ' '} {b.name:<24} {b.kind:<12}{parent}")
+
+    state.out.emit(branches, human)
+
+
+@branch.command("create")
+@click.argument("name")
+@click.option("--from", "parent", help="Parent branch (default: your current branch).")
+@click.option("--kind", type=click.Choice(["task", "development", "release"]), default="task", show_default=True)
+@click.option("--no-switch", is_flag=True, help="Stay on the current branch.")
+@pass_state
+@handles_errors
+def branch_create(state: State, name: str, parent: str | None, kind: str, no_switch: bool) -> None:
+    """Create a branch and (by default) switch to it."""
+    b = state.session.branches.create(name, parent=parent, kind=kind, switch=not no_switch)
+    where = "" if no_switch else "; you are on it"
+    state.out.emit(b, lambda: click.echo(f"Created {b.path} from {b.parent}{where}"))
+
+
+@branch.command("switch")
+@click.argument("name")
+@click.option("--share-open-files", is_flag=True, help="Share open files as a draft first, then switch.")
+@pass_state
+@handles_errors
+def branch_switch(state: State, name: str, share_open_files: bool) -> None:
+    """Move your workspace to another branch."""
+    result = state.session.branches.switch(name, share_open_files=share_open_files)
+
+    def human() -> None:
+        if result.draft:
+            click.echo(f"Your open files were shared as draft {result.draft.number}")
+        click.echo(f"On {result.branch.name}; got {result.report.file_count} file(s)")
+
+    state.out.emit(result, human)
+
+
+@branch.command("update")
+@click.option("--mine", "keep_mine", multiple=True, metavar="PATH", help="Keep your version of PATH (repeatable).")
+@click.option("--theirs", "take_theirs", multiple=True, metavar="PATH", help="Take the parent's version of PATH.")
+@click.option("--both", "keep_both", multiple=True, metavar="PATH",
+              help="Keep yours and save the parent's as NAME.theirs.EXT.")
+@click.option("--all", "default", type=click.Choice(["mine", "theirs", "both"]),
+              help="Settle every conflict this way.")
+@click.option("-m", "--message", help="Description of the update.")
+@pass_state
+@handles_errors
+def branch_update(state: State, keep_mine: tuple[str, ...], take_theirs: tuple[str, ...], keep_both: tuple[str, ...],
+                  default: str | None, message: str | None) -> None:
+    """Bring the parent's changes into your branch."""
+    s = state.session
+    resolutions: dict[str, str] = {}
+    for choice, paths in (("mine", keep_mine), ("theirs", take_theirs), ("both", keep_both)):
+        if paths:
+            for target in s.workspace.targets(list(paths), local_base=Path.cwd()):
+                resolutions[target.asset_path] = choice
+    result = s.branches.update(resolutions=resolutions, default=default, message=message)
+
+    def human() -> None:
+        if result.change is None:
+            click.echo("Already up to date")
+            return
+        click.echo(f"Updated in change {result.change.number}")
+        for label, items in (("taken", result.taken), ("kept mine", result.kept_mine),
+                             ("took theirs", result.took_theirs)):
+            for item in items:
+                click.echo(f"  {label:<11} {item}")
+        for copy in result.theirs_copies:
+            click.echo(f"  parent's version saved as {copy} (not in Perforce)")
+
+    state.out.emit(result, human)
+
+
+@branch.command("publish")
+@click.option("-m", "--message", help="Description of the publish.")
+@pass_state
+@handles_errors
+def branch_publish(state: State, message: str | None) -> None:
+    """Copy your branch's saved work up to its parent."""
+    result = state.session.branches.publish(message=message)
+    state.out.emit(result, lambda: click.echo(
+        f"Published {len(result.files)} file(s) to {result.parent} in change {result.change.number}"))
+
+
+@branch.command("retire")
+@click.argument("name")
+@click.option("--yes", is_flag=True, help="Confirm retiring a branch that is not a task branch.")
+@pass_state
+@handles_errors
+def branch_retire(state: State, name: str, yes: bool) -> None:
+    """Delete a branch (its history stays)."""
+    state.session.branches.retire(name, confirm=yes)
+    state.out.emit({"retired": name}, lambda: click.echo(f"Retired {name}"))
+
+
+# --- drafts -------------------------------------------------------------------
+
+
+@cli.group()
+def draft() -> None:
+    """Drafts: share work without saving it (Perforce shelves)."""
+
+
+@draft.command("share")
+@click.argument("paths", nargs=-1)
+@click.option("-m", "--message", required=True, help="What the draft is.")
+@click.option("--close", is_flag=True, help="Close the files afterwards (the draft keeps the work).")
+@pass_state
+@handles_errors
+def draft_share(state: State, paths: tuple[str, ...], message: str, close: bool) -> None:
+    """Share changed files as a draft."""
+    d = state.session.drafts.share(*paths, message=message, keep_open=not close, local_base=Path.cwd())
+    state.out.emit(d, lambda: click.echo(f"Shared draft {d.number} with {len(d.files)} file(s)"))
+
+
+@draft.command("list")
+@click.option("--all", "everyone", is_flag=True, help="Everyone's drafts, not only yours.")
+@pass_state
+@handles_errors
+def draft_list(state: State, everyone: bool) -> None:
+    """List drafts in the project."""
+    drafts = state.session.drafts.list(everyone=everyone)
+
+    def human() -> None:
+        for d in drafts:
+            first = d.description.splitlines()[0] if d.description else ""
+            click.echo(f"{d.number:<7} {d.user:<12} {len(d.files):>3} file(s)  {first}")
+        if not drafts:
+            click.echo("No drafts")
+
+    state.out.emit(drafts, human)
+
+
+@draft.command("get")
+@click.argument("number", type=int)
+@pass_state
+@handles_errors
+def draft_get(state: State, number: int) -> None:
+    """Copy a draft's files into your workspace (open, not saved)."""
+    got = state.session.drafts.get(number)
+
+    def human() -> None:
+        for path in got:
+            click.echo(f"got  {path}")
+
+    state.out.emit(got, human)
+
+
+@draft.command("drop")
+@click.argument("number", type=int)
+@click.option("--yes", is_flag=True, help="Do not ask for confirmation.")
+@pass_state
+@handles_errors
+def draft_drop(state: State, number: int, yes: bool) -> None:
+    """Delete one of your drafts."""
+    if not yes:
+        if state.out.as_json:
+            raise clio.ConfirmationRequiredError(f"Dropping draft {number} needs confirmation", hint="Pass --yes")
+        click.confirm(f"Drop draft {number}?", abort=True)
+    state.session.drafts.drop(number, confirm=True)
+    state.out.emit({"dropped": number}, lambda: click.echo(f"Dropped draft {number}"))
 
 
 def _size(n: int) -> str:
