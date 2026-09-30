@@ -102,3 +102,51 @@ def p4_server(tmp_path: Path) -> P4Server:
     )
     server.connection().run_or_throw("client", ["-i"], spec)
     return server
+
+
+@pytest.fixture(autouse=True)
+def isolated_config(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the developer's own Clio and Perforce settings out of tests."""
+    home = tmp_path_factory.mktemp("config")
+    monkeypatch.delenv("CLIO_SITE_CONFIG", raising=False)
+    monkeypatch.setenv("CLIO_USER_CONFIG", os.fspath(home / "config.toml"))
+    for name in ("P4CLIENT", "P4CONFIG", "P4USER", "P4PORT"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def add_user(server: P4Server, name: str) -> str:
+    """Create another user and log them in. A password set by a super user
+    starts out expired, so the new user changes it before logging in."""
+    admin = server.connection()
+    admin.run_or_throw("user", ["-i", "-f"], f"User: {name}\nEmail: {name}@example.com\nFullName: {name}\n")
+    first, final = f"{PASSWORD}-first", f"{PASSWORD}-{name}"
+    clio.Connection(port=server.port, user=USER, tickets=os.fspath(server.tickets),
+                    prompt=lambda text, no_echo: first).run_or_throw("passwd", [name])
+    user_conn = clio.Connection(
+        port=server.port, user=name, tickets=os.fspath(server.tickets),
+        prompt=lambda text, no_echo: first if "old" in text.lower() else final,
+    )
+    user_conn.run_or_throw("passwd")
+    user_conn.run_or_throw("login")
+    return name
+
+
+@pytest.fixture
+def make_session(p4_server: P4Server, tmp_path: Path):
+    """make_session(user) -> a Session on a new Clio workspace for that user."""
+    sessions: list[clio.Session] = []
+
+    def make(user: str = USER, **settings) -> clio.Session:
+        if user != USER:
+            add_user(p4_server, user)
+        options = {"parallel_threads": 1, "tickets": os.fspath(p4_server.tickets), **settings}
+        session = clio.connect(
+            port=p4_server.port, user=user, depot=DEPOT_ROOT, root=os.fspath(tmp_path / f"{user}_root"), **options,
+        )
+        session.setup(name=f"{user}_clio")
+        sessions.append(session)
+        return session
+
+    yield make
+    for session in sessions:
+        session.close()

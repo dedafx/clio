@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.2. The C++ core, Python bindings and USD resolver are scaffolded (see [building.md](building.md)). |
+| **Status** | Draft v0.3. Phase 0 (C++ core, Python bindings, USD resolver) and phase 1 (Python workflow services, `clio` CLI, history cache) are implemented; see [workflow.md](workflow.md), [usd.md](usd.md) and [building.md](building.md). |
 | **Package** | `deda.clio` (Python namespace package) |
 | **Targets** | Python 3.13 · USD 26.08 (primary) and USD 25.08 or later · no DCCs yet |
 | **Consumers** | Standalone Python, the `clio` CLI, and USD. Dedaverse, Imagine and DCC integrations are later work. |
@@ -332,11 +332,63 @@ Configuration is layered, and later layers win:
 
 Authentication uses **Perforce tickets only**. Clio never stores passwords.
 `clio login` wraps `p4 login` (including SSO where the server is set up for
-it) and `p4 trust` for SSL fingerprints, with a clear prompt.
+it) and `p4 trust` for SSL fingerprints, with a clear prompt. *(Phase 1:
+`clio login` and `clio setup` log in with a password prompt; SSO and
+`p4 trust` are not implemented yet. See §6.1.)*
 
 Workspaces are created on demand with a predictable name,
 `{user}_{host}_{project}`, and a root taken from config. `clio setup` does
 the first-time setup in one step.
+
+### 6.1 Ticket lifetime and re-login *(to revisit)*
+
+**Goal:** artists should not have to think about Perforce tickets. Today
+(phase 1) the ticket file is hidden, and nothing asks for a password after
+`clio login`, but an **expired ticket** stops every command with
+`AuthError` ("Run 'clio login'"). In a DCC session that runs past the
+expiry, the next save fails.
+
+**What Perforce allows** (checked against p4d 2026.1 and its `p4 help`):
+
+* A ticket cannot be renewed with the ticket itself. `p4 login` asks for
+  the password even while a valid ticket exists, so a password-based login
+  can never be silent without storing the password, which Clio does not do.
+* Group settings decide the lifetime: `Timeout` (total life, can be
+  `unlimited`) and `IdleTimeout` (invalidated after this long without a
+  command). A user gets the highest limit of their groups.
+* Single sign-on: with a server `auth-check-sso` trigger and a client
+  `P4LOGINSSO` script that prints proof of identity (for example a Windows
+  domain or Kerberos token), `p4 login` issues a normal ticket with no
+  password prompt. The SSO message is sent in clear text, so it needs an
+  `ssl:` port. Browser-based identity providers (Helix Authentication
+  Service with SAML/OIDC) may still open a browser when the provider's
+  session has lapsed.
+* Tickets are valid only on the machine that asked for them unless
+  `login -a` is used.
+
+**Options:**
+
+| Option | Where | Artist experience | Trade-off |
+|---|---|---|---|
+| A. `Timeout: unlimited` + `IdleTimeout` (e.g. 7 days) for the artists' group | Server config, no Clio code | Log in once per machine; again only after a week without using Perforce | The ticket file becomes a long-lived credential (limited to that machine) |
+| B. Re-login on expiry | Clio CLI (and a session hook) | On `AuthError`, the CLI asks for the password, logs in and retries the command: one step instead of a failure | Still a password prompt when the ticket expires |
+| C. Silent SSO login | Server trigger + client `P4LOGINSSO` + Clio | Never asked: Clio logs in on expiry and refreshes early when `login -s` shows little time left | Needs an identity provider; silent only if its check is silent |
+| D. Password in the OS keychain | Clio | Never asked | Against the "Clio never stores passwords" rule. Rejected. |
+
+**Proposed plan (not scheduled):**
+
+1. Ask the Perforce admin for option A for the artists' group. This removes
+   most re-logins with no code.
+2. Implement B: CLI prompt and retry on `AuthError`; a `Session` login
+   callback so Dedaverse or a DCC panel can show its own dialog instead of
+   failing (phase 5 UI work); a warning when the ticket has little time
+   left.
+3. If the studio has SSO: implement C, enabled when `P4LOGINSSO` is set.
+   First verify that `clio_core`'s P4API connection runs the `P4LOGINSSO`
+   script the way the `p4` command does (not tested yet), and that the USD
+   resolver, which never prompts, can use it from worker threads.
+4. Also still open from this section: `p4 trust` for `ssl:` servers in
+   `clio setup` (not implemented in phase 1).
 
 ## 7. Branching model
 
@@ -1396,9 +1448,16 @@ needs `UsdUtils`, lives in Python (`deda.clio.usd`) and in the `clio` CLI.
 
 ## 12. CLI
 
-Entry point `clio` (also `python -m deda.clio.cli`). Human-readable output by
-default, `--json` on every command for tooling, and exit codes documented
-per error class.
+Entry point `clio` (also `python -m deda.clio.cli`), built with **click**.
+Human-readable output by default, `--json` on every command for tooling, and
+exit codes documented per error class ([workflow.md](workflow.md)). Path
+arguments are relative to the current folder; `//...` is a depot path.
+
+*Implemented in phase 1:* `setup`, `login`, `logout`, `whoami`, `status`,
+`get`, `lock`, `unlock`, `who`, `save`, `discard`, `history`, and `activity
+[PATH]` (recent changes in a folder, §9.1). `status` is live, not cached:
+the status cache comes with phase 3. The rest of the list below belongs to
+later phases.
 
 ```
 clio setup                      # first-time: login, trust, create workspace
@@ -1422,13 +1481,16 @@ clio usd localize LAYER --dest DIR   # rewrite clio: paths for delivery (§10.5)
 ```
 
 Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
-`revert`, `shelve`). *(Q3: CLI framework. The recommendation is `click`,
-loaded lazily, or `argparse` for zero dependencies.)*
+`revert`, `shelve`) *(not implemented yet)*.
 
 ## 13. Testing strategy
 
-* **Unit tests** (`tests/unit`) run service logic against `FakeBackend`.
-  They are fast and have no server.
+* **Unit tests** run service logic against `FakeBackend`, which answers
+  from scripted rules and records every call. It does not emulate
+  Perforce: behaviour that depends on Perforce is tested against a real
+  server (below). The fake covers what a server makes hard to trigger,
+  such as a submit trigger rejecting a change. They are fast and have no
+  server.
 * **Integration tests** (`tests/integration`) run against a real, throwaway
   `p4d` started per test session with an `rsh:` port
   (`P4PORT="rsh:p4d -r <tmp> -L log -i"`). That needs no network listener and
@@ -1473,7 +1535,7 @@ loaded lazily, or `argparse` for zero dependencies.)*
 | Phase | Scope |
 |---|---|
 | **0 — Scaffold** *(done)* | CMake project; `clio_core` (P4API connections, pins, `clio:` identifiers, settings, resolve for latest/have/historical pins, version store); `deda.clio._core` (nanobind, abi3); the `clioUsd` resolver plugin; C++, Python and USD tests against a throwaway `p4d`. See [building.md](building.md). |
-| **1 — Core workflow** | Python services over `CoreBackend`: connect/login/setup, get (parallel), lock/unlock, save, status, history backed by the HistoryCache with watermark refresh (§9.3–9.4), CLI for these. Baseline benchmarks. |
+| **1 — Core workflow** *(done)* | Python services over `CoreBackend`: connect/login/setup, get (parallel), lock/unlock, save, status, discard, history and folder activity backed by the HistoryCache with watermark refresh (§9.3–9.4), and the `clio` CLI for these ([workflow.md](workflow.md)). Baseline benchmarks ([benchmarks.md](benchmarks.md)). *Deferred:* per-file progress (P4API's progress hook is not exposed yet), a status cache (phase 3), `clio doctor` (phase 5). |
 | **2 — Branching** | Streams/task streams, switch, update/publish with binary conflict handling, cross-branch lock check, drafts (shelves). |
 | **3 — Performance** | Connection pool and miss coalescer in `clio_core`; time-bounded in-memory caches (§8.3); C++ hashing/scan/diff if benchmarks justify it. Measure; add a persistent store only if the numbers call for it. |
 | **4 — USD completion** | Write side (edit/lock on save, §10.6); revision-based timestamps; `deda.clio.usd.prepare` (option A); CI builds against USD 26.08 and 25.08. |
@@ -1482,6 +1544,8 @@ loaded lazily, or `argparse` for zero dependencies.)*
 
 ### Backlog
 
+* **Tickets without re-login** (§6.1): re-login and retry on expiry, silent
+  SSO login, `p4 trust` in setup. Revisit with the Perforce admin (Q11).
 * **Persistent local cache (SQLite)** for status and history, only if
   in-memory caching proves too slow (§8.3).
 * **Thumbnails and previews** (§9.8).
@@ -1497,8 +1561,7 @@ loaded lazily, or `argparse` for zero dependencies.)*
 2. **Server:** Existing Perforce server version and topology (single server,
    proxy, edge)? Is there already a streams depot, or is this greenfield? Can
    we set `net.parallel.max` and the typemap?
-3. **CLI framework:** `click` (nicer UX, one dependency) or `argparse` (no
-   dependencies)?
+3. ~~**CLI framework**~~ *Decided: `click` (see below).*
 4. **Cross-branch locking:** Advisory warning or hard block by default?
 5. **Vocabulary:** Do "save / get / lock / draft / publish" suit your
    artists, or do they already know some Perforce terms that should stay?
@@ -1516,8 +1579,16 @@ loaded lazily, or `argparse` for zero dependencies.)*
 10. **Manifests, unsubmitted work:** Should the farm be able to render
     unsubmitted work through shelves, or must everything in a manifest be
     submitted?
+11. **Ticket lifetime (§6.1):** Can the artists' group get `Timeout:
+    unlimited` with an `IdleTimeout` (for example 7 days)? Does the studio
+    have an identity provider for Perforce single sign-on
+    (`auth-check-sso`), and is it silent (Windows domain, Kerberos) or
+    browser-based?
 
 ### Decided
+
+* CLI: `click` (Q3). It is the one runtime dependency besides Clio's own
+  extension, and only the CLI imports it.
 
 * Default pin is `have`: a file on disk is loaded as it is; a file not on
   disk is synced as its layer is resolved. `latest` updates everything.

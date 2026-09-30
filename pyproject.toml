@@ -9,12 +9,16 @@ description = "Artist-friendly Perforce asset access, with a USD asset resolver"
 readme = "README.md"
 license = "Apache-2.0"
 requires-python = ">=3.13"
+dependencies = ["click>=8.1"]
 classifiers = [
     "Programming Language :: C++",
     "Programming Language :: Python :: 3.13",
     "Topic :: Multimedia :: Graphics :: 3D Modeling",
     "Topic :: Software Development :: Version Control",
 ]
+
+[project.scripts]
+clio = "deda.clio.cli:main"
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
