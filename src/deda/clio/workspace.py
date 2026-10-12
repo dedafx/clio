@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -59,6 +60,8 @@ _OPENED_STATE = {
     "move/delete": FileState.DELETING,
 }
 _DELETED_AT_HEAD = ("delete", "move/delete", "purge", "archive")
+#: Files per reconcile command when only some files need a closer look.
+_RECONCILE_CHUNK = 200
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +69,23 @@ class DiscardResult:
     asset_paths: tuple[str, ...]
     #: Where copies of the discarded files were kept, if any were.
     backup_dir: Path | None
+
+
+def _size_is_suspect(head_type: str, depot_size: int | None, local_size: int) -> bool:
+    """Whether a read-only file's size says it was changed (and so is worth
+    a closer look by Perforce). Only the size of the head revision is known,
+    and only some types keep their size on disk: binary files always;
+    text files unless the client converts line endings, which on Windows
+    only makes them bigger, so only a smaller file is suspicious there.
+    Unicode types are converted, so their size says nothing."""
+    if depot_size is None:
+        return False
+    base = head_type.split("+", 1)[0]
+    if base in ("binary", "ubinary"):
+        return local_size != depot_size
+    if base in ("text", "xtext", "ctext", "ktext"):
+        return local_size < depot_size if os.name == "nt" else local_size != depot_size
+    return False
 
 
 def _int(value: str | None) -> int | None:
@@ -470,10 +490,9 @@ class Workspace:
         targets = self.targets(paths, local_base=local_base)
         specs = self._specs(targets)
         statuses: dict[str, FileStatus] = {}
-        for rec in self._run("fstat", specs).records:
-            depot = rec.get("depotFile")
-            if not depot:
-                continue
+        records = [r for r in self._run("fstat", ["-Ol", *specs]).records if r.get("depotFile")]
+        for rec in records:
+            depot = rec["depotFile"]
             action = rec.get("action")
             have, head = _int(rec.get("haveRev")), _int(rec.get("headRev"))
             deleted_at_head = rec.get("headAction") in _DELETED_AT_HEAD
@@ -498,9 +517,8 @@ class Workspace:
                 "ourLock" in rec, locked_by, _others(rec, "otherOpen"),
             )
         if check_disk:
-            reconcile = self._run("reconcile", ["-n", "-e", "-a", "-d", "-f", *self._add_specs(targets)])
             local_state = {"edit": FileState.MODIFIED, "add": FileState.NEW, "delete": FileState.DELETED}
-            for rec in reconcile.records:
+            for rec in self._disk_changes(targets, records, statuses):
                 depot, state = rec.get("depotFile"), local_state.get(rec.get("action", ""))
                 if not depot or not state:
                     continue
@@ -511,6 +529,43 @@ class Workspace:
                 elif current.state in (FileState.SYNCED, FileState.OUT_OF_DATE, FileState.MISSING):
                     statuses[depot] = replace(current, state=state)
         return sorted(statuses.values(), key=lambda f: f.asset_path)
+
+    def _disk_changes(
+        self, targets: Sequence[Target], records: Sequence[dict[str, str]], statuses: dict[str, FileStatus]
+    ) -> list[dict[str, str]]:
+        """What changed on disk without Perforce knowing, as ``p4 reconcile -n`` records.
+
+        ``p4 reconcile`` opens and hashes every file, which costs about
+        3 ms a file on Windows (virus scanners) against a few microseconds
+        to ``stat`` it. So the files are looked at first without opening
+        them, and only the suspicious ones go to reconcile: a file that is
+        missing, writable (Perforce leaves unopened files read-only), or, for
+        binary files, a different size from the depot's. New files are found
+        by a separate scoped ``reconcile -a``, which does not open the files
+        that are already known. Perforce still makes every final decision.
+        """
+        s = self._session
+        suspects: list[str] = []
+        for rec in records:
+            depot = rec["depotFile"]
+            status = statuses.get(depot)
+            if status is None or status.state not in (FileState.SYNCED, FileState.OUT_OF_DATE):
+                continue  # opened, missing from disk by design, or already known
+            try:
+                info = status.local_path.stat()
+            except OSError:  # missing, or unreadable: let Perforce say
+                suspects.append(os.fspath(status.local_path))
+                continue
+            if info.st_mode & stat.S_IWRITE:
+                suspects.append(os.fspath(status.local_path))
+            elif status.have_rev == status.head_rev and _size_is_suspect(
+                    rec.get("headType", ""), _int(rec.get("fileSize")), info.st_size):
+                suspects.append(os.fspath(status.local_path))
+        found = list(self._run("reconcile", ["-n", "-a", "-f", *self._add_specs(targets)]).records)
+        for start in range(0, len(suspects), _RECONCILE_CHUNK):
+            chunk = suspects[start:start + _RECONCILE_CHUNK]
+            found.extend(self._run("reconcile", ["-n", "-e", "-d", "-f", *chunk]).records)
+        return found
 
     # --- discard --------------------------------------------------------
 
