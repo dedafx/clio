@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from deda.clio import _core
-from deda.clio._paths import Target
+from deda.clio._paths import Target, escape
 from deda.clio.backends.base import Result
 from deda.clio.errors import (
     ConfirmationRequiredError,
@@ -256,6 +256,8 @@ class Workspace:
                 to_add.append(os.fspath(s.paths.local_path(target.asset_path)))
                 to_add_depot.append(depot)
 
+        elsewhere = self._open_elsewhere([*already_open, *to_edit, *to_add_depot])
+
         opened: set[str] = set(already_open)
         messages: list[str] = []
         for command, files in (("edit", to_edit), ("add", to_add)):
@@ -275,10 +277,52 @@ class Workspace:
                 self._raise_locked(match.group(1), match.group(2), match.group(3), result.texts)
         self._check(result, "lock files")
         user, client = s.user, s.client
-        locks = tuple(Lock(self._asset(d), d, user, client) for d in sorted(opened))
+        locks = tuple(Lock(self._asset(d), d, user, client, elsewhere.get(d, ())) for d in sorted(opened))
         for lock in locks:
             s.events.emit("file_locked", lock=lock)
         return locks
+
+    def _open_elsewhere(self, depot_files: Sequence[str]) -> dict[str, tuple[str, ...]]:
+        """Who has the same assets open in related branches (parent,
+        siblings, children), in one ``fstat`` (design doc §7.3). With
+        ``cross_branch_locks = "block"`` a hit raises
+        :class:`LockedByOtherError`; with ``"off"`` nothing is checked."""
+        s = self._session
+        mode = s.config.cross_branch_locks
+        if mode == "off" or not depot_files or not s.stream:
+            return {}
+        related = s.branches.related()
+        if not related:
+            return {}
+        asked: dict[str, str] = {}  # other branch's depot path -> our depot path
+        for depot in depot_files:
+            asset = escape(self._asset(depot))
+            for branch in related:
+                asked[f"{branch.path}/{asset}"] = depot
+        found: dict[str, list[str]] = {}
+        for rec in self._run("fstat", list(asked)).records:
+            other = rec.get("depotFile")
+            if other not in asked:
+                continue
+            holders = list(_others(rec, "otherOpen"))
+            locked = set(_others(rec, "otherLock"))
+            stream = other[: -len(escape(self._asset(asked[other]))) - 1]
+            for holder in holders:
+                if mode == "block":
+                    user, _, workspace = holder.partition("@")
+                    asset = self._asset(asked[other])
+                    raise LockedByOtherError(
+                        f"{asset} is {'locked' if holder in locked else 'open'} by {user} in {stream}",
+                        path=asset, user=user, workspace=workspace, branch=stream,
+                        hint=f"Ask {user} to save or unlock it there first; this project blocks cross-branch edits",
+                    )
+                found.setdefault(asked[other], []).append(f"{holder} ({stream})")
+        return {depot: tuple(holders) for depot, holders in found.items()}
+
+    def switch(self, branch: str, *, share_open_files: bool = False):
+        """Move this workspace to another branch (see
+        :meth:`Branches.switch`)."""
+        return self._session.branches.switch(branch, share_open_files=share_open_files)
 
     def _raise_if_locked_by_other(self, depot: str, rec: dict[str, str]) -> None:
         holder = None

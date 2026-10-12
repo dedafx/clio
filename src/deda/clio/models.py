@@ -13,17 +13,23 @@ from enum import Enum
 from pathlib import Path
 
 __all__ = [
+    "Branch",
     "Change",
+    "Conflict",
+    "Draft",
     "FileState",
     "FileStatus",
     "Freshness",
     "HistoryPage",
     "Lock",
+    "PublishResult",
     "Revision",
     "SaveResult",
+    "SwitchResult",
     "SyncPlan",
     "SyncReport",
     "SyncedFile",
+    "UpdateResult",
 ]
 
 
@@ -92,6 +98,10 @@ class Lock:
     depot_path: str
     user: str
     workspace: str
+    #: Who has the same asset open in a related branch, as
+    #: "user@workspace (//depot/branch)" (design doc §7.3). Empty when
+    #: nobody does, or when the check is off.
+    elsewhere: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +136,77 @@ class Revision:
     file_type: str
     size: int | None = None
     digest: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Branch:
+    """A Perforce stream."""
+
+    path: str  # //imagine/crate-damage
+    name: str  # crate-damage
+    parent: str | None  # //imagine/main, None for a mainline
+    kind: str  # mainline, development, release, task, virtual
+    owner: str = ""
+    description: str = ""
+    #: This workspace is on this branch.
+    is_current: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class Conflict:
+    """A file changed in both the branch and its parent (design doc §7.2)."""
+
+    asset_path: str
+    depot_path: str
+    #: The parent's version, as "//imagine/main/crate.ma#3".
+    theirs: str
+
+
+@dataclass(frozen=True, slots=True)
+class SwitchResult:
+    branch: Branch
+    report: SyncReport
+    #: The draft that holds files that were open before the switch, if any.
+    draft: Draft | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateResult:
+    """What ``update`` brought down from the parent. ``change`` is None when
+    the branch was already up to date."""
+
+    change: Change | None
+    #: Files that changed only in the parent, taken as they are there.
+    taken: tuple[str, ...] = ()
+    #: Conflicts settled by keeping this branch's version.
+    kept_mine: tuple[str, ...] = ()
+    #: Conflicts settled by taking the parent's version.
+    took_theirs: tuple[str, ...] = ()
+    #: Copies of the parent's version written next to the kept file
+    #: ("keep both"). They are not in Perforce.
+    theirs_copies: tuple[Path, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PublishResult:
+    change: Change
+    #: Branch the files went to.
+    parent: str
+    #: Depot paths in the parent.
+    files: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class Draft:
+    """A shelved change: work shared without saving it."""
+
+    number: int
+    description: str
+    user: str
+    workspace: str
+    time: datetime | None = None
+    #: Depot paths of the shelved files, when known.
+    files: tuple[str, ...] = ()
 
 
 class Freshness(Enum):

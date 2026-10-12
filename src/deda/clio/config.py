@@ -33,7 +33,7 @@ from typing import Any
 
 from deda.clio.errors import ConfigError
 
-__all__ = ["Config", "load_config", "user_config_path"]
+__all__ = ["Config", "cache_dir", "load_config", "user_config_path"]
 
 PROJECT_FILE = ".clio.toml"
 
@@ -69,6 +69,9 @@ class Config:
     poll_interval: float = 30.0
     #: Where ``discard`` copies files before reverting them.
     backup_dir: str = ""
+    #: On lock, what to do when someone has the same file open in a related
+    #: branch (design doc §7.3): ``warn``, ``block`` or ``off``.
+    cross_branch_locks: str = "warn"
     #: Seconds before an unreachable server is given up on.
     connect_timeout: int = 10
     #: Seconds a single Perforce command may run.
@@ -108,8 +111,13 @@ def _check_keys(values: dict[str, Any], source: str) -> None:
         raise ConfigError(f"Unknown setting(s) {', '.join(unknown)} in {source}")
 
 
+_CHOICES = {"cross_branch_locks": ("warn", "block", "off")}
+
+
 def _coerce(key: str, value: Any, source: str) -> Any:
     kind = _KEYS[key]
+    if key in _CHOICES and value not in _CHOICES[key]:
+        raise ConfigError(f"Setting '{key}' in {source} must be one of {', '.join(_CHOICES[key])}, got {value!r}")
     try:
         if kind == "int":
             if isinstance(value, bool):
@@ -132,6 +140,18 @@ def _config_home() -> Path:
         return Path(appdata) / "clio" if appdata else Path.home() / "AppData" / "Roaming" / "clio"
     xdg = os.environ.get("XDG_CONFIG_HOME")
     return (Path(xdg) if xdg else Path.home() / ".config") / "clio"
+
+
+def cache_dir() -> Path:
+    """Clio's per-user cache folder: ``%LOCALAPPDATA%\\clio`` on Windows,
+    ``$XDG_CACHE_HOME/clio`` (or ``~/.cache/clio``) elsewhere. The same
+    folder as the C++ core's ``Settings::defaultCacheDir``."""
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return Path(base) / "clio"
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".cache") / "clio"
 
 
 def user_config_path() -> Path:

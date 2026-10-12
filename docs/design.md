@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.3. Phase 0 (C++ core, Python bindings, USD resolver) and phase 1 (Python workflow services, `clio` CLI, history cache) are implemented; see [workflow.md](workflow.md), [usd.md](usd.md) and [building.md](building.md). |
+| **Status** | Draft v0.4. Phase 0 (C++ core, Python bindings, USD resolver), phase 1 (Python workflow services, `clio` CLI, history cache) and phase 2 (branches and drafts) are implemented; see [workflow.md](workflow.md), [usd.md](usd.md) and [building.md](building.md). |
 | **Package** | `deda.clio` (Python namespace package) |
 | **Targets** | Python 3.13 · USD 26.08 (primary) and USD 25.08 or later · no DCCs yet |
 | **Consumers** | Standalone Python, the `clio` CLI, and USD. Dedaverse, Imagine and DCC integrations are later work. |
@@ -419,6 +419,26 @@ Binary assets cannot be merged line by line. Clio treats integration as
   is standard stream flow control. The error message explains
   "update first".
 
+**As built (phase 2):**
+
+* `update` runs in the artist's workspace: `merge` into a new change,
+  `resolve -am` (one-sided changes, and clean text merges), then the
+  choices for the remaining conflicts (`resolve -ay` / `-at`; "keep both"
+  writes the parent's version with `p4 print -o` and keeps mine). Without a
+  choice for every conflict, the change is reverted and deleted and
+  `ConflictError` lists the conflicts, so an update is all or nothing.
+  Update and publish need a workspace with no open files.
+* `publish` runs in a hidden per-user publishing workspace
+  (`<client>_publish`, bound to the parent stream, root in Clio's cache
+  folder) with `p4 copy -v`: files are opened without being transferred, so
+  nothing is downloaded and the artist's workspace is untouched. Perforce
+  itself refuses a copy over outstanding merges; Clio checks `p4 merge -n`
+  first for a clear message.
+* `switch` is refused while files are open, or shares them as a draft
+  first (`share_open_files`), then `p4 client -s -S` and a sync.
+* `retire` deletes the stream spec (`p4 stream -d`); history stays. It is
+  refused while a workspace is on the stream.
+
 ### 7.3 Locks across branches
 
 Exclusive locking (`+l`) prevents two people from editing the same file
@@ -433,8 +453,12 @@ art work with branching. Clio mitigates this:
   blocking.
 * This check is a batched metadata query (one call for all paths across all
   related streams), so it adds one server round trip, not one per file.
+  The branch list it needs is cached for `poll_interval`.
 
-*(Open question Q4: should this be advisory or enforced by default?)*
+*Decided (Q4):* advisory by default. `cross_branch_locks = "warn"` reports
+the holders on each `Lock` (`elsewhere`) and the CLI prints a warning;
+`"block"` raises `LockedByOtherError` (with `branch`) before anything is
+opened; `"off"` skips the check.
 
 ## 8. Performance
 
@@ -1455,7 +1479,10 @@ arguments are relative to the current folder; `//...` is a depot path.
 
 *Implemented in phase 1:* `setup`, `login`, `logout`, `whoami`, `status`,
 `get`, `lock`, `unlock`, `who`, `save`, `discard`, `history`, and `activity
-[PATH]` (recent changes in a folder, §9.1). `status` is live, not cached:
+[PATH]` (recent changes in a folder, §9.1). *Phase 2:* `branch list |
+create | switch | update | publish | retire` and `draft share | list | get |
+drop`. `branch update` takes `--mine/--theirs/--both PATH` and
+`--all CHOICE`; exit code 12 means conflicts need a choice. `status` is live, not cached:
 the status cache comes with phase 3. The rest of the list below belongs to
 later phases.
 
@@ -1536,7 +1563,7 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
 |---|---|
 | **0 — Scaffold** *(done)* | CMake project; `clio_core` (P4API connections, pins, `clio:` identifiers, settings, resolve for latest/have/historical pins, version store); `deda.clio._core` (nanobind, abi3); the `clioUsd` resolver plugin; C++, Python and USD tests against a throwaway `p4d`. See [building.md](building.md). |
 | **1 — Core workflow** *(done)* | Python services over `CoreBackend`: connect/login/setup, get (parallel), lock/unlock, save, status, discard, history and folder activity backed by the HistoryCache with watermark refresh (§9.3–9.4), and the `clio` CLI for these ([workflow.md](workflow.md)). Baseline benchmarks ([benchmarks.md](benchmarks.md)). *Deferred:* per-file progress (P4API's progress hook is not exposed yet), a status cache (phase 3), `clio doctor` (phase 5). |
-| **2 — Branching** | Streams/task streams, switch, update/publish with binary conflict handling, cross-branch lock check, drafts (shelves). |
+| **2 — Branching** *(done)* | Streams/task streams, switch, update/publish with binary conflict handling, cross-branch lock check, drafts (shelves) ([workflow.md](workflow.md#branches-and-drafts)). *Deferred:* updating or publishing part of a branch, taking a draft into another branch, virtual streams, stream spec editing (paths, imports). |
 | **3 — Performance** | Connection pool and miss coalescer in `clio_core`; time-bounded in-memory caches (§8.3); C++ hashing/scan/diff if benchmarks justify it. Measure; add a persistent store only if the numbers call for it. |
 | **4 — USD completion** | Write side (edit/lock on save, §10.6); revision-based timestamps; `deda.clio.usd.prepare` (option A); CI builds against USD 26.08 and 25.08. |
 | **4½ — Version manifests** | `Manifest` create/save/load/fetch/check/diff (§10.8), `manifest=` context setting, content-addressed pool, `clio usd manifest` CLI, farm guide (proxy + `policy=verify`). |
@@ -1562,7 +1589,7 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
    proxy, edge)? Is there already a streams depot, or is this greenfield? Can
    we set `net.parallel.max` and the typemap?
 3. ~~**CLI framework**~~ *Decided: `click` (see below).*
-4. **Cross-branch locking:** Advisory warning or hard block by default?
+4. ~~**Cross-branch locking**~~ *Decided: advisory by default, configurable (see below).*
 5. **Vocabulary:** Do "save / get / lock / draft / publish" suit your
    artists, or do they already know some Perforce terms that should stay?
 6. **Asset identity:** Is an asset a folder (all files under a path), or is
@@ -1587,6 +1614,8 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
 
 ### Decided
 
+* Cross-branch locks: a warning by default; `cross_branch_locks` can make
+  them block or turn the check off (Q4, §7.3).
 * CLI: `click` (Q3). It is the one runtime dependency besides Clio's own
   extension, and only the CLI imports it.
 

@@ -1,9 +1,9 @@
-# Everyday workflow: get, lock, save
+# Everyday workflow: get, lock, save, branch
 
 This guide covers the `clio` command line and the Python API for the
 day-to-day work of an artist: getting files, locking them, saving changes,
 and seeing who is doing what. For USD, see [usd.md](usd.md). For the design
-behind it, see [design.md](design.md) §5, §9, §11 and §12.
+behind it, see [design.md](design.md) §5, §7, §9, §11 and §12.
 
 ## Words
 
@@ -15,6 +15,10 @@ behind it, see [design.md](design.md) §5, §9, §11 and §12.
 | **discard** | Throw away your local changes | `p4 revert` |
 | **workspace** | Your copy of the project on disk | client workspace |
 | **version** | `latest`, `@1234` (change), `@approved` (label), `#3` (revision) | revision specifier |
+| **branch** | A separate line of work, such as a task branch for one asset | stream |
+| **update** | Bring the parent branch's changes into your branch | `p4 merge` + `p4 resolve` |
+| **publish** | Copy your branch's saved work up to its parent | `p4 copy` |
+| **draft** | Work shared without saving it | shelved change |
 
 ## First-time setup
 
@@ -64,6 +68,7 @@ clio --project imagine status
 | `parallel_min_files` | Fewest files for a parallel transfer | 8 |
 | `poll_interval` | Seconds history stays fresh before a server check | 30 |
 | `backup_dir` | Where `discard` keeps copies | `%LOCALAPPDATA%\clio\backups`, `~/.local/state/clio/backups` |
+| `cross_branch_locks` | On lock, someone has the file open in a related branch: `warn`, `block` or `off` | `warn` |
 | `connect_timeout`, `timeout` | Seconds to reach the server, and per command | 10, 120 |
 
 ## The command line
@@ -98,7 +103,58 @@ says what to do next.
 **Exit codes:** 0 success, 1 other error, 2 wrong usage, 3 not logged in,
 4 server unreachable, 5 locked by someone else, 6 out of date, 7 nothing to
 save, 8 refused by the server, 9 cancelled or not confirmed, 10 outside the
-workspace, 11 configuration error.
+workspace, 11 configuration error, 12 conflicts need a choice.
+
+## Branches and drafts
+
+Branches need a **streams depot** (design doc §7): create the workspace
+with `clio setup --stream //imagine/main`. A branch is usually a **task
+branch** for one piece of work, made from `main` and published back to it.
+
+```bash
+clio branch create crate-damage        # branch main and switch to it
+clio lock props/crate/crate.ma         # work and save as usual
+clio save -m "Crate: damage pass" props/crate
+
+clio branch update                     # bring in what changed on main
+clio branch publish -m "Crate damage"  # copy your saved work up to main
+clio branch switch main
+clio branch retire crate-damage        # when done (history stays)
+clio branch list
+```
+
+* **Switching** re-points your workspace and transfers only files that
+  differ. It is refused while files are open; `--share-open-files` shares
+  them as a draft first, so nothing is lost.
+* **Update** takes files that changed only on the parent as they are.
+  A file changed on **both** sides cannot be merged (art files are not
+  text), so you choose: `--mine PATH` keeps your version, `--theirs PATH`
+  takes the parent's, `--both PATH` keeps yours and saves the parent's
+  next to it as `name.theirs.ext` to compare by hand. `--all mine|theirs|both`
+  settles every conflict. Without a choice for each conflict, nothing is
+  changed and the conflicts are listed (exit code 12). An update is saved
+  as one change, or not at all.
+* **Publish** copies saved work from your branch to its parent. It is
+  refused while the branch is behind the parent (update first) or while
+  you have files open (save or discard them: only saved work is
+  published). It runs in a hidden publishing workspace on the server side,
+  so nothing is downloaded and your workspace is not touched.
+* **Locks across branches.** Perforce locks only stop two people in the
+  same branch. When you lock, Clio also looks at the same files in the
+  parent, sibling and child branches and warns if someone has them open
+  there. A project can make this block the lock instead
+  (`cross_branch_locks = "block"`).
+
+**Drafts** share work without saving it: a lead can review it, or someone
+else can pick it up.
+
+```bash
+clio draft share -m "WIP lid" props/crate   # files stay open for you
+clio draft share -m "WIP lid" --close props/crate   # the draft keeps the work
+clio draft list [--all]
+clio draft get 1234                         # copy into your workspace, open
+clio draft drop 1234
+```
 
 ## Python
 
@@ -129,6 +185,16 @@ with clio.connect("imagine") as s:
     for r in page.items:
         print(r.rev, r.change, r.user, r.description)
     older = s.history.revisions("props/crate/crate.ma", before=page.next_cursor)
+
+    # Branches (streams) and drafts.
+    s.branches.create("crate-damage")             # and switch to it
+    try:
+        s.branches.update()
+    except clio.ConflictError as e:
+        choices = {c.asset_path: "mine" for c in e.conflicts}
+        s.branches.update(resolutions=choices)
+    s.branches.publish(message="Crate damage")
+    draft = s.drafts.share("props/crate", message="WIP lid")
 ```
 
 API paths are **asset paths**, relative to the project root
@@ -159,21 +225,27 @@ save, get, status) always ask the server.
 
 ## Current limitations
 
-1. **No branches yet.** `save` refuses files that someone else saved
-   first, rather than merging them (binary merging comes with branching,
-   roadmap phase 2). Keep a copy, get the latest version and redo the
-   change.
-2. **Progress is coarse.** `get` reports the start (with totals from a
+1. **Within one branch, `save` does not merge.** If someone saved a newer
+   version of a file first, `save` refuses and changes nothing. Keep a
+   copy, get the latest version and redo the change, or work in a task
+   branch, where `branch update` offers keep mine / take theirs / keep both.
+2. **Branch updates and publishes are whole-branch.** You cannot update or
+   publish only some files. Drafts can only be taken into the branch they
+   were made in.
+3. **"Keep both" copies are not in Perforce.** `name.theirs.ext` is written
+   next to your file for comparison. Delete it when done: a later `save` of
+   that folder would add it.
+4. **Progress is coarse.** `get` reports the start (with totals from a
    preview) and the end, not each file, and cancelling takes effect between
    Perforce commands.
-3. **Parallel transfers need the Perforce ticket from the usual place**
+5. **Parallel transfers need the Perforce ticket from the usual place**
    (the default ticket file or `P4TICKETS`). With the `tickets` setting,
    transfers run one at a time, because Perforce's extra transfer
    connections do not see that ticket file.
-4. **Status is live.** Every `status` asks the server; with the disk check
+6. **Status is live.** Every `status` asks the server; with the disk check
    it also compares every file on disk, which is the slow part for large
    folders (see [benchmarks.md](benchmarks.md)). `--no-disk` skips it.
-5. **Workspaces must map the project root one to one** (as `clio setup`
+7. **Workspaces must map the project root one to one** (as `clio setup`
    creates them). Remapped or partial views are not supported.
-6. **Discard** reverts opened files only. Files changed on disk without
+8. **Discard** reverts opened files only. Files changed on disk without
    being locked are left alone (`clio get --force` restores them).

@@ -49,6 +49,11 @@ def test_config_rejects_unknown_keys_and_bad_types(tmp_path, monkeypatch):
         load_config(cwd=tmp_path)
     with pytest.raises(clio.ConfigError):
         load_config(cwd=tmp_path, timeout=True)
+    bad.write_text('cross_branch_locks = "sometimes"\n')
+    with pytest.raises(clio.ConfigError, match="warn, block, off"):
+        load_config(cwd=tmp_path)
+    bad.write_text('cross_branch_locks = "block"\n')
+    assert load_config(cwd=tmp_path).cross_branch_locks == "block"
 
 
 # --- paths --------------------------------------------------------------------
