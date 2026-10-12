@@ -397,12 +397,12 @@ class Workspace:
             raise WorkflowError("A save needs a description", hint="Say what changed, for example -m 'Crate: UV fix'")
         s = self._session
         targets = self.targets(paths, local_base=local_base)
-        specs, add_specs = self._specs(targets), self._add_specs(targets)
+        specs = self._specs(targets)
         number = self._new_change(message)
         try:
+            records = [r for r in self._run("fstat", ["-Ol", *specs]).records if "depotFile" in r]
             self._run("reopen", ["-c", str(number), *specs])
-            self._check(self._run("reconcile", ["-c", str(number), "-e", "-a", "-d", "-f", *add_specs]),
-                        "detect changed files")
+            self._disk_changes(targets, records, ["-c", str(number)])
             opened = [r for r in self._run("opened", ["-c", str(number)]).records if "depotFile" in r]
             if not opened:
                 raise NothingToSaveError("Nothing to save: no added, changed or deleted files",
@@ -518,7 +518,7 @@ class Workspace:
             )
         if check_disk:
             local_state = {"edit": FileState.MODIFIED, "add": FileState.NEW, "delete": FileState.DELETED}
-            for rec in self._disk_changes(targets, records, statuses):
+            for rec in self._disk_changes(targets, records, ["-n"]):
                 depot, state = rec.get("depotFile"), local_state.get(rec.get("action", ""))
                 if not depot or not state:
                     continue
@@ -531,40 +531,45 @@ class Workspace:
         return sorted(statuses.values(), key=lambda f: f.asset_path)
 
     def _disk_changes(
-        self, targets: Sequence[Target], records: Sequence[dict[str, str]], statuses: dict[str, FileStatus]
+        self, targets: Sequence[Target], records: Sequence[dict[str, str]], reconcile_args: Sequence[str]
     ) -> list[dict[str, str]]:
-        """What changed on disk without Perforce knowing, as ``p4 reconcile -n`` records.
+        """Run ``p4 reconcile`` for what changed on disk without Perforce
+        knowing, and return its records. ``records`` are ``fstat -Ol`` records
+        for the targets; ``reconcile_args`` are ``-n`` (just look) or
+        ``-c N`` (open into a change).
 
         ``p4 reconcile`` opens and hashes every file, which costs about
         3 ms a file on Windows (virus scanners) against a few microseconds
         to ``stat`` it. So the files are looked at first without opening
         them, and only the suspicious ones go to reconcile: a file that is
-        missing, writable (Perforce leaves unopened files read-only), or, for
-        binary files, a different size from the depot's. New files are found
-        by a separate scoped ``reconcile -a``, which does not open the files
-        that are already known. Perforce still makes every final decision.
+        missing, writable (Perforce leaves unopened files read-only), or the
+        wrong size (see :func:`_size_is_suspect`). Files already opened are
+        left alone. New files are found by a separate scoped ``reconcile
+        -a``, which does not open the files that are already known.
+        Perforce still makes every final decision.
         """
-        s = self._session
         suspects: list[str] = []
         for rec in records:
-            depot = rec["depotFile"]
-            status = statuses.get(depot)
-            if status is None or status.state not in (FileState.SYNCED, FileState.OUT_OF_DATE):
-                continue  # opened, missing from disk by design, or already known
+            if rec.get("action") or _int(rec.get("haveRev")) is None or "clientFile" not in rec:
+                continue  # opened, or not in the workspace
+            local = rec["clientFile"]
             try:
-                info = status.local_path.stat()
+                info = os.stat(local)
             except OSError:  # missing, or unreadable: let Perforce say
-                suspects.append(os.fspath(status.local_path))
+                suspects.append(local)
                 continue
-            if info.st_mode & stat.S_IWRITE:
-                suspects.append(os.fspath(status.local_path))
-            elif status.have_rev == status.head_rev and _size_is_suspect(
-                    rec.get("headType", ""), _int(rec.get("fileSize")), info.st_size):
-                suspects.append(os.fspath(status.local_path))
-        found = list(self._run("reconcile", ["-n", "-a", "-f", *self._add_specs(targets)]).records)
+            if info.st_mode & stat.S_IWRITE or (
+                    rec.get("haveRev") == rec.get("headRev")
+                    and _size_is_suspect(rec.get("headType", ""), _int(rec.get("fileSize")), info.st_size)):
+                suspects.append(local)
+        found = list(self._check(
+            self._run("reconcile", [*reconcile_args, "-a", "-f", *self._add_specs(targets)]),
+            "detect new files").records)
         for start in range(0, len(suspects), _RECONCILE_CHUNK):
             chunk = suspects[start:start + _RECONCILE_CHUNK]
-            found.extend(self._run("reconcile", ["-n", "-e", "-d", "-f", *chunk]).records)
+            found.extend(self._check(
+                self._run("reconcile", [*reconcile_args, "-e", "-d", "-f", *chunk]),
+                "detect changed files").records)
         return found
 
     # --- discard --------------------------------------------------------

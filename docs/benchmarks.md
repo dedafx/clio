@@ -49,3 +49,36 @@ P4D 2026.1, Clio built with MSVC 2022, the server and workspaces in `%TEMP%`.
   check to files whose size or time changed, and compare with a Linux
   machine and a TCP server, to see how much of the per-file cost is Windows
   file-system overhead (for example real-time antivirus scanning).
+
+## Phase 3: the disk check (2026-10-12)
+
+Same machine and setup as the baseline (20 x 4 MB large files this run).
+
+| Operation | Baseline | Now |
+|---|---:|---:|
+| status (with disk check): 2000 files | 10.58 s | 0.33 s |
+| save: 200 edited of 2000 locked | 19.33 s | 8.28 s |
+
+**Where the time went.** `stat` on a file takes about 3.5 microseconds;
+opening it takes about 2.7 ms here (Windows real-time virus scanning).
+`p4 reconcile -e` and `-d` open every file, and `-m` (modtime first) made no
+difference. `reconcile -a` (new files) does not open known files and
+takes 60 ms for 500 files.
+
+**What changed.** `status` and `save` take the sizes from `fstat -Ol`, `stat`
+the files themselves, and send only the suspicious ones to
+`reconcile -e -d`: missing, writable (Perforce leaves unopened files
+read-only), or a different size. Files already opened are skipped. Size
+counts for binary files, and for text files only where the client does not
+convert line endings (on Windows only a smaller file counts). Perforce
+still decides every result.
+
+**Known limit.** A text file changed on Windows and made read-only again
+without getting smaller is not noticed by `status`. Locked or edited files
+(the normal workflow) are always seen, as they are opened.
+
+**What is left, and is not Clio's.** `p4 edit` costs about 5 ms a file in
+the server even with `-k` (no file changes), so `lock` of 2,000 files stays
+at 10.8 s; `p4 submit` is about 16 ms a file (read, hash, upload). Both
+need a TCP server and a Linux machine to compare before drawing a
+conclusion.
