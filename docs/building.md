@@ -50,11 +50,13 @@ the OpenSSL that Python or a host application loads.
   ```
 * Run CMake, pip and `build_usd.py` from an "x64 Native Tools" prompt (or
   after `vcvars64.bat`).
-* The Python headers must match the interpreter. A python.org 3.13 install
-  that has ever had the free-threaded option installed can be left with a
-  `pyconfig.h` that defines `Py_GIL_DISABLED`, and links then fail with
-  `cannot open file 'python313t.lib'`. Repair that Python install, or use
-  another 3.13 (for example the `python` NuGet package).
+* The Python headers must match the interpreter. Use the latest 3.13 patch
+  release from python.org (tested with 3.13.16, the same as Dedaverse). An
+  older install (for example 3.13.4) that has ever had the free-threaded
+  option installed can be left with a `pyconfig.h` that defines
+  `Py_GIL_DISABLED`, and links then fail with `cannot open file
+  'python313t.lib'`. Upgrade or repair that Python install, or use another
+  3.13 (for example the `python` NuGet package).
 
 ### USD (only for the resolver plugin)
 

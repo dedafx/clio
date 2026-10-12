@@ -73,9 +73,16 @@ Python suite takes about 2.5 minutes because every test starts a `p4d`.
 * Run CMake and pip from an x64 Native Tools prompt (after `vcvars64.bat`).
 * Use the `_dyn` P4API (`/MD`), and OpenSSL from vcpkg
   (`x64-windows-static-md`). See `docs/building.md`.
-* Avoid a python.org Python 3.13 whose `pyconfig.h` defines
-  `Py_GIL_DISABLED` (links fail wanting `python313t.lib`); use another 3.13
-  such as the NuGet `python` package.
+* Use the same CPython as Dedaverse: the latest 3.13 patch release from
+  python.org (3.13.16 as of 2026-10-12, `py -3.13`). Keep Clio's venv in
+  `.venv` (git-ignored) and rebuild it when the patch release moves:
+  `py -3.13 -m venv .venv`, then `pip install pytest` and `pip install .`.
+  Older python.org 3.13 installs (such as 3.13.4) have a `pyconfig.h` that
+  defines `Py_GIL_DISABLED` and links fail wanting `python313t.lib`; upgrade
+  rather than working around it.
+* The extension is abi3 (`cp313-abi3`), so a wheel built on one 3.13 patch
+  release loads on any later 3.13; USD's Python modules built against an
+  earlier 3.13 patch release also load.
 * Per-file costs here are dominated by file opens (about 3 ms each with
   real-time virus scanning) while `stat` is microseconds. Prefer `stat`
   over opening files, and do not conclude a Perforce command is slow before
