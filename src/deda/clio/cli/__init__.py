@@ -603,6 +603,39 @@ def draft_drop(state: State, number: int, yes: bool) -> None:
     state.out.emit({"dropped": number}, lambda: click.echo(f"Dropped draft {number}"))
 
 
+# --- doctor -------------------------------------------------------------------
+
+_STATUS_MARK = {"ok": ("ok  ", "green"), "warn": ("warn", "yellow"), "fail": ("FAIL", "red"), "skip": ("skip", None)}
+
+
+@cli.command()
+@click.option("--typemap", is_flag=True, help="Print the recommended typemap for the Perforce admin and exit.")
+@pass_state
+@handles_errors
+def doctor(state: State, typemap: bool) -> None:
+    """Check this machine's setup: config, server, login, workspace, USD."""
+    from deda.clio.doctor import CheckStatus, recommended_typemap, run_doctor
+
+    if typemap:
+        click.echo(recommended_typemap(), nl=False)
+        return
+    report = run_doctor(state.session)
+
+    def human() -> None:
+        for check in report.checks:
+            mark, colour = _STATUS_MARK[check.status.value]
+            click.echo(f"[{click.style(mark, fg=colour)}] {check.name}: {check.message}")
+            if check.hint:
+                click.echo(f"       {check.hint}")
+        failed, warned = len(report.by_status(CheckStatus.FAIL)), len(report.by_status(CheckStatus.WARN))
+        click.echo("Everything needed works" if report.ok and not warned else
+                   f"{failed} failed, {warned} warning(s)")
+
+    state.out.emit(report, human)
+    if not report.ok:
+        sys.exit(1)
+
+
 # --- usd ----------------------------------------------------------------------
 
 

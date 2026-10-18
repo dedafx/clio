@@ -603,6 +603,12 @@ check and a recommended **typemap** for the admins:
 | Derived / cache outputs (bakes, caches, previews) | `binary+FS<n>` (e.g. `+S3`) | Keep only the last *n* revisions, to control depot growth. |
 | `.usda .json .py .txt .mtlx` | `text` | Mergeable. No lock needed. |
 
+*As built (phase 5):* `clio doctor` (`deda.clio.doctor`) runs the checks
+for config, server, login, workspace, workspace options (`allwrite` defeats the
+read-only clue that `status` uses), `net.parallel.max`, this typemap
+(`clio doctor --typemap` prints it), the USD plugin and the version store. A
+check never raises; one that cannot run is `skip`.
+
 Also recommended: **P4 Proxy** (or edge servers) for remote artists, so
 repeated syncs of the same large files come from a local cache;
 `net.parallel.max` enabled; and adequate `lbr` storage on fast disks.

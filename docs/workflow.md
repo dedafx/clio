@@ -92,6 +92,7 @@ clio discard props/crate --yes    # throw away changes (a copy is kept)
 clio history props/crate/crate.ma # versions of a file
 clio activity props               # recent changes in a folder
 clio login | logout | whoami
+clio doctor                       # is this machine set up well? (see below)
 ```
 
 `save` finds what you changed under the paths you give (new, edited and
@@ -103,7 +104,23 @@ says what to do next.
 **Exit codes:** 0 success, 1 other error, 2 wrong usage, 3 not logged in,
 4 server unreachable, 5 locked by someone else, 6 out of date, 7 nothing to
 save, 8 refused by the server, 9 cancelled or not confirmed, 10 outside the
-workspace, 11 configuration error, 12 conflicts need a choice.
+workspace, 11 configuration error, 12 conflicts need a choice, 13 a
+version manifest cannot be made or used.
+
+### `clio doctor`
+
+`clio doctor` checks the configuration, the server, your login (and when
+the ticket expires), the workspace, the workspace options, the server's
+parallel-transfer setting, the file-type map, USD and the Clio plugin, and
+the version store. Each line is `ok`, `warn` (it works, but slower or riskier
+than it needs to), `FAIL` or `skip` (could not be checked, for example
+because the server is unreachable), with what to do about it. It exits with 1
+only if something failed.
+
+Clio does not change the server. For the admin, `clio doctor --typemap`
+prints the recommended file-type map: exclusive locks (`+l`) for files that
+cannot be merged, no server compression (`+F`) for files that are already
+compressed, and plain text for text. Paste it into `p4 typemap`.
 
 ## Branches and drafts
 
