@@ -105,6 +105,13 @@ class Session:
         return info.get("serverID") or f"{info.get('serverAddress', '')}|{info.get('serverRoot', '')}|{self.config.port}"
 
     @cached_property
+    def hooks(self):  # -> deda.clio.hooks.HookRegistry
+        """Validation hooks for this session (see :mod:`deda.clio.hooks`)."""
+        from deda.clio.hooks import HookRegistry
+
+        return HookRegistry()
+
+    @cached_property
     def paths(self) -> ProjectPaths:
         """The project's depot root and workspace root.
 

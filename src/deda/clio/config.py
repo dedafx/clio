@@ -76,6 +76,11 @@ class Config:
     connect_timeout: int = 10
     #: Seconds a single Perforce command may run.
     timeout: int = 120
+    #: Built-in validation hooks to run before a save (``no-absolute-paths``,
+    #: ``naming``; see ``deda.clio.hooks``). Hooks from entry points always run.
+    hooks: tuple[str, ...] = ()
+    #: Regular expression every new file name must match (the ``naming`` hook).
+    naming_pattern: str = ""
     #: Where each setting came from, for ``clio doctor`` style reports.
     sources: dict[str, str] = field(default_factory=dict, compare=False)
 
@@ -125,6 +130,11 @@ def _coerce(key: str, value: Any, source: str) -> Any:
             return int(value)
         if kind == "float":
             return float(value)
+        if kind.startswith("tuple"):
+            items = [p.strip() for p in value.split(",")] if isinstance(value, str) else list(value)
+            if not all(isinstance(i, str) for i in items):
+                raise TypeError
+            return tuple(i for i in items if i)
         if isinstance(value, os.PathLike):
             return os.fspath(value)
         if not isinstance(value, str):

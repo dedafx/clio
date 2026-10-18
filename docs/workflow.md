@@ -70,6 +70,8 @@ clio --project imagine status
 | `backup_dir` | Where `discard` keeps copies | `%LOCALAPPDATA%\clio\backups`, `~/.local/state/clio/backups` |
 | `cross_branch_locks` | On lock, someone has the file open in a related branch: `warn`, `block` or `off` | `warn` |
 | `connect_timeout`, `timeout` | Seconds to reach the server, and per command | 10, 120 |
+| `hooks` | Built-in checks to run before a save: `no-absolute-paths`, `naming` (a list, or comma-separated text) | none |
+| `naming_pattern` | Regular expression that every new file name must match (the `naming` check) | |
 
 ## The command line
 
@@ -105,7 +107,36 @@ says what to do next.
 4 server unreachable, 5 locked by someone else, 6 out of date, 7 nothing to
 save, 8 refused by the server, 9 cancelled or not confirmed, 10 outside the
 workspace, 11 configuration error, 12 conflicts need a choice, 13 a
-version manifest cannot be made or used.
+version manifest cannot be made or used, 14 a validation check stopped the
+save.
+
+### Checks before a save
+
+`clio save` can run checks first, so you hear about a problem before the
+server's triggers reject the change, with a message written for you. If a
+check finds an error, **nothing is saved and your files are unchanged**; the
+error says which files and what to do. Warnings are printed and the save goes
+on. `clio save --no-validate` skips the checks.
+
+Turn on Clio's own checks in your config:
+
+```toml
+hooks = ["no-absolute-paths", "naming"]
+naming_pattern = '[a-z0-9_]+\.[a-z0-9]+'     # new files only
+```
+
+* `no-absolute-paths`: USD layers must not point at `D:/work/x.exr` or
+  `/mnt/x.usd`, which exist on one machine only (needs USD's Python bindings).
+* `naming`: new files must match `naming_pattern`. Old files with old names
+  never block a save.
+
+A studio adds its own checks as a Python function `check(context)` that
+returns `HookIssue`s, either in a package that declares an entry point in the
+group `deda.clio.hooks`, or in code with `deda.clio.hooks.register(name, fn)`
+(`session.hooks.register` for one session). The context has the session, the
+files (asset path, local path, action such as `add` or `edit`, file type) and
+the description. A check that crashes is reported as a warning and does not
+stop the save.
 
 ### `clio doctor`
 

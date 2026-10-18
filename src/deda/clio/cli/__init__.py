@@ -336,17 +336,21 @@ def who(state: State, paths: tuple[str, ...]) -> None:
 @cli.command()
 @click.argument("paths", nargs=-1)
 @click.option("-m", "--message", required=True, help="What changed.")
+@click.option("--no-validate", is_flag=True, help="Skip the validation hooks.")
 @pass_state
 @handles_errors
-def save(state: State, paths: tuple[str, ...], message: str) -> None:
+def save(state: State, paths: tuple[str, ...], message: str, no_validate: bool) -> None:
     """Save added, changed and deleted files to Perforce."""
-    result = state.session.workspace.save(*paths, message=message, local_base=Path.cwd())
+    result = state.session.workspace.save(*paths, message=message, local_base=Path.cwd(),
+                                          validate=not no_validate)
 
     def human() -> None:
         click.echo(f"Saved change {result.change.number}")
         for label, items in (("added", result.added), ("edited", result.edited), ("deleted", result.deleted)):
             for item in items:
                 click.echo(f"  {label:<8} {item}")
+        for warning in result.warnings:
+            click.echo(f"warning: {warning}", err=True)
 
     state.out.emit(result, human)
 

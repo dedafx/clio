@@ -135,6 +135,8 @@ class SaveResult:
     added: tuple[str, ...] = ()
     edited: tuple[str, ...] = ()
     deleted: tuple[str, ...] = ()
+    #: Warnings from validation hooks (errors stop the save).
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

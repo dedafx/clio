@@ -1657,6 +1657,16 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
   absolute texture paths", "file naming convention"). Hooks run
   client-side before submit, so artists get feedback before a server
   trigger rejects the change.
+* *As built (phase 5):* `deda.clio.hooks`. `HookContext` carries the session,
+  the files of the change (asset path, local path, action, file type) and the
+  message; a hook returns `HookIssue`s (`error` stops the save with
+  `ValidationError`, exit code 14, after the change has been put back as for
+  any refused save; `warning` goes into `SaveResult.warnings`). Hooks come from
+  the `deda.clio.hooks` entry point group, `hooks.register` and
+  `session.hooks.register`, and the built-ins `no-absolute-paths` and `naming`
+  that the `hooks` setting turns on. A hook that raises, or an entry point that
+  does not load, is a warning (fail open). The asset-resolver entry point
+  (`deda.clio.resolvers`) waits for Dedaverse/Imagine (open question 6).
 * The event bus (§5.6) lets Dedaverse drive lock icons, progress bars, and
   notifications without polling.
 

@@ -456,7 +456,8 @@ class Workspace:
 
     # --- save -----------------------------------------------------------
 
-    def save(self, *paths: PathArg, message: str, local_base: Path | None = None) -> SaveResult:
+    def save(self, *paths: PathArg, message: str, local_base: Path | None = None,
+             validate: bool = True) -> SaveResult:
         """Save (submit) every added, changed or deleted file under
         ``paths``, in a new change with ``message``.
 
@@ -464,6 +465,10 @@ class Workspace:
         edited without being locked are included. If the server refuses the
         submit (a trigger, or a file that changed on the server), the change
         stays pending and the local files are untouched (§5.2).
+
+        Validation hooks (:mod:`deda.clio.hooks`) run first; an error from one
+        raises :class:`~deda.clio.ValidationError` and nothing is submitted.
+        ``validate=False`` skips them.
         """
         if not message.strip():
             raise WorkflowError("A save needs a description", hint="Say what changed, for example -m 'Crate: UV fix'")
@@ -480,6 +485,7 @@ class Workspace:
                 raise NothingToSaveError("Nothing to save: no added, changed or deleted files",
                                          hint="Change files first, or check the paths")
             self._precheck_submit(number)
+            warnings = self._validate(opened, message) if validate else ()
         except Exception:
             self._abandon_change(number)
             raise
@@ -497,7 +503,21 @@ class Workspace:
                         tuple(r["depotFile"] for r in opened))
         s.events.emit("change_submitted", change=change)
         s.history.note_submitted(change.files)
-        return SaveResult(change, *(tuple(by_action[k]) for k in ("added", "edited", "deleted")))
+        return SaveResult(change, *(tuple(by_action[k]) for k in ("added", "edited", "deleted")), warnings)
+
+    def _validate(self, opened: Sequence[dict[str, str]], message: str) -> tuple[str, ...]:
+        """Run the validation hooks on the files of the change. Returns the
+        warnings; raises on errors."""
+        from deda.clio.hooks import HookContext, HookFile, run_hooks
+
+        s = self._session
+        files = tuple(
+            HookFile(self._asset(r["depotFile"]), r["depotFile"], s.paths.local_of_depot(r["depotFile"]),
+                     r.get("action", ""), r.get("type", ""))
+            for r in opened
+        )
+        report = run_hooks(HookContext(s, files, message))
+        return tuple(str(i) for i in report.warnings)
 
     def _new_change(self, message: str) -> int:
         s = self._session

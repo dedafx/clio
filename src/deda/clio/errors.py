@@ -30,6 +30,7 @@ __all__ = [
     "PinError",
     "ServerPolicyError",
     "ServerUnavailableError",
+    "ValidationError",
     "WorkflowError",
 ]
 
@@ -138,6 +139,21 @@ class ManifestError(WorkflowError):
         super().__init__(message, **kwargs)
         #: One sentence per file or reference that stops the manifest.
         self.problems = tuple(problems)
+
+
+class ValidationError(WorkflowError):
+    """A validation hook (``deda.clio.hooks``) stopped a save. Nothing was
+    submitted and no file on disk changed."""
+
+    exit_code = 14
+
+    def __init__(self, message: str, *, issues: Sequence = (), **kwargs) -> None:
+        issues = tuple(issues)
+        super().__init__(message, **kwargs)
+        #: The :class:`~deda.clio.hooks.HookIssue` found (errors and warnings).
+        self.issues = issues
+        #: One sentence per error, for display.
+        self.problems = tuple(str(i) for i in issues if getattr(i.severity, "value", "") == "error")
 
 
 class NotInWorkspaceError(WorkflowError):

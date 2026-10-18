@@ -39,6 +39,7 @@ from deda.clio.errors import (
     PinError,
     ServerPolicyError,
     ServerUnavailableError,
+    ValidationError,
     WorkflowError,
 )
 from deda.clio.events import CancelToken, EventBus, ProgressEvent
@@ -113,6 +114,7 @@ __all__ = [
     "SyncReport",
     "SyncedFile",
     "UpdateResult",
+    "ValidationError",
     "WorkflowError",
     "__version__",
     "connect",
