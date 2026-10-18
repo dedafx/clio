@@ -148,6 +148,8 @@ Settings Settings::parse(const std::string& text) {
             settings.policy = parsePolicy(value);
         } else if (key == "connect_timeout") {
             settings.connection.connectTimeout = parseSeconds(key, value);
+        } else if (key == "manifest") {
+            settings.manifest = value;
         } else if (key == "connections") {
             const auto count = parseSeconds(key, value).count();
             if (count < 1 || count > 64) {
@@ -195,6 +197,7 @@ std::string Settings::str() const {
     if (!connection.ticketFile.empty()) add("tickets", connection.ticketFile);
     if (pin != Pin::have()) add("pin", pin.str());
     if (policy != Policy::Sync) add("policy", policyName(policy));
+    if (!manifest.empty()) add("manifest", manifest.generic_string());
     const Settings defaults;
     if (maxConnections != defaults.maxConnections) add("connections", std::to_string(maxConnections));
     if (batchWindow != defaults.batchWindow) add("batch_ms", std::to_string(batchWindow.count()));

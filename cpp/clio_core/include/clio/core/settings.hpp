@@ -39,6 +39,9 @@ Policy parsePolicy(const std::string& text);
 ///   timeout  command timeout in seconds (default 120, 0 = none)
 ///   connect_timeout
 ///            seconds to wait for an unreachable server (default 10, 0 = OS default)
+///   manifest path of a version manifest (design doc §10.8). Files are then
+///            loaded only as the manifest lists them, from its own folder in
+///            the version store; `pin` is not used for them
 ///   connections
 ///            most Perforce connections the process opens (default 4); they
 ///            are opened only when threads need them at the same time
@@ -55,6 +58,7 @@ struct Settings {
     std::filesystem::path versionStore;
     Pin pin = Pin::have();
     Policy policy = Policy::Sync;
+    std::filesystem::path manifest; ///< empty: no manifest
     std::size_t maxConnections = 4;
     std::chrono::milliseconds batchWindow{20};
     std::chrono::seconds cacheTtl{60};

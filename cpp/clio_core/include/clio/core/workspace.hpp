@@ -1,11 +1,13 @@
 #pragma once
 
 #include "clio/core/identifier.hpp"
+#include "clio/core/manifest.hpp"
 #include "clio/core/p4/connection.hpp"
 #include "clio/core/p4/pool.hpp"
 #include "clio/core/settings.hpp"
 
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -18,7 +20,22 @@ struct LocalPathMatch {
     AssetIdentifier id;
     std::optional<Pin> pin; ///< Set for version-store paths (the version the folder holds).
     bool inVersionStore = false;
+    bool inManifest = false; ///< in the manifest's folder (a kind of version store path)
 };
+
+/// What fetching a manifest did.
+struct ManifestFetchReport {
+    std::size_t files = 0;   ///< files in the manifest
+    std::size_t fetched = 0; ///< downloaded from the server
+    std::size_t linked = 0;  ///< taken from the pool of files already stored
+    std::size_t present = 0; ///< already in the manifest's folder and correct
+    std::int64_t bytes = 0;  ///< bytes downloaded
+    /// "path: reason" for each file that could not be provided.
+    std::vector<std::string> failures;
+};
+
+/// Called as files complete: (done, total, path).
+using ManifestProgress = std::function<void(std::size_t, std::size_t, const std::string&)>;
 
 /// Outcome of fetching a historical version into the version store.
 enum class FetchResult {
@@ -115,6 +132,35 @@ public:
     /// cannot be reached.
     bool clientUsesModtime();
 
+    /// Name the manifest whose folder matchLocalPath() should recognize.
+    void useManifest(const Manifest& manifest);
+
+    /// Where a manifest's copy of a file is (or will be): the manifest's own
+    /// folder in the version store, which mirrors the depot so that relative
+    /// paths between layers keep working (design doc §10.8).
+    std::filesystem::path manifestPath(const Manifest& manifest, const std::string& relativePath) const;
+
+    /// Make sure the manifest's copy of one file exists and is correct. It
+    /// is taken from the pool of stored files (`<store>/objects/<digest>`,
+    /// linked into place, so two manifests share a big file) or fetched with
+    /// `p4 print` at the manifest's revision and checked against its digest.
+    /// Throws Error if the revision is gone or its digest differs, P4Error if
+    /// the server cannot be reached.
+    enum class Materialized { Present, Linked, Fetched };
+    Materialized materialize(const Manifest& manifest, const ManifestEntry& entry, bool verifyPresent,
+                             std::int64_t* bytesFetched = nullptr);
+
+    /// Materialize every file of the manifest, on up to `threads` threads
+    /// (and as many pooled connections as the pool allows). Failures are
+    /// collected in the report, not thrown.
+    ManifestFetchReport fetchManifest(const Manifest& manifest, std::size_t threads,
+                                      const ManifestProgress& progress = {});
+
+    /// Ask the server whether every revision in the manifest can still be
+    /// fetched, and still has the manifest's digest. Returns one sentence per
+    /// problem; empty means all is well. One `fstat` per 500 files.
+    std::vector<std::string> checkManifest(const Manifest& manifest);
+
     /// The version-store folder name for this server: the effective P4PORT
     /// (configured, or from the Perforce environment), encoded reversibly as
     /// a folder name (a long port is shortened with a hash).
@@ -133,6 +179,7 @@ private:
     std::filesystem::path _storeBase() const;
 
     Settings _settings;
+    std::string _manifestFolder; ///< see useManifest()
     std::mutex _syncMutex;
     std::mutex _modtimeMutex;
     std::optional<bool> _usesModtime;

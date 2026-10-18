@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.6. Phase 0 (C++ core, Python bindings, USD resolver), phase 1 (Python workflow services, `clio` CLI, history cache), phase 2 (branches and drafts), phase 3 (performance) and phase 4 (USD write side, timestamps, `prepare`) are implemented; see [workflow.md](workflow.md), [usd.md](usd.md) and [building.md](building.md). |
+| **Status** | Draft v0.7. Phase 0 (C++ core, Python bindings, USD resolver), phase 1 (Python workflow services, `clio` CLI, history cache), phase 2 (branches and drafts), phase 3 (performance), phase 4 (USD write side, timestamps, `prepare`) and phase 4½ (version manifests) are implemented; see [workflow.md](workflow.md), [usd.md](usd.md) and [building.md](building.md). |
 | **Package** | `deda.clio` (Python namespace package) |
 | **Targets** | Python 3.13 · USD 26.08 (primary) and USD 25.08 or later · no DCCs yet |
 | **Consumers** | Standalone Python, the `clio` CLI, and USD. Dedaverse, Imagine and DCC integrations are later work. |
@@ -1489,6 +1489,46 @@ depot=//imagine/main;root=/farm/ws;manifest=/jobs/551/sh0100.clio-manifest.json;
   variables with the stage's defaults. Paths that depend on values set
   only at render time must be listed explicitly (`--extra PATH…`).
 
+#### As built (phase 4½)
+
+* **Python** (`deda.clio.usd`): `Manifest` with `create`, `load`, `save`,
+  `fetch`, `check`, `diff`, `settings` and `sha256`, over a canonical JSON
+  text (fixed key order, sorted files), so a saved manifest has the same id
+  when it is loaded again. `clio usd manifest create | fetch | check | diff`.
+  Failures to make a manifest raise `ManifestError` (exit code 13) with the
+  list of files.
+* **Creation** reuses `prepare`'s dependency walk instead of
+  `UsdUtils.ComputeAllDependencies`: it already resolves through the same
+  core, fetches what is missing, and follows pins. `fstat -Ol` runs on 500
+  files at a time, with `#have`, no suffix, or `@change`/`@label` by pin.
+  Digests of workspace files are checked on 8 threads (text ignoring `\r`).
+* **C++** (`clio_core`): `Manifest` (its own JSON reader; the format needs
+  nothing more), MD5 and SHA-256 written out so that the core does not use
+  the OpenSSL that P4API carries, `Workspace::materialize` /
+  `fetchManifest` / `checkManifest`, and the manifest branch of
+  `AssetResolver`. `Settings` has a `manifest=` key.
+* **Digests and line endings.** Perforce's digest is of the file as the server
+  stores it. `p4 print` writes text with the client's line endings, so text
+  copies (types `text`, `unicode`, `utf8`) are hashed with `\r\n` counted as
+  `\n`. `utf16` files are converted in a way that changes the bytes, so their
+  digest is not checked.
+* **Pool.** `<store>/objects/<digest>` holds each stored content once;
+  every manifest folder gets a hard link (a copy where the file system cannot
+  link). The pool is read-only and trusted once written: content is checked
+  before it enters the pool.
+* **Resolve.** A listed file resolves to the manifest folder's copy, with the
+  pin `#rev`. Not listed: `nullopt` under verify and offline, the normal
+  resolve with a warning under sync. In the USD plugin a project path that
+  resolves to nothing under a manifest returns an empty path instead of
+  falling back to `ArDefaultResolver`, because the fallback would load the
+  machine's own copy. The manifest's folder is recognized by
+  `matchLocalPath`, so relative references inside manifest layers resolve.
+* The store folder is named by the server (§10.4), so fetch and render must
+  reach the same server address.
+* **Not built:** shelf support (a `"shelf"` per file for unsubmitted work,
+  open question 10), evaluating expression variables, and submitting the
+  manifest to Perforce from Clio.
+
 #### API sketch
 
 ```python
@@ -1623,7 +1663,7 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
 | **2 — Branching** *(done)* | Streams/task streams, switch, update/publish with binary conflict handling, cross-branch lock check, drafts (shelves) ([workflow.md](workflow.md#branches-and-drafts)). *Deferred:* updating or publishing part of a branch, taking a draft into another branch, virtual streams, stream spec editing (paths, imports). |
 | **3 — Performance** *(done)* | Stat-first disk check for `status` and `save` ([benchmarks.md](benchmarks.md#phase-3-the-disk-check-2026-10-12)); `ConnectionPool` in `clio_core`; the miss coalescer (single-flight plus a batching window for `sync`, parallel fetches of pinned versions); time-bounded resolver memo (§8.3, §10.3 "As built"). *Measured and not built:* C++ hashing, scan and diff, a persistent store and a Python status cache (see [benchmarks.md](benchmarks.md#phase-3-what-was-not-built-2026-10-18)). |
 | **4 — USD completion** *(done, CI not yet run)* | Write side: edit/add on save, refuse on another user's lock (§10.6); revision-based timestamps for `modtime` clients (§10.3); `deda.clio.usd.prepare`, `prepare_for_edit` and `finish_edit` (option A, §10.2). A Linux CI workflow builds and tests against USD 26.08 and 25.08 (`.github/workflows/ci.yml`); it has not run on GitHub yet. *Deferred:* locking a layer before it is edited (today the edit happens at save), submit hooks. |
-| **4½ — Version manifests** | `Manifest` create/save/load/fetch/check/diff (§10.8), `manifest=` context setting, content-addressed pool, `clio usd manifest` CLI, farm guide (proxy + `policy=verify`). |
+| **4½ — Version manifests** *(done)* | `Manifest` create/save/load/fetch/check/diff (§10.8), `manifest=` context setting, content-addressed pool, `clio usd manifest` CLI, farm guide (proxy + `policy=verify`, [usd.md](usd.md#rendering-on-a-farm-version-manifests)). *Deferred:* shelves for unsubmitted work, expression variables. |
 | **5 — Ecosystem** | UI view models (`FileListView`, `HistoryView`) with the request pipeline, ContentCache (§9.5), asset resolver plugins, validation hooks, `clio doctor`. Dedaverse/DCC integration when targeted. |
 
 ### Backlog

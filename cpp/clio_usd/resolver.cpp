@@ -151,10 +151,14 @@ void ClioResolver::_WarnOnce(const std::string& assetPath, const std::string& wa
 
 ArResolvedPath ClioResolver::_Resolve(const std::string& assetPath) const {
     // Exceptions must never escape into USD, which calls this from worker
-    // threads. Any problem falls back to the default resolver.
+    // threads. Any problem falls back to the default resolver, except under
+    // a manifest: its guarantee is that nothing outside it is loaded, so a
+    // project path that the manifest cannot provide does not resolve.
+    bool underManifest = false;
     try {
         if (const auto core = _GetCoreResolver()) {
             const std::filesystem::path projectPath = _ProjectPath(*core, assetPath);
+            underManifest = core->manifest() && !projectPath.empty();
             if (!projectPath.empty()) {
                 if (const auto asset = core->resolvePath(projectPath)) {
                     if (!asset->warning.empty()) {
@@ -162,12 +166,19 @@ ArResolvedPath ClioResolver::_Resolve(const std::string& assetPath) const {
                     }
                     return ArResolvedPath(asset->localPath.generic_string());
                 }
+                if (underManifest) {
+                    _WarnOnce(assetPath, "not provided: it is not in the manifest, or the manifest's copy "
+                                         "has not been fetched (clio usd manifest fetch)");
+                }
             }
         }
     } catch (const std::exception& e) {
         _WarnOnce(assetPath, std::string("could not use Perforce: ") + e.what());
     } catch (...) {
         _WarnOnce(assetPath, "could not use Perforce (unknown error)");
+    }
+    if (underManifest) {
+        return ArResolvedPath();
     }
     return ArDefaultResolver::_Resolve(assetPath);
 }

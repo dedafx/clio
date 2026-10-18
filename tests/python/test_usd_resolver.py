@@ -450,3 +450,58 @@ def test_modtime_client_timestamp_is_the_workspace_revision(p4_server):
     assert _timestamp(p4_server.settings_text(), crate, resources) == 2.0
     p4_server.connection().run_or_throw("sync", ["-q", "//depot/proj/assets/crate/crate.usda#1"])
     assert _timestamp(p4_server.settings_text(), crate, resources) == 1.0
+
+
+# --- loading through a version manifest (design §10.8) -----------------------
+
+_RESOLVE_SCRIPT = textwrap.dedent(
+    """
+    import json, sys
+    from pxr import Ar
+
+    settings, *paths = sys.argv[1:]
+    resolver = Ar.GetResolver()
+    with Ar.ResolverContextBinder(resolver.CreateContextFromString(settings)):
+        print(json.dumps([str(resolver.Resolve(p)) for p in paths]))
+    """
+)
+
+
+def test_a_stage_loads_through_a_manifest_and_nothing_outside_it(p4_server, make_session):
+    from deda.clio import usd as clio_usd
+
+    resources = _plugin_resources()
+    _submit_v1_v2(p4_server)  # head: crate 2, geo 2
+    p4_server.submit({"assets/crate/other.usda": _geo(9)}, "not in the manifest")
+    alice = make_session()
+    alice.workspace.get()
+    alice.workspace.get("assets/crate/crate.usda", version="#1")  # the artist looked at crate v1
+    store = p4_server.version_store
+
+    manifest = clio_usd.Manifest.create(alice, "shots/sh010/shot.usda", store=store)
+    assert manifest.files["assets/crate/crate.usda"].rev == 1
+    path = manifest.save(p4_server.workspace_root.parent / "job.clio-manifest.json")
+    assert manifest.fetch(alice, store=store).ok
+
+    # The farm's workspace holds the latest files (crate v2) ...
+    assert "version = 2" in (p4_server.workspace_root / "assets/crate/crate.usda").read_text()
+    settings = p4_server.settings_text(manifest=path, policy="verify")  # verify: no server calls
+
+    # ... but the stage loads the manifest's revisions, from the manifest's folder.
+    result, stderr = _open_stage(settings, _shot(p4_server), plugin=resources)
+    assert (result["value"], result["geo"]) == (1, 2), stderr
+    assert len(result["real_paths"]) == 3
+    folder = f"manifest-{manifest.sha256[:16]}"
+    assert all(folder in p for p in result["real_paths"])
+
+    # A file the manifest does not list does not resolve, although it is on disk.
+    inside = os.fspath(p4_server.workspace_root / "assets/crate/geo.usda")
+    outside = os.fspath(p4_server.workspace_root / "assets/crate/other.usda")
+    assert Path(outside).is_file()
+    out = subprocess.run([sys.executable, "-c", _RESOLVE_SCRIPT, settings, inside, outside],
+                         env=_env(resources), capture_output=True, text=True, check=False)
+    assert out.returncode == 0, out.stderr
+    resolved_inside, resolved_outside = json.loads(out.stdout.strip().splitlines()[-1])
+    assert folder in resolved_inside
+    assert resolved_outside == ""
+    assert "not in the manifest" in out.stderr

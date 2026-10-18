@@ -18,6 +18,11 @@ from pathlib import Path
 from typing import Any
 
 __all__ = [
+    "CheckReport",
+    "FetchReport",
+    "Manifest",
+    "ManifestDiff",
+    "ManifestFile",
     "PrepareReport",
     "create_context",
     "finish_edit",
@@ -67,14 +72,25 @@ def create_context(settings: str):
     return Ar.GetResolver().CreateContextFromString(settings)
 
 
-_LAZY = ("PrepareReport", "finish_edit", "prepare", "prepare_for_edit", "resolver_settings")
+_LAZY = {
+    "PrepareReport": "_prepare",
+    "finish_edit": "_prepare",
+    "prepare": "_prepare",
+    "prepare_for_edit": "_prepare",
+    "resolver_settings": "_prepare",
+    "CheckReport": "_manifest",
+    "FetchReport": "_manifest",
+    "Manifest": "_manifest",
+    "ManifestDiff": "_manifest",
+    "ManifestFile": "_manifest",
+}
 
 
 def __getattr__(name: str) -> Any:
-    # The Python-only path (option A, design doc §10.2) lives in _prepare;
-    # it is loaded on first use so that importing this module stays cheap.
+    # The Python-only path (option A, design doc §10.2) and manifests (§10.8)
+    # are loaded on first use, so that importing this module stays cheap.
     if name in _LAZY:
-        from deda.clio.usd import _prepare
+        import importlib
 
-        return getattr(_prepare, name)
+        return getattr(importlib.import_module(f"deda.clio.usd.{_LAZY[name]}"), name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

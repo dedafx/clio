@@ -2,6 +2,7 @@
 
 #include "clio/core/coalescer.hpp"
 #include "clio/core/identifier.hpp"
+#include "clio/core/manifest.hpp"
 #include "clio/core/settings.hpp"
 #include "clio/core/workspace.hpp"
 
@@ -48,6 +49,15 @@ struct ResolvedAsset {
 /// found" for those) is kept for `Settings::cacheTtl` and then checked
 /// again. Thread-safe.
 ///
+/// With a manifest (`Settings::manifest`, design doc §10.8) a file is loaded
+/// only as the manifest lists it: the manifest's revision, from the
+/// manifest's own folder in the version store. Pins do not apply. A path the
+/// manifest does not list is not provided (nullopt) under the verify and
+/// offline policies, which is the guarantee that nothing outside the
+/// manifest is ever loaded; under sync it is resolved as without a manifest,
+/// with a warning. A listed file that is not in the folder yet is fetched
+/// under sync (use Workspace::fetchManifest to fetch them all first).
+///
 /// Misses are coalesced (design §10.3): threads asking for the same asset
 /// share one resolve, and the `sync`s of threads that miss within
 /// `Settings::batchWindow` of each other become one Perforce command.
@@ -69,6 +79,9 @@ public:
 
     const Settings& settings() const { return _workspace.settings(); }
     Workspace& workspace() { return _workspace; }
+
+    /// The manifest the settings name, or null.
+    const Manifest* manifest() const { return _manifest ? &*_manifest : nullptr; }
 
     /// The pin that applies to `id`: its own pin, else the settings pin.
     Pin effectivePin(const AssetIdentifier& id) const;
@@ -134,7 +147,9 @@ private:
     /// `serverAnswered` is set when the result, including "not found", came
     /// from the server and may be remembered.
     std::optional<ResolvedAsset> _resolveUncached(const AssetIdentifier& id, const Pin& pin,
-                                                  bool& serverAnswered);
+                                                  bool& serverAnswered, bool ignoreManifest = false);
+    std::optional<ResolvedAsset> _resolveFromManifest(const AssetIdentifier& id, const Pin& pin,
+                                                      bool& serverAnswered);
     std::optional<ResolvedAsset> _useWorkspaceFile(ResolvedAsset asset, const std::string& reason) const;
     std::optional<ResolvedAsset> _resolveAndRemember(const AssetIdentifier& id, const Pin& pin,
                                                      const std::string& key);
@@ -155,6 +170,7 @@ private:
 
     Clock _clock;
     Workspace _workspace;
+    std::optional<Manifest> _manifest;
     std::mutex _haveMutex;
     std::unordered_map<std::string, HaveEntry> _haveCache; ///< by workspace path, for cacheTtl
     std::atomic<std::int64_t> _serverRetryAt{0}; ///< steady_clock ticks; 0 = available

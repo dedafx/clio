@@ -9,7 +9,9 @@ configure_file(
 add_library(clio_core STATIC
     src/coalescer.cpp
     src/file_lock.cpp
+    src/hash.cpp
     src/identifier.cpp
+    src/manifest.cpp
     src/pin.cpp
     src/resolver.cpp
     src/settings.cpp

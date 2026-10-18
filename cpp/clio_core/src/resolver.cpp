@@ -13,7 +13,17 @@ AssetResolver::AssetResolver(Settings settings, Clock clock)
               std::lock_guard<std::mutex> lock(_haveMutex);
               _haveCache.clear(); // revisions have changed
           },
-          _workspace.settings().batchWindow) {}
+          _workspace.settings().batchWindow) {
+    const auto& manifestPath = _workspace.settings().manifest;
+    if (!manifestPath.empty()) {
+        _manifest = Manifest::load(manifestPath.string());
+        if (_manifest->depot() != _workspace.settings().depotRoot) {
+            throw ConfigError("The manifest " + manifestPath.string() + " is for " + _manifest->depot() +
+                              ", not " + _workspace.settings().depotRoot);
+        }
+        _workspace.useManifest(*_manifest);
+    }
+}
 
 std::chrono::steady_clock::time_point AssetResolver::_now() const {
     return _clock ? _clock() : std::chrono::steady_clock::now();
@@ -96,8 +106,45 @@ std::optional<ResolvedAsset> AssetResolver::_useWorkspaceFile(ResolvedAsset asse
     return asset;
 }
 
+std::optional<ResolvedAsset> AssetResolver::_resolveFromManifest(const AssetIdentifier& id, const Pin& pin,
+                                                                 bool& serverAnswered) {
+    const Policy policy = settings().policy;
+    const ManifestEntry* entry = _manifest->find(id.relativePath());
+    if (!entry) {
+        if (policy != Policy::Sync) {
+            return std::nullopt; // nothing outside the manifest is ever loaded
+        }
+        auto asset = _resolveUncached(id, pin, serverAnswered, /*ignoreManifest=*/true);
+        if (asset) {
+            const std::string note = id.path() + " is not in the manifest " + _manifest->folderName().substr(9, 8);
+            asset->warning = asset->warning.empty() ? note : note + "; " + asset->warning;
+        }
+        return asset;
+    }
+    ResolvedAsset asset{id, Pin::revision(entry->rev), _workspace.depotPath(id),
+                        _workspace.manifestPath(*_manifest, entry->path), {}};
+    if (std::filesystem::exists(asset.localPath)) {
+        return asset;
+    }
+    if (policy != Policy::Sync || !_serverAvailable()) {
+        return std::nullopt; // verify: the manifest must be fetched first
+    }
+    try {
+        _workspace.materialize(*_manifest, *entry, /*verifyPresent=*/false);
+        serverAnswered = true;
+        return asset;
+    } catch (const P4Error&) {
+        _markServerUnavailable();
+        return std::nullopt;
+    }
+}
+
 std::optional<ResolvedAsset> AssetResolver::_resolveUncached(const AssetIdentifier& id,
-                                                             const Pin& pin, bool& serverAnswered) {
+                                                             const Pin& pin, bool& serverAnswered,
+                                                             bool ignoreManifest) {
+    if (_manifest && !ignoreManifest) {
+        return _resolveFromManifest(id, pin, serverAnswered);
+    }
     const Policy policy = settings().policy;
     ResolvedAsset asset{id, pin, _workspace.depotPath(id), {}, {}};
     const bool mayContactServer = policy == Policy::Sync && _serverAvailable();

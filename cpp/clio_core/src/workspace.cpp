@@ -2,6 +2,7 @@
 
 #include "clio/core/error.hpp"
 #include "clio/core/file_lock.hpp"
+#include "clio/core/hash.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -9,6 +10,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <thread>
+#include <cctype>
+#include <map>
+#include <set>
 #include <system_error>
 
 #ifdef _WIN32
@@ -295,6 +300,13 @@ std::optional<LocalPathMatch> Workspace::matchLocalPath(const std::filesystem::p
         if (slash == std::string::npos) {
             return std::nullopt;
         }
+        if (!_manifestFolder.empty() && rel->substr(0, slash) == _manifestFolder) {
+            try {
+                return LocalPathMatch{AssetIdentifier::fromRelativePath(rel->substr(slash + 1)), std::nullopt, true, true};
+            } catch (const Error&) {
+                return std::nullopt;
+            }
+        }
         auto pin = pinFromDirName(rel->substr(0, slash));
         if (!pin) {
             return std::nullopt;
@@ -451,6 +463,208 @@ bool Workspace::clientUsesModtime() {
         _usesModtime = uses;
     }
     return *_usesModtime;
+}
+
+void Workspace::useManifest(const Manifest& manifest) {
+    _manifestFolder = manifest.folderName();
+}
+
+std::filesystem::path Workspace::manifestPath(const Manifest& manifest, const std::string& relativePath) const {
+    return underRoot(_storeBase() / manifest.folderName(), AssetIdentifier::fromRelativePath(relativePath));
+}
+
+Workspace::Materialized Workspace::materialize(const Manifest& manifest, const ManifestEntry& entry,
+                                               bool verifyPresent, std::int64_t* bytesFetched) {
+    namespace fs = std::filesystem;
+    const fs::path target = manifestPath(manifest, entry.path);
+    std::error_code ec;
+    const bool check = entry.digestCheckable();
+
+    if (fs::exists(target, ec)) {
+        if (!verifyPresent || !check || md5File(target, entry.isText()) == entry.digest) {
+            return Materialized::Present;
+        }
+        // Damaged or replaced: put the right file back.
+        fs::permissions(target, fs::perms::owner_write, fs::perm_options::add, ec);
+        fs::remove(target, ec);
+    }
+    fs::create_directories(target.parent_path(), ec);
+    if (ec) {
+        throw Error("Could not create " + target.parent_path().string() + ": " + ec.message());
+    }
+
+    const auto readOnly = [](const fs::path& file) {
+        std::error_code e;
+        fs::permissions(file, fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write,
+                        fs::perm_options::remove, e);
+    };
+    // Put the pool's file at `target`: a hard link, or a copy where the file
+    // system cannot link.
+    const auto place = [&](const fs::path& source) {
+        std::error_code e;
+        fs::create_hard_link(source, target, e);
+        if (e) {
+            fs::copy_file(source, target, fs::copy_options::overwrite_existing, e);
+            if (e) {
+                throw Error("Could not store " + target.string() + ": " + e.message());
+            }
+            readOnly(target);
+        }
+    };
+
+    const bool pooled = !entry.digest.empty();
+    const fs::path pool = _settings.versionStore / "objects" / entry.digest;
+    if (pooled && fs::exists(pool, ec)) {
+        place(pool);
+        return Materialized::Linked;
+    }
+
+    static std::atomic<unsigned> counter{0};
+    fs::path temp = target;
+    temp += ".clio-tmp-" + std::to_string(CLIO_GETPID()) + "-" + std::to_string(counter.fetch_add(1));
+    _pool.runOrThrow("print", {"-q", "-o", temp.string(), depotPath(AssetIdentifier::fromRelativePath(entry.path)) +
+                                                              "#" + std::to_string(entry.rev)});
+    if (!fs::exists(temp, ec)) {
+        throw Error(entry.path + "#" + std::to_string(entry.rev) +
+                    " is not on the server any more (obliterated or archived)");
+    }
+    if (check) {
+        const std::string actual = md5File(temp, entry.isText());
+        if (actual != entry.digest) {
+            fs::remove(temp, ec);
+            throw Error(entry.path + "#" + std::to_string(entry.rev) + " has digest " + actual +
+                        " on the server, but the manifest has " + entry.digest +
+                        ". The file was changed or restored after the manifest was made");
+        }
+    }
+    if (bytesFetched) {
+        *bytesFetched += static_cast<std::int64_t>(fs::file_size(temp, ec));
+    }
+    readOnly(temp);
+    if (!pooled) {
+        fs::rename(temp, target, ec);
+        if (ec) {
+            fs::remove(temp, ec);
+            if (!fs::exists(target)) {
+                throw Error("Could not store " + target.string());
+            }
+        }
+        return Materialized::Fetched;
+    }
+    fs::create_directories(pool.parent_path(), ec);
+    fs::rename(temp, pool, ec);
+    if (ec) {
+        // Another thread stored the same content first.
+        fs::remove(temp, ec);
+        if (!fs::exists(pool)) {
+            throw Error("Could not store " + pool.string());
+        }
+    }
+    place(pool);
+    return Materialized::Fetched;
+}
+
+ManifestFetchReport Workspace::fetchManifest(const Manifest& manifest, std::size_t threads,
+                                             const ManifestProgress& progress) {
+    std::vector<const ManifestEntry*> entries;
+    for (const auto& [path, entry] : manifest.entries()) {
+        entries.push_back(&entry);
+    }
+    ManifestFetchReport report;
+    report.files = entries.size();
+
+    std::atomic<std::size_t> next{0};
+    std::atomic<std::size_t> done{0};
+    std::mutex reportMutex;
+    const auto worker = [&] {
+        for (;;) {
+            const std::size_t index = next.fetch_add(1);
+            if (index >= entries.size()) {
+                return;
+            }
+            const ManifestEntry& entry = *entries[index];
+            std::int64_t bytes = 0;
+            std::string failure;
+            Materialized how = Materialized::Present;
+            try {
+                how = materialize(manifest, entry, /*verifyPresent=*/true, &bytes);
+            } catch (const std::exception& e) {
+                failure = entry.path + ": " + e.what();
+            }
+            std::lock_guard<std::mutex> lock(reportMutex);
+            if (!failure.empty()) {
+                report.failures.push_back(failure);
+            } else {
+                switch (how) {
+                case Materialized::Present: ++report.present; break;
+                case Materialized::Linked: ++report.linked; break;
+                case Materialized::Fetched: ++report.fetched; break;
+                }
+                report.bytes += bytes;
+            }
+            if (progress) {
+                progress(++done, entries.size(), entry.path);
+            }
+        }
+    };
+
+    const std::size_t count = std::max<std::size_t>(1, std::min(threads, entries.size()));
+    std::vector<std::thread> workers;
+    for (std::size_t i = 1; i < count; ++i) {
+        workers.emplace_back(worker);
+    }
+    worker();
+    for (auto& t : workers) {
+        t.join();
+    }
+    std::sort(report.failures.begin(), report.failures.end());
+    return report;
+}
+
+std::vector<std::string> Workspace::checkManifest(const Manifest& manifest) {
+    std::vector<std::string> problems;
+    std::vector<const ManifestEntry*> entries;
+    for (const auto& [path, entry] : manifest.entries()) {
+        entries.push_back(&entry);
+    }
+    constexpr std::size_t chunk = 500;
+    for (std::size_t start = 0; start < entries.size(); start += chunk) {
+        const std::size_t end = std::min(entries.size(), start + chunk);
+        std::vector<std::string> args{"-Ol", "-T", "depotFile,headRev,digest"};
+        std::map<std::string, const ManifestEntry*> byDepotFile;
+        for (std::size_t i = start; i < end; ++i) {
+            const ManifestEntry& entry = *entries[i];
+            const auto id = AssetIdentifier::fromRelativePath(entry.path);
+            args.push_back(depotPath(id) + "#" + std::to_string(entry.rev));
+            byDepotFile[_settings.depotRoot + "/" + entry.path] = &entry;
+        }
+        const auto result = _pool.runOrThrow("fstat", args);
+        std::set<std::string> seen;
+        for (const auto& record : result.records) {
+            const auto file = record.find("depotFile");
+            if (file == record.end() || !byDepotFile.count(file->second)) {
+                continue;
+            }
+            const ManifestEntry& entry = *byDepotFile[file->second];
+            seen.insert(entry.path);
+            const auto digest = record.find("digest");
+            if (digest != record.end() && !entry.digest.empty()) {
+                std::string actual = digest->second;
+                for (char& c : actual) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                if (actual != entry.digest) {
+                    problems.push_back(entry.path + "#" + std::to_string(entry.rev) +
+                                       " has a different digest on the server than in the manifest");
+                }
+            }
+        }
+        for (std::size_t i = start; i < end; ++i) {
+            if (!seen.count(entries[i]->path)) {
+                problems.push_back(entries[i]->path + "#" + std::to_string(entries[i]->rev) +
+                                   " is not on the server any more (obliterated or archived)");
+            }
+        }
+    }
+    return problems;
 }
 
 FetchResult Workspace::fetchVersion(const AssetIdentifier& id, const Pin& pin) {

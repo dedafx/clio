@@ -60,6 +60,10 @@ class PrepareReport:
     waves: int
     #: ``p4 sync`` commands the core ran. Diagnostic: one per wave at most.
     sync_commands: int
+    #: Project-relative path ('assets/crate/crate.usda') of every file
+    #: provided, layers and assets, in the order they were found. Files in the
+    #: version store or a manifest are named by the same path.
+    asset_paths: tuple[str, ...] = ()
     #: The opened layers. Keeping the report alive keeps them in USD's layer
     #: registry, so ``Usd.Stage.Open`` reuses them instead of parsing again.
     keepalive: tuple[Any, ...] = field(default=(), repr=False, compare=False)
@@ -71,6 +75,7 @@ def resolver_settings(
     *,
     policy: str | _core.Policy | None = None,
     store: str | os.PathLike | None = None,
+    manifest: str | os.PathLike | None = None,
 ) -> _core.Settings:
     """Core settings for the session's project, the text form of a USD
     resolver context. ``pin`` is ``have`` (default), ``latest``, ``@<change>``
@@ -81,6 +86,8 @@ def resolver_settings(
     values: dict[str, str] = {"depot": paths.depot_root, "root": os.fspath(paths.root), "pin": pin_text}
     if store is not None:
         values["store"] = os.fspath(store)
+    if manifest is not None:
+        values["manifest"] = os.fspath(manifest)
     if policy is not None:
         values["policy"] = (policy.name.lower() if isinstance(policy, _core.Policy) else str(policy))
     for key, value in (
@@ -192,6 +199,7 @@ def prepare(
     payloads: str | PayloadFilter = "all",
     assets: bool = True,
     store: str | os.PathLike | None = None,
+    extra: Sequence[str | os.PathLike] = (),
     progress: ProgressCallback | None = None,
     cancel: CancelToken | None = None,
 ) -> PrepareReport:
@@ -207,6 +215,9 @@ def prepare(
     -> bool``. ``assets`` also prepares textures, clips and volumes. The walk
     works from layer contents, so it covers every variant, not only the
     selected ones; ``payloads`` narrows it.
+
+    ``extra`` lists more files to provide, as asset or local paths, for
+    files that no layer mentions (for example a path built at render time).
     """
     settings = resolver_settings(session, pin, store=store)
     resolver = _core.AssetResolver(settings)
@@ -233,6 +244,16 @@ def prepare(
 
     frontier: list[tuple[Path, str]] = [(local_root, text)]
     seen.add(_key(local_root))
+    for item in extra:
+        extra_text = os.fspath(item)
+        extra_local = (Path(extra_text) if Path(extra_text).is_absolute()
+                       else paths.local_path(extra_text.replace("\\", "/").lstrip("/")))
+        extra_local = paths.local_path(paths.asset_path_of_local(extra_local))
+        if _key(extra_local) not in seen:
+            seen.add(_key(extra_local))
+            frontier.append((extra_local, extra_text))
+    found = len(frontier)
+    asset_paths: list[str] = []
     with ThreadPoolExecutor(max_workers=_MAX_THREADS, thread_name_prefix="clio-prepare") as pool:
         while frontier:
             if cancel:
@@ -248,7 +269,9 @@ def prepare(
                 if info["warning"]:
                     warnings.append(info["warning"])
                 local = Path(info["local_path"])
-                if root_path is None:
+                if (relative := resolver.relative_path_of(wanted)) and relative not in asset_paths:
+                    asset_paths.append(relative)
+                if root_path is None and _key(wanted) == _key(local_root):
                     root_path = local
                 if local.suffix.lower() not in _LAYER_EXTENSIONS:
                     other.append(local)
@@ -278,7 +301,7 @@ def prepare(
         raise NotInWorkspaceError(f"{text} is not in Perforce and not on disk",
                                   hint="Check the path, or the pin")
     return PrepareReport(root_path, tuple(layers), tuple(other), tuple(missing), tuple(warnings), waves,
-                         resolver.sync_commands_run, tuple(keepalive))
+                         resolver.sync_commands_run, tuple(asset_paths), tuple(keepalive))
 
 
 def prepare_for_edit(session: Session, layer_paths: Iterable[str | os.PathLike | Sequence[str]]) -> EditReport:

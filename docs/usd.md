@@ -203,6 +203,7 @@ passed to USD's default resolver as a search path, as before.
 | `policy` | no | `sync` (default), `verify` or `offline` (below) |
 | `timeout` | no | Seconds before a Perforce command is cancelled. Default `120`, `0` = none |
 | `connect_timeout` | no | Seconds to wait for an unreachable server before falling back to local files. Default `10`, `0` = the OS default (can be over 2 minutes) |
+| `manifest` | no | Path of a version manifest. Files then load only as the manifest lists them (see [Rendering on a farm](#rendering-on-a-farm-version-manifests)). `pin` is not used |
 | `cache_ttl` | no | Seconds Clio trusts an answer that can change (`have`, `latest`, a label) before asking again. Default `60`, `0` = ask every time. A change or revision never changes and is kept until `RefreshContext` |
 | `batch_ms` | no | Milliseconds a resolve that needs the server waits for other missing files to join its `sync`. Default `20`, `0` = do not wait |
 | `connections` | no | Most Perforce connections Clio opens in the process (1 to 64). Default `4`; they open only when threads need them at the same time |
@@ -219,7 +220,7 @@ clio.Settings.parse(settings)   # raises clio.ConfigError with the reason
 | Policy | Contacts the server? | Use it for |
 |---|---|---|
 | `sync` | Yes, to fetch what is missing or out of date. Falls back to local files, with a warning, if the server is unavailable. | Everyday work |
-| `verify` | No. A file must already be on disk at the required version. Never falls back. | Render farms and reproducible builds, after a prefetch step (planned: version manifests, design §10.8) |
+| `verify` | No. A file must already be on disk at the required version. Never falls back. | Render farms and reproducible builds, after a prefetch step; see [version manifests](#rendering-on-a-farm-version-manifests) |
 | `offline` | No. Uses what is on disk (for historical pins: the version store, then the workspace). | Working without a connection |
 
 ### A default context for every stage
@@ -352,6 +353,117 @@ info.resolverInfo["depotPath"]     # "//imagine/main/assets/crate/crate.usda"
 
 `GetAssetInfo` makes no server calls. Outside the project, or with no Clio
 context, it returns what USD's default resolver returns.
+
+## Rendering on a farm: version manifests
+
+`have` and `latest` depend on the machine: `have` loads whatever each
+workspace holds, and `latest` depends on *when* each machine resolves. A
+render split over 500 machines must load **exactly the same file revisions**
+on every frame, even while artists keep submitting. A change pin (`@18234`)
+is close, but it cannot say what an artist actually looked at: a mix of
+revisions synced at different times.
+
+A **manifest** records the exact revision of every file the stage can load,
+with the server's digest. Every machine then loads through the manifest and
+nothing else. The same manifest gives the same pixels today or in a year,
+and its SHA-256 is the job's version id.
+
+### 1. Make it (on the artist's or the submitter's machine)
+
+```
+clio usd manifest create shots/sq010/sh0100/shot.usda --pin have -o sh0100.clio-manifest.json
+```
+
+```python
+from deda.clio import usd as clio_usd
+
+manifest = clio_usd.Manifest.create(session, "shots/sq010/sh0100/shot.usda", pin="have")
+manifest.save("sh0100.clio-manifest.json")
+print(manifest.sha256)          # the job's version id
+```
+
+The walk reads layer contents, like [`prepare`](#without-the-plugin-prepare),
+so the manifest is a **superset** of what one render loads: every variant and
+payload, so a variant switch on the farm never finds a file missing. Use
+`--no-payloads` to leave payloads out, and `--extra PATH` (repeatable) for a
+file no layer mentions, such as a path built at render time. Expressions in
+asset paths are not evaluated.
+
+| `--pin` | Revision recorded |
+|---|---|
+| `have` (default) | The one in your workspace: what you were looking at |
+| `latest` | The head revision, all read in one moment |
+| `@18234` or `@approved` | The revision at that change or label |
+
+**Clio refuses to make a manifest a farm machine could not reproduce**, and
+lists the files (exit code 13): a file that is **not in Perforce**, a file
+that is **open for edit**, a file whose **content differs from its
+revision** (edited without checking out), and a reference that cannot be
+provided (unless `--allow-missing`). Submit or revert those files and run it
+again.
+
+Keep the manifest with the render job. You can also submit it to Perforce
+(for example under `//imagine/main/manifests/`) so that any render can be
+reproduced later.
+
+### 2. Fetch it (once per farm machine, before rendering)
+
+```
+clio usd manifest fetch sh0100.clio-manifest.json --threads 8
+```
+
+This downloads every listed revision with parallel `p4 print` and checks each
+file against its digest. Files go into the manifest's own folder of the
+version store, which mirrors the depot so relative paths between layers keep
+working:
+
+```
+<store>/<server>/<depot>/manifest-<first 16 characters of the id>/shots/sq010/sh0100/shot.usda
+```
+
+A file that another manifest already stored (same digest) is **linked** from a
+shared pool (`<store>/objects/<digest>`), not downloaded again: two jobs with
+similar manifests store a big file once, and the second job fetches only the
+difference. Everything is stored read-only. Run it again at any time; files
+already in place are checked and left alone.
+
+**Reach Perforce through a P4 Proxy near the farm**, so 500 machines fetching
+the same files hit the proxy's cache and not the commit server.
+
+### 3. Render with the manifest
+
+```
+depot=//imagine/main;root=/farm/ws;manifest=/jobs/551/sh0100.clio-manifest.json;policy=verify
+```
+
+Use this as the resolver context (or `$CLIO_RESOLVER_CONTEXT`) and open the
+stage as usual. In Python, `manifest.settings(session, path)` builds it.
+
+* A path in the manifest resolves to the manifest's copy of that revision,
+  wherever the stage found it (a workspace path, or a relative path inside
+  another layer of the manifest).
+* A path **not in the manifest does not resolve**, even if the file is on
+  disk, and Clio prints one warning. That is the guarantee: nothing outside
+  the manifest is ever loaded. The same holds for a listed file that was not
+  fetched yet.
+* With `policy=verify` there are **no server calls** during the render.
+  With `policy=sync` (for interactive use) a listed file that is not stored
+  yet is fetched, and a path outside the manifest is resolved as without a
+  manifest, with a warning.
+
+### Checking and comparing
+
+```
+clio usd manifest check sh0100.clio-manifest.json     # is every revision still on the server?
+clio usd manifest diff  old.json new.json              # what changed between two jobs
+```
+
+`check` asks the server (one `fstat` per 500 files) whether each revision can
+still be fetched with the manifest's digest. An obliterated or archived
+revision cannot, so run it before a long re-render. `diff` needs no server;
+it exits with 1 when the manifests differ.
+
+---
 
 ## Without the plugin: `prepare`
 
