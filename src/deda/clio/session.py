@@ -112,6 +112,14 @@ class Session:
         return HookRegistry()
 
     @cached_property
+    def content(self):  # -> deda.clio.content.ContentCache
+        """The content cache for file bytes shown in UIs (design doc §9.3)."""
+        from deda.clio.config import cache_dir
+        from deda.clio.content import ContentCache
+
+        return ContentCache(cache_dir() / "content", self.config.content_cache_mb * 2**20)
+
+    @cached_property
     def paths(self) -> ProjectPaths:
         """The project's depot root and workspace root.
 

@@ -607,6 +607,46 @@ def draft_drop(state: State, number: int, yes: bool) -> None:
     state.out.emit({"dropped": number}, lambda: click.echo(f"Dropped draft {number}"))
 
 
+# --- caches -------------------------------------------------------------------
+
+
+@cli.group("cache")
+def cache_group() -> None:
+    """The history and content caches (design doc §9)."""
+
+
+@cache_group.command("clear")
+@click.option("--history", "only_history", is_flag=True, help="Only the history cache.")
+@click.option("--content", "only_content", is_flag=True, help="Only the content cache.")
+@pass_state
+@handles_errors
+def cache_clear(state: State, only_history: bool, only_content: bool) -> None:
+    """Forget cached history and delete cached file content."""
+    both = not (only_history or only_content)
+    freed = 0
+    if both or only_history:
+        state.session.history.refresh()
+    if both or only_content:
+        freed = state.session.content.clear()
+    state.out.emit({"content_bytes_freed": freed},
+                   lambda: click.echo(f"Cleared the cache{f' ({_size(freed)} of content)' if freed else ''}"))
+
+
+@cache_group.command("verify")
+@click.argument("path", required=False, default="")
+@pass_state
+@handles_errors
+def cache_verify(state: State, path: str) -> None:
+    """Check the caches against the server and drop what disagrees."""
+    history = state.session.history.verify(path)
+    content = state.session.content.verify()
+    result = {"history_dropped": history, "content_checked": content.checked,
+              "content_removed": list(content.removed)}
+    state.out.emit(result, lambda: click.echo(
+        f"History: {history} entry(ies) dropped. Content: {content.checked} file(s) checked, "
+        f"{len(content.removed)} removed"))
+
+
 # --- doctor -------------------------------------------------------------------
 
 _STATUS_MARK = {"ok": ("ok  ", "green"), "warn": ("warn", "yellow"), "fail": ("FAIL", "red"), "skip": ("skip", None)}

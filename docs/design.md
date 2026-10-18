@@ -730,6 +730,18 @@ Notes:
   to a branch, is stored once and never downloaded twice. Content comes from
   `p4 print -o`, which does not change the workspace.
 
+*As built (phase 5):* `ContentCache` (`deda.clio.content`, `session.content`)
+is a folder under Clio's cache folder (`.../clio/content`) named
+`<digest>-<size><extension>`, filled with `p4 print -o` and checked against the
+digest (text files with `\r\n` counted as `\n`, as in §10.8). Identical content is
+stored once. It is size-limited by `content_cache_mb` and evicts the least
+recently used files down to 90% of the limit. `get_many` fetches several
+revisions in parallel; one that cannot be fetched is reported on its own.
+`clio cache verify` re-hashes the content files and, for history, asks the
+server (`p4 files -a`, 200 files per command) whether every cached revision
+still exists, dropping the entries that disagree; `clio cache clear` empties
+both. Folder activity is not verified, only cleared.
+
 **HistoryCache data model (sketch).** Shown as tables, but held in memory
 for the MVP. The same shape would become the schema of a persistent store.
 

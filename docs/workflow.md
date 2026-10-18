@@ -71,6 +71,7 @@ clio --project imagine status
 | `cross_branch_locks` | On lock, someone has the file open in a related branch: `warn`, `block` or `off` | `warn` |
 | `connect_timeout`, `timeout` | Seconds to reach the server, and per command | 10, 120 |
 | `hooks` | Built-in checks to run before a save: `no-absolute-paths`, `naming` (a list, or comma-separated text) | none |
+| `content_cache_mb` | Size limit of the cache of file content shown in UIs, in MB | 5120 |
 | `naming_pattern` | Regular expression that every new file name must match (the `naming` check) | |
 
 ## The command line
@@ -95,6 +96,8 @@ clio history props/crate/crate.ma # versions of a file
 clio activity props               # recent changes in a folder
 clio login | logout | whoami
 clio doctor                       # is this machine set up well? (see below)
+clio cache clear [--history|--content]   # forget cached history, delete cached file content
+clio cache verify [PATH]          # drop cached entries the server no longer agrees with
 ```
 
 `save` finds what you changed under the paths you give (new, edited and

@@ -253,6 +253,34 @@ class History:
         """Called after a save: the next read re-checks affected entries."""
         self.cache.mark_stale(depot_paths)
 
+    def verify(self, path: str = "") -> int:
+        """Check cached file histories against the server and drop the ones
+        that disagree (a revision was obliterated), so the next read fetches
+        them again. History is cached as if it never changed (design doc
+        §9.2); this is the check for the exceptions. One ``p4 files`` per 200
+        files. ``path`` limits it to a folder. Returns the number dropped.
+        Folder activity is not checked: ``refresh()`` clears it."""
+        prefix = self._session.paths.depot_path(path.strip("/")) if path else self._session.paths.depot_root
+        cache = self.cache
+        with cache.lock:
+            wanted = {depot: {r.rev for r in entry.items} for depot, entry in cache.files.items()
+                      if entry.items and depot.startswith(prefix)}
+        dropped = 0
+        depots = list(wanted)
+        for start in range(0, len(depots), 200):
+            chunk = depots[start:start + 200]
+            result = self._session.backend.run("files", ["-a", *(f"{d}#1,#{max(wanted[d])}" for d in chunk)])
+            present: dict[str, set[int]] = {}
+            for rec in result.records:
+                if "depotFile" in rec and "rev" in rec:
+                    present.setdefault(rec["depotFile"], set()).add(int(rec["rev"]))
+            with cache.lock:
+                for depot in chunk:
+                    if wanted[depot] - present.get(depot, set()):
+                        cache.files.pop(depot, None)
+                        dropped += 1
+        return dropped
+
     def refresh(self) -> None:
         """Forget everything cached for this server and user."""
         cache = self.cache

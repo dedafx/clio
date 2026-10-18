@@ -79,6 +79,8 @@ class Config:
     #: Built-in validation hooks to run before a save (``no-absolute-paths``,
     #: ``naming``; see ``deda.clio.hooks``). Hooks from entry points always run.
     hooks: tuple[str, ...] = ()
+    #: Size limit of the content cache (file bytes fetched for display), in MB.
+    content_cache_mb: int = 5120
     #: Regular expression every new file name must match (the ``naming`` hook).
     naming_pattern: str = ""
     #: Where each setting came from, for ``clio doctor`` style reports.
