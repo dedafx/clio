@@ -62,6 +62,8 @@ class Session:
         self.close()
 
     def close(self) -> None:
+        if (pipeline := self.__dict__.get("pipeline")) is not None:
+            pipeline.close()
         with self._lock:
             executor, self._executor = self._executor, None
         if executor:
@@ -110,6 +112,16 @@ class Session:
         from deda.clio.hooks import HookRegistry
 
         return HookRegistry()
+
+    @cached_property
+    def pipeline(self):  # -> deda.clio.views._pipeline.RequestPipeline
+        """The request pipeline that view models share (design doc §9.5)."""
+        from deda.clio.views import _handlers
+        from deda.clio.views._pipeline import RequestPipeline
+
+        pipeline = RequestPipeline()
+        _handlers.install(pipeline, self)
+        return pipeline
 
     @cached_property
     def content(self):  # -> deda.clio.content.ContentCache

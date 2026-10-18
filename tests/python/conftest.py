@@ -110,6 +110,10 @@ def isolated_config(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytes
     home = tmp_path_factory.mktemp("config")
     monkeypatch.delenv("CLIO_SITE_CONFIG", raising=False)
     monkeypatch.setenv("CLIO_USER_CONFIG", os.fspath(home / "config.toml"))
+    # Clio's cache folder (content cache, locks, the default version store) is
+    # the test's own, so a cached file from another run cannot hide a fetch.
+    monkeypatch.setenv("LOCALAPPDATA", os.fspath(home / "local"))
+    monkeypatch.setenv("XDG_CACHE_HOME", os.fspath(home / "cache"))
     for name in ("P4CLIENT", "P4CONFIG", "P4USER", "P4PORT"):
         monkeypatch.delenv(name, raising=False)
 

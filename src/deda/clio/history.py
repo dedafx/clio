@@ -52,6 +52,12 @@ class HistoryCache:
         self.lock = threading.RLock()
         self.files: OrderedDict[str, _Entry[Revision]] = OrderedDict()
         self.scopes: OrderedDict[str, _Entry[Change]] = OrderedDict()
+        #: Folder listings for file list views: scope -> (fstat records by
+        #: depot path, when they were fetched). Volatile data (§9.2).
+        self.listings: OrderedDict[str, tuple[dict[str, dict[str, str]], float]] = OrderedDict()
+        #: Who submitted a revision: immutable, kept for the process (§9.2).
+        self.revisions: OrderedDict[tuple[str, int], Revision] = OrderedDict()
+        self.max_revisions = 20000
 
     @classmethod
     def for_server(cls, server_id: str, user: str) -> HistoryCache:
@@ -74,6 +80,13 @@ class HistoryCache:
                 table.move_to_end(key)
             return entry
 
+    def remember_revision(self, revision: Revision) -> None:
+        with self.lock:
+            self.revisions[(revision.depot_path, revision.rev)] = revision
+            self.revisions.move_to_end((revision.depot_path, revision.rev))
+            while len(self.revisions) > self.max_revisions:
+                self.revisions.popitem(last=False)
+
     def mark_stale(self, depot_paths: Iterable[str]) -> None:
         """Files changed by this process: re-check them (and folders above
         them) on next use, without waiting for the polling interval."""
@@ -82,6 +95,9 @@ class HistoryCache:
             for path in paths:
                 if path in self.files:
                     self.files[path].checked_at = 0.0
+            for scope in list(self.listings):  # listings show heads and locks: re-ask
+                if any(p.startswith(scope.removesuffix("...")) for p in paths):
+                    del self.listings[scope]
             for scope, entry in self.scopes.items():
                 prefix = scope.removesuffix("...")
                 if any(p.startswith(prefix) for p in paths):
@@ -287,3 +303,5 @@ class History:
         with cache.lock:
             cache.files.clear()
             cache.scopes.clear()
+            cache.listings.clear()
+            cache.revisions.clear()

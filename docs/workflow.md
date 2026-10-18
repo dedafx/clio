@@ -258,8 +258,49 @@ asset path, a depot path and a local path.
 and `p4_messages`: `AuthError`, `ServerUnavailableError`,
 `LockedByOtherError` (`path`, `user`, `workspace`), `OutOfDateError`
 (`paths`), `NothingToSaveError`, `ServerPolicyError` (`change`),
-`CancelledError`, `ConfirmationRequiredError`, `NotInWorkspaceError`.
+`CancelledError`, `ConfirmationRequiredError`, `NotInWorkspaceError`,
+`ManifestError` (`problems`) and `ValidationError` (`problems`, `issues`).
 Perforce warnings such as "file(s) up-to-date" are never raised.
+
+### For user interfaces: `deda.clio.views`
+
+A file browser or a history panel should not call the server for every row.
+The view models in `deda.clio.views` do the batching for you. They have no
+Qt dependency but map directly onto a `QAbstractItemModel`: `len(view)`,
+`view[row]`, and signals.
+
+```python
+from deda.clio.views import FileListView, HistoryView
+
+files = FileListView(s, "props/crate", columns=("version", "state", "locked_by", "changed_by", "changed_at"))
+files.rows_changed.connect(on_rows_changed)   # (first, last) -- on a worker thread
+files.reset.connect(on_reset)                 # the set of rows changed
+files.set_visible_range(0, 40)                # only these rows are asked for, if stale
+row = files[3]    # FileRow: asset_path, version ("v12 of 14"), state, locked_by, size, freshness, ...
+
+hist = HistoryView(s, "props/crate/crate.ma", page_size=20)
+hist.rows_inserted.connect(on_inserted)       # (first, last): newer at the top, older at the end
+hist.fetch_more()                             # the next, older page, when the user scrolls
+path = hist.content(2).result()               # that revision's bytes, in the content cache
+```
+
+* **One call opens a folder.** The whole folder is listed with one `fstat`,
+  and kept, so a second view of the same folder has its rows at once.
+* **Rows say how fresh they are** (`FRESH`, `STALE`, or the view is
+  `LOADING`), so the UI can show a quiet "updating" mark and never block.
+  A row is fresh for `volatile_ttl` seconds (20); `set_visible_range` asks
+  again for the visible rows that are older, in one request however many there
+  are, and prefetches the rows just below. Requests for rows that scrolled away
+  before they started are dropped.
+* **Nothing runs on the UI thread.** Signal slots run on a worker thread; a
+  Qt UI connects them to a queued signal.
+* **`start_polling()`** checks for news every `poll_interval` seconds while
+  the view is visible (`set_visible(False)` pauses it).
+* **Display only.** Lock, save and get ask the server themselves; a cached
+  row is never used to decide anything.
+* A history revision's file bytes come from the **content cache**
+  (`s.content`, `content_cache_mb`), fetched once per machine and never
+  into your workspace. `clio cache clear` empties it.
 
 **Background work and events.** `s.submit_bg(ws.get, "environments/forest")`
 runs a call on a worker thread and returns a future; each thread uses its

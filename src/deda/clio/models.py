@@ -228,6 +228,7 @@ class Draft:
 class Freshness(Enum):
     FRESH = "fresh"  # checked against the server within the polling interval
     STALE = "stale"  # from the cache, not re-checked (the server was not asked)
+    LOADING = "loading"  # nothing yet: the first answer is on its way
 
 
 @dataclass(frozen=True, slots=True)

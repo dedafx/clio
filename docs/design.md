@@ -875,6 +875,30 @@ Each result carries **freshness** (`FRESH`, `STALE` with its age, or
    come back as events, which the consumer marshals to its UI thread (in Qt,
    a queued signal).
 
+*As built (phase 5):* `deda.clio.views`.
+
+* **`RequestPipeline`** (`session.pipeline`) implements the five steps above:
+  a 30 ms window that merges requests of one kind into one batch (`fstat` for
+  rows, one `filelog -m1` for the submitters of many rows), deduplication of a
+  key that is waiting or running, priorities (visible, selected, prefetch),
+  cancellation of requests that have not started, and a few worker threads. A
+  failing batch fails only its own requests; the session closes the pipeline.
+* **`FileListView`**: one `fstat` for the folder (split folder by folder if the
+  server reports `MaxResults`/`MaxScanRows`), kept in the `HistoryCache` as a
+  listing; rows carry freshness against `volatile_ttl` (20 s);
+  `set_visible_range` asks for stale visible rows and prefetches as many below;
+  rows whose file left the server (not in the workspace and deleted at head) are
+  removed with a `reset`; `changed_by` is asked once per revision and kept
+  (immutable). `fstat -T` lists `otherOpen0..2` and `otherLock0..1`
+  explicitly, because a wildcard drops them.
+* **`HistoryView`**: the cached first page at once (stale), then the §9.4 check
+  for newer revisions; `fetch_more` loads an older page; `content(i)` goes
+  through the pipeline to the content cache.
+* Polling is a timer per view that is paused while hidden. Signals call their
+  slots on the emitting (worker) thread.
+* *Not built:* thumbnails (§9.8), the activity feed and branch views, lock
+  badges for folders other than the visible rows, a persistent cache.
+
 ### 9.6 Cached vs live: decision table
 
 | UI need | Source | Server calls |
@@ -1692,7 +1716,7 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
 | **3 — Performance** *(done)* | Stat-first disk check for `status` and `save` ([benchmarks.md](benchmarks.md#phase-3-the-disk-check-2026-10-12)); `ConnectionPool` in `clio_core`; the miss coalescer (single-flight plus a batching window for `sync`, parallel fetches of pinned versions); time-bounded resolver memo (§8.3, §10.3 "As built"). *Measured and not built:* C++ hashing, scan and diff, a persistent store and a Python status cache (see [benchmarks.md](benchmarks.md#phase-3-what-was-not-built-2026-10-18)). |
 | **4 — USD completion** *(done, CI not yet run)* | Write side: edit/add on save, refuse on another user's lock (§10.6); revision-based timestamps for `modtime` clients (§10.3); `deda.clio.usd.prepare`, `prepare_for_edit` and `finish_edit` (option A, §10.2). A Linux CI workflow builds and tests against USD 26.08 and 25.08 (`.github/workflows/ci.yml`); it has not run on GitHub yet. *Deferred:* locking a layer before it is edited (today the edit happens at save), submit hooks. |
 | **4½ — Version manifests** *(done)* | `Manifest` create/save/load/fetch/check/diff (§10.8), `manifest=` context setting, content-addressed pool, `clio usd manifest` CLI, farm guide (proxy + `policy=verify`, [usd.md](usd.md#rendering-on-a-farm-version-manifests)). *Deferred:* shelves for unsubmitted work, expression variables. |
-| **5 — Ecosystem** | UI view models (`FileListView`, `HistoryView`) with the request pipeline, ContentCache (§9.5), asset resolver plugins, validation hooks, `clio doctor`. Dedaverse/DCC integration when targeted. |
+| **5 — Ecosystem** *(mostly done)* | *Done:* `clio doctor` and `clio doctor --typemap` (§8.5); validation hooks, `deda.clio.hooks` (§14); ContentCache and `clio cache clear/verify` (§9.3); view models `FileListView` and `HistoryView` over a coalescing, deduplicating, prioritized, cancellable `RequestPipeline` (§9.5). *Left:* asset resolver plugins (`deda.clio.resolvers`, waits for open question 6: what an asset is to Dedaverse/Imagine), activity-feed and branch view models, thumbnails (§9.8), Dedaverse/DCC integration when targeted. |
 
 ### Backlog
 

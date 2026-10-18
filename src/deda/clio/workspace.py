@@ -89,6 +89,33 @@ def _size_is_suspect(head_type: str, depot_size: int | None, local_size: int) ->
     return False
 
 
+def file_state(rec: dict[str, str]) -> FileState | None:
+    """Where a file stands, from one ``fstat`` record (no disk check). None
+    for a file that was deleted at the head and is not in the workspace."""
+    action = rec.get("action")
+    have, head = _int(rec.get("haveRev")), _int(rec.get("headRev"))
+    deleted_at_head = rec.get("headAction") in _DELETED_AT_HEAD
+    if action:
+        return _OPENED_STATE.get(action, FileState.EDITING)
+    if deleted_at_head and have is None:
+        return None
+    if have is None:
+        return FileState.MISSING
+    if deleted_at_head or have != head:
+        return FileState.OUT_OF_DATE
+    return FileState.SYNCED
+
+
+def locked_by_other(rec: dict[str, str]) -> str | None:
+    """Who else holds a lock on the file, from one ``fstat`` record: an
+    explicit lock, or the exclusive open that a ``+l`` file type takes."""
+    if "otherLock" in rec:
+        return next(iter(_others(rec, "otherLock")), None) or "someone"
+    if "+l" in rec.get("headType", "") and _others(rec, "otherOpen"):
+        return _others(rec, "otherOpen")[0]
+    return None
+
+
 def _int(value: str | None) -> int | None:
     return int(value) if value not in (None, "", "none") else None
 
@@ -585,24 +612,11 @@ class Workspace:
         records = [r for r in self._run("fstat", ["-Ol", *specs]).records if r.get("depotFile")]
         for rec in records:
             depot = rec["depotFile"]
-            action = rec.get("action")
             have, head = _int(rec.get("haveRev")), _int(rec.get("headRev"))
-            deleted_at_head = rec.get("headAction") in _DELETED_AT_HEAD
-            if action:
-                state = _OPENED_STATE.get(action, FileState.EDITING)
-            elif deleted_at_head and have is None:
+            state = file_state(rec)
+            if state is None:
                 continue
-            elif have is None:
-                state = FileState.MISSING
-            elif deleted_at_head or have != head:
-                state = FileState.OUT_OF_DATE
-            else:
-                state = FileState.SYNCED
-            locked_by = None
-            if "otherLock" in rec:
-                locked_by = next(iter(_others(rec, "otherLock")), None) or "someone"
-            elif "+l" in rec.get("headType", "") and _others(rec, "otherOpen"):
-                locked_by = _others(rec, "otherOpen")[0]
+            locked_by = locked_by_other(rec)
             asset = self._asset(depot)
             statuses[depot] = FileStatus(
                 asset, depot, s.paths.local_path(asset), state, have, head, _int(rec.get("headChange")),

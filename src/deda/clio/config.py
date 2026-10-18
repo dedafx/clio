@@ -67,6 +67,9 @@ class Config:
     parallel_min_files: int = 8
     #: How long history and activity stay fresh before a cheap server check.
     poll_interval: float = 30.0
+    #: How long a file list row (head revision, locks) stays fresh before it
+    #: is asked for again, in seconds (design doc §9.2, "volatile").
+    volatile_ttl: float = 20.0
     #: Where ``discard`` copies files before reverting them.
     backup_dir: str = ""
     #: On lock, what to do when someone has the same file open in a related
