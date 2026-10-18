@@ -27,6 +27,19 @@ enum class FetchResult {
     KeptExisting, ///< Fetched, but an existing stored copy could not be replaced and was kept.
 };
 
+/// What to do before a file in the workspace is written (design doc §10.6).
+struct WriteCheck {
+    bool allowed = true;
+    /// Why the write is refused (for example "locked by sam"), when not allowed.
+    std::string whyNot;
+    /// Something the user should know although the write may go ahead, for
+    /// example that the local copy is not the latest version.
+    std::string warning;
+    /// The file is not in Perforce. Call Workspace::addNewFile() after
+    /// writing it.
+    bool isNew = false;
+};
+
 /// Maps clio: identifiers to depot and local paths, and runs the Perforce
 /// operations that put files on disk.
 ///
@@ -69,6 +82,22 @@ public:
     /// file. Stored files are made read-only, so nothing edits a version in
     /// place.
     FetchResult fetchVersion(const AssetIdentifier& id, const Pin& pin);
+
+    /// Make a workspace file ready to be written: open it for edit (which
+    /// also locks it when its file type is exclusive, +l), or refuse before
+    /// anything is lost if someone else holds the lock. A file that is not
+    /// in Perforce is allowed and reported as `isNew`. Never submits.
+    /// Two commands at most (`fstat`, `edit`), however often it is called
+    /// for a file that is already open. Throws P4Error if the server cannot
+    /// be reached.
+    WriteCheck prepareForWrite(const AssetIdentifier& id);
+
+    /// `p4 add` a file that was new when prepareForWrite() looked at it and
+    /// has been written since. Returns a warning for the user, or an empty
+    /// string if the file was opened for add (or was already open). A file
+    /// that was not written is skipped. Throws P4Error if the server cannot
+    /// be reached.
+    std::string addNewFile(const AssetIdentifier& id);
 
     /// The version-store folder name for this server: the effective P4PORT
     /// (configured, or from the Perforce environment), encoded reversibly as

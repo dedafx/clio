@@ -16,7 +16,7 @@ built and why, see [building.md](building.md) and [design.md](design.md) §10.
 
 > **Status: v0.1 scaffold.** Reading works: latest, have, change and label
 > pins, with fallback to local files, and many missing files are fetched
-> together. Saving layers back to Perforce is not done yet. See
+> together. Saving a layer opens it for edit in Perforce. See
 > [Current limitations](#current-limitations).
 
 Supported: Python 3.13, and OpenUSD 26.08 and 25.08 (both tested), plus
@@ -252,6 +252,34 @@ process; if it is invalid, USD prints one warning and Clio stays off.
 Answers that came from a fallback are not remembered, so the exact version
 is fetched as soon as the server is reachable again.
 
+### Saving layers
+
+When you save a layer inside the project (`layer.Save()`, or a DCC's save),
+Clio gets the file ready first, so the save works like it does for any
+other Perforce file:
+
+* **An existing file is opened for edit** (`p4 edit`). A file type with an
+  exclusive lock (`+l`) is locked by that.
+* **A new file is added** to Perforce right after USD has written it.
+* **A file someone else has locked is refused before anything is
+  written.** The save fails with the reason, for example
+  `assets/crate/crate.usda is locked by sam (workspace sam_ws)`, and your
+  file on disk is not touched.
+* **A stored version cannot be saved over** (a file in the version store, from
+  a `@change`, `@label` or `#rev` pin). Save to the workspace instead.
+* If your copy is not the latest version, the save goes ahead and Clio
+  warns you. Get the latest version and merge it before you submit.
+
+Saving never submits. Submit with `clio save` (or `Workspace.save`), as for
+any other file. With the `verify` and `offline` policies Clio does not touch
+Perforce, and if the server cannot be reached the file is saved locally with
+a warning, so a dead network never loses an artist's work. Without a Clio
+context, saving is plain USD.
+
+Because Sdf asks `PermissionToSave` as a plain question (it passes no
+reason and may ask often), Clio answers it without contacting the server;
+the lock check and the edit happen when the file is opened for writing.
+
 ### Opening a big stage
 
 USD loads layers on many threads, so a stage can ask for hundreds of missing
@@ -361,17 +389,13 @@ assert Plug.Registry().GetPluginWithName("clioUsd").isLoaded
 
 ## Current limitations
 
-1. **Saving layers does not check out files.** USD writes to the local
-   file. Clio does not run `p4 edit`, take a lock or add new files yet
-   (design §10.6). With Perforce's default workspace options, synced files
-   are read-only, so check them out with `p4 edit` before saving.
-2. **Clio is the primary resolver.** Only one primary resolver can be
+1. **Clio is the primary resolver.** Only one primary resolver can be
    active in a process, so Clio cannot yet be combined with another
    custom resolver (for example a DCC's or a studio's). No DCCs are
    targeted yet.
-3. **Pins apply to the whole stage.** Layers cannot hold a pin on a single
+2. **Pins apply to the whole stage.** Layers cannot hold a pin on a single
    path (see [Choosing a version](#choosing-a-version-pins)).
-4. **Project-rooted search paths may cost one server call per probe.**
+3. **Project-rooted search paths may cost one server call per probe.**
    USD first looks for `assets/x.usda` next to the current layer. If that
    location is inside the project, Clio asks the server once, and
    remembers a "not found" answer until refresh. Relative paths avoid

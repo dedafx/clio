@@ -1173,7 +1173,7 @@ symbol.
 |---|---|
 | `_CreateIdentifier` | Inherited from `ArDefaultResolver`: USD's usual anchoring of relative paths and search paths. |
 | `_Resolve` | If a Clio context is bound and the path is inside the workspace root or the version store (search paths are tried under the workspace root), fetch it through `clio_core` at the pin and return the local file. Otherwise, or if Clio cannot provide it, `ArDefaultResolver::_Resolve`. *(Phase 3: threads share one fetch per file, and misses within a short window become one `sync`; see §10.3.)* |
-| `_ResolveForNewAsset` / `_CanWriteAssetToPath` / `_OpenAssetForWrite` | *Planned (phase 4); inherited today, so saving writes the local file only.* When a layer is saved: runs `p4 edit` (with lock for `+l` types) or `p4 add` in the artist's pending change, or refuses with `whyNot` ("locked by Sam"). Never submits (§10.6). |
+| `_ResolveForNewAsset` / `_CanWriteAssetToPath` / `_OpenAssetForWrite` | *Phase 4, write side as built in §10.6.* When a layer is saved: runs `p4 edit` (with lock for `+l` types) or `p4 add` in the artist's pending change, or refuses with `whyNot` ("locked by Sam"). Never submits (§10.6). |
 | `_IsContextDependentPath` | `true` for project paths while a Clio context is bound, because they resolve to a different file for each pin. Sdf then looks layers up by resolved path, so stages opened at different pins in one process never share a layer. Otherwise inherited. |
 | `_CreateDefaultContext[ForAsset]`, `_CreateContextFromString` | The default resolver's context, plus a `ClioResolverContext` from `$CLIO_RESOLVER_CONTEXT` if set. `CreateContextFromString(settings)` builds a Clio context when the string contains `=`, otherwise the default resolver's search-path context. |
 | `_GetAssetInfo` | Fills `assetName` (project path), `version` (the pin, for example `@18234`) and `resolverInfo` (`depotPath`, `pin`), with no server calls, so DCC UIs can show "crate.usd @18234". *(Planned: the revision number and digest.)* |
@@ -1291,6 +1291,25 @@ When USD saves a layer from a DCC, the resolver's write hooks let Clio:
   (`_CanWriteAssetToPath` with a `whyNot` message);
 * never submit. Saving a layer is a local action. Submitting stays an
   explicit Clio `save`.
+
+**As built (phase 4).** `AssetResolver::prepareForWrite` (clio_core) does
+the work: `fstat` the file; if it is already open here, nothing more; if it
+is not in Perforce (or deleted at head) it is `isNew`; if another client holds
+a lock (`otherLock`, or an exclusive-open `+l` type) the write is refused with
+`<path> is locked by <user> (workspace <client>)`; if it is not in this
+workspace the write is refused ("get it first"); otherwise `p4 edit`, with a
+warning when the copy is not the head revision. `finishWrite` runs `p4 add`
+for a new file after it was written. At most two commands, under the
+workspace lock. The `verify` and `offline` policies do nothing, and an
+unreachable server allows the write with a warning (Clio is an enhancement,
+not a barrier).
+
+Sdf asks `_CanWriteAssetToPath` as a query (`SdfLayer::PermissionToSave`
+passes no `whyNot` and may call it often), so the plugin answers it locally
+(stored versions only) and does the Perforce work in `_OpenAssetForWrite`,
+which runs before the file is touched. A refusal there is a runtime error
+with the reason, and the layer on disk is unchanged. A wrapper around the
+default writable asset runs `finishWrite` when the asset is closed.
 
 Under option A (no plugin), the same behaviour is available as
 `clio_usd.prepare_for_edit(layer_paths)`, which DCC integrations call from

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 
+#include <algorithm>
 #include <atomic>
 #include <system_error>
 
@@ -204,6 +205,36 @@ std::optional<Pin> pinFromDirName(const std::string& name) {
     return std::nullopt;
 }
 
+bool deletedAtHead(const p4::Record& record) {
+    const auto it = record.find("headAction");
+    return it != record.end() &&
+           (it->second == "delete" || it->second == "move/delete" || it->second == "purge" ||
+            it->second == "archive");
+}
+
+// Values of a numbered tagged field: otherOpen0, otherOpen1, ... or, with
+// one holder, the field itself.
+std::vector<std::string> numberedField(const p4::Record& record, const std::string& name) {
+    std::vector<std::string> values;
+    for (int i = 0;; ++i) {
+        const auto it = record.find(name + std::to_string(i));
+        if (it == record.end()) {
+            break;
+        }
+        values.push_back(it->second);
+    }
+    return values;
+}
+
+// "sam@sam_ws" -> "sam (workspace sam_ws)"
+std::string holderText(const std::string& userAtClient) {
+    const auto at = userAtClient.find('@');
+    if (at == std::string::npos) {
+        return userAtClient;
+    }
+    return userAtClient.substr(0, at) + " (workspace " + userAtClient.substr(at + 1) + ")";
+}
+
 } // namespace
 
 Workspace::Workspace(Settings settings)
@@ -300,6 +331,82 @@ p4::CommandResult Workspace::sync(const std::vector<AssetIdentifier>& ids, const
     // workspace; serialize with them too.
     FileLock workspaceLock(lockPath());
     return _pool.runOrThrow("sync", args);
+}
+
+WriteCheck Workspace::prepareForWrite(const AssetIdentifier& id) {
+    const std::string depot = depotPath(id);
+    const std::filesystem::path local = workspacePath(id);
+
+    std::lock_guard<std::mutex> lock(_syncMutex);
+    FileLock workspaceLock(lockPath());
+
+    const auto fstat = _pool.runOrThrow("fstat", {depot});
+    const p4::Record* record = fstat.records.empty() ? nullptr : &fstat.records.front();
+
+    WriteCheck check;
+    if (record && record->count("action")) {
+        return check; // already open in this workspace: nothing to do
+    }
+    if (!record || deletedAtHead(*record)) {
+        check.isNew = true;
+        return check;
+    }
+
+    // Someone else's lock: an explicit one, or the exclusive open that a +l
+    // file type takes.
+    std::string holder;
+    if (record->count("otherLock")) {
+        const auto locks = numberedField(*record, "otherLock");
+        const auto opens = numberedField(*record, "otherOpen");
+        holder = !locks.empty() ? locks.front() : (!opens.empty() ? opens.front() : "another user");
+    } else if (record->count("headType") && record->at("headType").find("+l") != std::string::npos) {
+        const auto opens = numberedField(*record, "otherOpen");
+        if (!opens.empty()) {
+            holder = opens.front();
+        }
+    }
+    if (!holder.empty()) {
+        check.allowed = false;
+        check.whyNot = id.path() + " is locked by " + holderText(holder);
+        return check;
+    }
+
+    if (!record->count("haveRev")) {
+        check.allowed = false;
+        check.whyNot = id.path() + " is in Perforce but not in your workspace; get it before changing it";
+        return check;
+    }
+    if (record->count("headRev") && record->at("headRev") != record->at("haveRev")) {
+        check.warning = id.path() + ": your copy is not the latest version";
+    }
+
+    const auto edit = _pool.run("edit", {local.string()});
+    const bool opened = std::any_of(edit.records.begin(), edit.records.end(),
+                                    [](const p4::Record& r) { return r.count("action") > 0; });
+    if (!opened) {
+        check.allowed = false;
+        check.whyNot = "Perforce did not open " + id.path() + " for edit";
+        if (edit.hasErrors()) {
+            check.whyNot += ": " + edit.errorText();
+        }
+    }
+    return check;
+}
+
+std::string Workspace::addNewFile(const AssetIdentifier& id) {
+    const std::filesystem::path local = workspacePath(id);
+    std::error_code ec;
+    if (!std::filesystem::exists(local, ec)) {
+        return {}; // the write did not happen
+    }
+    std::lock_guard<std::mutex> lock(_syncMutex);
+    FileLock workspaceLock(lockPath());
+    // -f: add even if the file name has characters Perforce would warn about.
+    const auto add = _pool.run("add", {"-f", local.string()});
+    if (add.hasErrors()) {
+        return id.path() + " was saved but not added to Perforce: " + add.errorText();
+    }
+    return {};
 }
 
 FetchResult Workspace::fetchVersion(const AssetIdentifier& id, const Pin& pin) {

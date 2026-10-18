@@ -48,6 +48,19 @@ protected:
     ArAssetInfo _GetAssetInfo(const std::string& assetPath,
                               const ArResolvedPath& resolvedPath) const override;
 
+    // Write side (design doc §10.6). Saving a layer is a local action: Clio
+    // opens the file for edit (or for add, once it is written) and refuses a
+    // save that someone else's lock forbids. It never submits.
+    //
+    // Sdf calls _CanWriteAssetToPath as a plain question (SdfLayer::
+    // PermissionToSave, with no whyNot), so it must stay cheap and free of
+    // side effects: it only refuses stored versions. The Perforce work
+    // happens in _OpenAssetForWrite, before anything is written.
+    ArResolvedPath _ResolveForNewAsset(const std::string& assetPath) const override;
+    bool _CanWriteAssetToPath(const ArResolvedPath& resolvedPath, std::string* whyNot) const override;
+    std::shared_ptr<ArWritableAsset> _OpenAssetForWrite(const ArResolvedPath& resolvedPath,
+                                                        WriteMode writeMode) const override;
+
 private:
     /// The core resolver for the Clio context bound in this thread, or the
     /// default ($CLIO_RESOLVER_CONTEXT). Null if there is none.
@@ -60,9 +73,15 @@ private:
 
     void _WarnOnce(const std::string& assetPath, const std::string& warning) const;
 
+    /// Open `resolvedPath` for edit if it is a project file. False (with the
+    /// reason) if it must not be written. `*isNew` is set if the file is not
+    /// in Perforce yet and must be added once it is written.
+    bool _PrepareForWrite(const ArResolvedPath& resolvedPath, bool* isNew, std::string* whyNot) const;
+
     mutable std::mutex _mutex;
     mutable std::map<std::string, std::shared_ptr<clio::core::AssetResolver>> _coreResolvers;
     mutable std::set<std::string> _warned; ///< paths already warned about, until refresh
+
 };
 
 PXR_NAMESPACE_CLOSE_SCOPE

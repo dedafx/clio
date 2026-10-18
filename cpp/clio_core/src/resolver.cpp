@@ -202,6 +202,38 @@ std::filesystem::path AssetResolver::resolveForNewAsset(const AssetIdentifier& i
     return _workspace.workspacePath(id);
 }
 
+WriteCheck AssetResolver::prepareForWrite(const AssetIdentifier& id) {
+    if (settings().policy != Policy::Sync) {
+        return {};
+    }
+    const std::string notSaved = "; the file is saved locally and not opened for edit in Perforce";
+    if (!_serverAvailable()) {
+        WriteCheck check;
+        check.warning = "Perforce is not available" + notSaved;
+        return check;
+    }
+    try {
+        return _workspace.prepareForWrite(id);
+    } catch (const P4Error& e) {
+        _markServerUnavailable();
+        WriteCheck check;
+        check.warning = std::string("Perforce is not available (") + e.what() + ")" + notSaved;
+        return check;
+    }
+}
+
+std::string AssetResolver::finishWrite(const AssetIdentifier& id) {
+    if (settings().policy != Policy::Sync || !_serverAvailable()) {
+        return {};
+    }
+    try {
+        return _workspace.addNewFile(id);
+    } catch (const P4Error& e) {
+        _markServerUnavailable();
+        return id.path() + " was saved but not added to Perforce (" + e.what() + ")";
+    }
+}
+
 void AssetResolver::refresh() {
     std::lock_guard<std::mutex> lock(_memoMutex);
     _memo.clear();

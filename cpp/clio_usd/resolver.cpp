@@ -13,6 +13,9 @@
 #include <pxr/usd/ar/assetInfo.h>
 #include <pxr/usd/ar/defineResolver.h>
 #include <pxr/usd/ar/notice.h>
+#include <pxr/usd/ar/writableAsset.h>
+
+#include <functional>
 
 PXR_NAMESPACE_OPEN_SCOPE
 
@@ -54,6 +57,40 @@ bool isSearchPath(const std::string& path) {
     }
     return path.rfind("./", 0) != 0 && path.rfind("../", 0) != 0;
 }
+
+// Wraps the default writable asset so that a new file is added to Perforce
+// after it has been written and closed.
+class ClioWritableAsset final : public ArWritableAsset {
+public:
+    ClioWritableAsset(std::shared_ptr<ArWritableAsset> inner, std::function<void()> onClosed)
+        : _inner(std::move(inner)), _onClosed(std::move(onClosed)) {}
+
+    ~ClioWritableAsset() override { Close(); }
+
+    bool Close() override {
+        const bool ok = _inner->Close();
+        if (!_closed) {
+            _closed = true;
+            if (ok && _onClosed) {
+                try {
+                    _onClosed();
+                } catch (...) {
+                    // Adding to Perforce is best effort; the file is saved.
+                }
+            }
+        }
+        return ok;
+    }
+
+    size_t Write(const void* buffer, size_t count, size_t offset) override {
+        return _inner->Write(buffer, count, offset);
+    }
+
+private:
+    std::shared_ptr<ArWritableAsset> _inner;
+    std::function<void()> _onClosed;
+    bool _closed = false;
+};
 
 } // namespace
 
@@ -132,6 +169,114 @@ ArResolvedPath ClioResolver::_Resolve(const std::string& assetPath) const {
         _WarnOnce(assetPath, "could not use Perforce (unknown error)");
     }
     return ArDefaultResolver::_Resolve(assetPath);
+}
+
+ArResolvedPath ClioResolver::_ResolveForNewAsset(const std::string& assetPath) const {
+    try {
+        if (const auto core = _GetCoreResolver()) {
+            const std::filesystem::path projectPath = _ProjectPath(*core, assetPath);
+            if (!projectPath.empty()) {
+                // A new file inside the project goes into the workspace.
+                return ArResolvedPath(projectPath.lexically_normal().generic_string());
+            }
+        }
+    } catch (const std::exception&) {
+    }
+    return ArDefaultResolver::_ResolveForNewAsset(assetPath);
+}
+
+bool ClioResolver::_PrepareForWrite(const ArResolvedPath& resolvedPath, bool* isNew,
+                                    std::string* whyNot) const {
+    const std::string path = resolvedPath.GetPathString();
+    try {
+        const auto core = _GetCoreResolver();
+        if (!core) {
+            return true; // no Clio context: behave like the default resolver
+        }
+        const auto match = core->workspace().matchLocalPath(path);
+        if (!match) {
+            return true; // not a project file
+        }
+        if (match->inVersionStore) {
+            if (whyNot) {
+                *whyNot = path + " is a stored version (" + (match->pin ? match->pin->str() : "") +
+                          "), which is read-only. Save to the workspace instead.";
+            }
+            return false;
+        }
+        const clio::core::WriteCheck check = core->prepareForWrite(match->id);
+        if (!check.allowed) {
+            if (whyNot) {
+                *whyNot = check.whyNot;
+            }
+            return false;
+        }
+        if (!check.warning.empty()) {
+            _WarnOnce(path, check.warning);
+        }
+        *isNew = check.isNew;
+    } catch (const std::exception& e) {
+        // Clio is an enhancement, not a barrier: let the save go ahead.
+        _WarnOnce(path, std::string("could not open for edit in Perforce: ") + e.what());
+    } catch (...) {
+        _WarnOnce(path, "could not open for edit in Perforce (unknown error)");
+    }
+    return true;
+}
+
+bool ClioResolver::_CanWriteAssetToPath(const ArResolvedPath& resolvedPath, std::string* whyNot) const {
+    if (!ArDefaultResolver::_CanWriteAssetToPath(resolvedPath, whyNot)) {
+        return false;
+    }
+    try {
+        const auto core = _GetCoreResolver();
+        const auto match = core ? core->workspace().matchLocalPath(resolvedPath.GetPathString())
+                                : std::nullopt;
+        if (match && match->inVersionStore) {
+            if (whyNot) {
+                *whyNot = "a stored version (" + (match->pin ? match->pin->str() : std::string()) +
+                          ") is read-only; save to the workspace instead";
+            }
+            return false;
+        }
+    } catch (const std::exception&) {
+    }
+    return true;
+}
+
+std::shared_ptr<ArWritableAsset> ClioResolver::_OpenAssetForWrite(const ArResolvedPath& resolvedPath,
+                                                                  WriteMode writeMode) const {
+    // The file must be writable (opened for edit) before it is opened, and a
+    // refusal must come before anything is written.
+    bool isNew = false;
+    std::string whyNot;
+    if (!_PrepareForWrite(resolvedPath, &isNew, &whyNot)) {
+        TF_RUNTIME_ERROR("clio: cannot write %s: %s", resolvedPath.GetPathString().c_str(), whyNot.c_str());
+        return nullptr;
+    }
+    auto inner = ArDefaultResolver::_OpenAssetForWrite(resolvedPath, writeMode);
+    if (!inner) {
+        return nullptr;
+    }
+
+    if (!isNew) {
+        return inner;
+    }
+    const std::string path = resolvedPath.GetPathString();
+    // The context is bound to the calling thread; the asset may be closed
+    // elsewhere, so keep the core resolver now.
+    const auto core = _GetCoreResolver();
+    if (!core) {
+        return inner;
+    }
+    return std::make_shared<ClioWritableAsset>(std::move(inner), [this, core, path] {
+        if (const auto match = core->workspace().matchLocalPath(path)) {
+            const std::string warning = core->finishWrite(match->id);
+            if (!warning.empty()) {
+                _WarnOnce(path, warning);
+            }
+        }
+    });
 }
 
 ArResolverContext ClioResolver::_CreateDefaultContext() const {

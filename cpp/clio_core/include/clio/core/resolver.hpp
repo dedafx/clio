@@ -93,6 +93,20 @@ public:
     /// server calls.
     std::filesystem::path resolveForNewAsset(const AssetIdentifier& id) const;
 
+    /// Get a workspace file ready to be written (design doc §10.6): open it
+    /// for edit, or refuse before anything is lost when someone else holds
+    /// the lock. Never submits.
+    ///
+    /// Clio is an enhancement, not a barrier: with the verify and offline
+    /// policies the server is not contacted, and if it cannot be reached the
+    /// write is allowed with a warning (the file is then saved locally, not
+    /// opened for edit). Only a lock held by someone else refuses a write.
+    WriteCheck prepareForWrite(const AssetIdentifier& id);
+
+    /// After a file that was reported `isNew` has been written: open it for
+    /// add. Returns a warning, or an empty string.
+    std::string finishWrite(const AssetIdentifier& id);
+
     /// Forget remembered results, so the next resolve checks again. Also
     /// retries a server that was unavailable.
     void refresh();
