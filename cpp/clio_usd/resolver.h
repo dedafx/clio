@@ -56,6 +56,9 @@ protected:
     // PermissionToSave, with no whyNot), so it must stay cheap and free of
     // side effects: it only refuses stored versions. The Perforce work
     // happens in _OpenAssetForWrite, before anything is written.
+    ArTimestamp _GetModificationTimestamp(const std::string& assetPath,
+                                          const ArResolvedPath& resolvedPath) const override;
+
     ArResolvedPath _ResolveForNewAsset(const std::string& assetPath) const override;
     bool _CanWriteAssetToPath(const ArResolvedPath& resolvedPath, std::string* whyNot) const override;
     std::shared_ptr<ArWritableAsset> _OpenAssetForWrite(const ArResolvedPath& resolvedPath,

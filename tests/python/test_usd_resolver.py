@@ -409,3 +409,44 @@ def test_a_save_goes_ahead_with_a_warning_when_perforce_is_unavailable(p4_server
     assert result["saved"]
     assert "Perforce is not available" in stderr
     assert "Written" in crate.read_text()
+
+
+_TIMESTAMP_SCRIPT = textwrap.dedent(
+    """
+    import json, sys
+    from pxr import Ar
+
+    settings, path = sys.argv[1:3]
+    resolver = Ar.GetResolver()
+    with Ar.ResolverContextBinder(resolver.CreateContextFromString(settings)):
+        stamp = resolver.GetModificationTimestamp(path, Ar.ResolvedPath(path))
+        print(json.dumps({"time": stamp.GetTime() if stamp.IsValid() else None}))
+    """
+)
+
+
+def _timestamp(settings: str, path: Path, plugin: Path):
+    out = subprocess.run([sys.executable, "-c", _TIMESTAMP_SCRIPT, settings, os.fspath(path)],
+                         env=_env(plugin), capture_output=True, text=True, check=False)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout.strip().splitlines()[-1])["time"]
+
+
+def _set_client_options(server, options: str) -> None:
+    spec = (f"Client: clio_test_ws\nOwner: clio_tester\nRoot: {server.workspace_root}\n"
+            f"Options: {options}\nLineEnd: local\nView:\n\t//depot/proj/... //clio_test_ws/...\n")
+    server.connection().run_or_throw("client", ["-i"], spec)
+
+
+def test_modtime_client_timestamp_is_the_workspace_revision(p4_server):
+    resources = _plugin_resources()
+    _submit_v1_v2(p4_server)  # crate.usda is at revision 2
+    crate = p4_server.workspace_root / "assets/crate/crate.usda"
+
+    # The default test client has nomodtime: the file's own time is used.
+    assert _timestamp(p4_server.settings_text(), crate, resources) == pytest.approx(crate.stat().st_mtime, abs=1)
+
+    _set_client_options(p4_server, "allwrite noclobber nocompress unlocked modtime rmdir")
+    assert _timestamp(p4_server.settings_text(), crate, resources) == 2.0
+    p4_server.connection().run_or_throw("sync", ["-q", "//depot/proj/assets/crate/crate.usda#1"])
+    assert _timestamp(p4_server.settings_text(), crate, resources) == 1.0

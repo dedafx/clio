@@ -40,6 +40,12 @@ struct WriteCheck {
     bool isNew = false;
 };
 
+/// Which revision of a file the workspace has, and whether it is open.
+struct HaveInfo {
+    long haveRev = 0;
+    bool opened = false; ///< open for edit, add or delete here: the local file may differ
+};
+
 /// Maps clio: identifiers to depot and local paths, and runs the Perforce
 /// operations that put files on disk.
 ///
@@ -99,6 +105,16 @@ public:
     /// be reached.
     std::string addNewFile(const AssetIdentifier& id);
 
+    /// The workspace's revision of a file (`fstat`), or nullopt if the file
+    /// is not in the workspace. Throws P4Error if the server cannot be reached.
+    std::optional<HaveInfo> haveInfo(const AssetIdentifier& id);
+
+    /// True if the client has the `modtime` option, so that synced files get
+    /// the time they were last changed instead of the time of the sync. Asked
+    /// once (`p4 client -o`) and remembered. Throws P4Error if the server
+    /// cannot be reached.
+    bool clientUsesModtime();
+
     /// The version-store folder name for this server: the effective P4PORT
     /// (configured, or from the Perforce environment), encoded reversibly as
     /// a folder name (a long port is shortened with a hash).
@@ -118,6 +134,8 @@ private:
 
     Settings _settings;
     std::mutex _syncMutex;
+    std::mutex _modtimeMutex;
+    std::optional<bool> _usesModtime;
     p4::ConnectionPool _pool;
     std::string _serverKey;
 };

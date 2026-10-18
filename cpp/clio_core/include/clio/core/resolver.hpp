@@ -111,6 +111,18 @@ public:
     /// retries a server that was unavailable.
     void refresh();
 
+    /// A change marker for the file at `localPath`, for USD's
+    /// GetModificationTimestamp (design doc §10.3): the workspace's revision
+    /// number. It is for the one case where the file's own modification time
+    /// cannot tell revisions apart: a client with the `modtime` option, where
+    /// synced files keep the time they were last changed, so two revisions
+    /// can have the same time. Nullopt means "use the file's modification
+    /// time": the path is not a workspace file, the policy does not allow the
+    /// server, the client does not use `modtime`, the file is open for edit
+    /// (the local file may differ from the revision), or the server could not
+    /// be asked.
+    std::optional<double> revisionTimestamp(const std::filesystem::path& localPath);
+
     /// How many `sync` commands the coalescer has run. For tests and
     /// diagnostics: many misses at once should cost few commands.
     std::size_t syncCommandsRun() const { return _syncBatcher.batchesRun(); }
@@ -136,8 +148,15 @@ private:
         std::chrono::steady_clock::time_point expires;
     };
 
+    struct HaveEntry {
+        std::optional<HaveInfo> info;
+        std::chrono::steady_clock::time_point expires;
+    };
+
     Clock _clock;
     Workspace _workspace;
+    std::mutex _haveMutex;
+    std::unordered_map<std::string, HaveEntry> _haveCache; ///< by workspace path, for cacheTtl
     std::atomic<std::int64_t> _serverRetryAt{0}; ///< steady_clock ticks; 0 = available
     std::mutex _memoMutex;
     /// Remembered answers, including "not found" answers from the server

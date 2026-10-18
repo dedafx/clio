@@ -10,6 +10,8 @@ AssetResolver::AssetResolver(Settings settings, Clock clock)
       _syncBatcher(
           [this](const std::vector<AssetIdentifier>& ids, const Pin& pin, bool force) {
               _workspace.sync(ids, pin, force);
+              std::lock_guard<std::mutex> lock(_haveMutex);
+              _haveCache.clear(); // revisions have changed
           },
           _workspace.settings().batchWindow) {}
 
@@ -202,6 +204,43 @@ std::filesystem::path AssetResolver::resolveForNewAsset(const AssetIdentifier& i
     return _workspace.workspacePath(id);
 }
 
+std::optional<double> AssetResolver::revisionTimestamp(const std::filesystem::path& localPath) {
+    if (settings().policy != Policy::Sync || !_serverAvailable()) {
+        return std::nullopt;
+    }
+    const auto match = _workspace.matchLocalPath(localPath);
+    if (!match || match->inVersionStore) {
+        return std::nullopt; // stored versions never change; their file time is fine
+    }
+    const std::string key = match->id.path();
+    try {
+        if (!_workspace.clientUsesModtime()) {
+            return std::nullopt;
+        }
+        std::optional<HaveInfo> info;
+        bool cached = false;
+        {
+            std::lock_guard<std::mutex> lock(_haveMutex);
+            if (auto it = _haveCache.find(key); it != _haveCache.end() && _now() < it->second.expires) {
+                info = it->second.info;
+                cached = true;
+            }
+        }
+        if (!cached) {
+            info = _workspace.haveInfo(match->id);
+            std::lock_guard<std::mutex> lock(_haveMutex);
+            _haveCache[key] = HaveEntry{info, _now() + settings().cacheTtl};
+        }
+        if (!info || info->opened) {
+            return std::nullopt;
+        }
+        return static_cast<double>(info->haveRev);
+    } catch (const P4Error&) {
+        _markServerUnavailable();
+        return std::nullopt;
+    }
+}
+
 WriteCheck AssetResolver::prepareForWrite(const AssetIdentifier& id) {
     if (settings().policy != Policy::Sync) {
         return {};
@@ -211,6 +250,11 @@ WriteCheck AssetResolver::prepareForWrite(const AssetIdentifier& id) {
         WriteCheck check;
         check.warning = "Perforce is not available" + notSaved;
         return check;
+    }
+    {
+        // Opening the file for edit changes what its timestamp should be.
+        std::lock_guard<std::mutex> lock(_haveMutex);
+        _haveCache.erase(id.path());
     }
     try {
         return _workspace.prepareForWrite(id);
@@ -235,6 +279,10 @@ std::string AssetResolver::finishWrite(const AssetIdentifier& id) {
 }
 
 void AssetResolver::refresh() {
+    {
+        std::lock_guard<std::mutex> lock(_haveMutex);
+        _haveCache.clear();
+    }
     std::lock_guard<std::mutex> lock(_memoMutex);
     _memo.clear();
     _serverRetryAt.store(0);

@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
 #include <algorithm>
 #include <atomic>
@@ -407,6 +408,49 @@ std::string Workspace::addNewFile(const AssetIdentifier& id) {
         return id.path() + " was saved but not added to Perforce: " + add.errorText();
     }
     return {};
+}
+
+std::optional<HaveInfo> Workspace::haveInfo(const AssetIdentifier& id) {
+    const auto fstat = _pool.runOrThrow("fstat", {"-T", "haveRev,action", depotPath(id)});
+    if (fstat.records.empty()) {
+        return std::nullopt;
+    }
+    const p4::Record& record = fstat.records.front();
+    const auto have = record.find("haveRev");
+    if (have == record.end() || have->second.empty() || have->second == "none") {
+        return std::nullopt;
+    }
+    HaveInfo info;
+    info.haveRev = std::strtol(have->second.c_str(), nullptr, 10);
+    info.opened = record.count("action") > 0;
+    return info;
+}
+
+bool Workspace::clientUsesModtime() {
+    std::lock_guard<std::mutex> lock(_modtimeMutex);
+    if (!_usesModtime) {
+        const auto spec = _pool.runOrThrow("client", {"-o"});
+        bool uses = false;
+        if (!spec.records.empty()) {
+            const auto options = spec.records.front().find("Options");
+            if (options != spec.records.front().end()) {
+                // "allwrite noclobber nocompress unlocked modtime rmdir": a
+                // whole word, because "nomodtime" contains "modtime".
+                const std::string& text = options->second;
+                std::size_t at = 0;
+                while ((at = text.find("modtime", at)) != std::string::npos) {
+                    const bool wordStart = at == 0 || text[at - 1] == ' ';
+                    const bool wordEnd = at + 7 == text.size() || text[at + 7] == ' ';
+                    if (wordStart && wordEnd) {
+                        uses = true;
+                    }
+                    at += 7;
+                }
+            }
+        }
+        _usesModtime = uses;
+    }
+    return *_usesModtime;
 }
 
 FetchResult Workspace::fetchVersion(const AssetIdentifier& id, const Pin& pin) {

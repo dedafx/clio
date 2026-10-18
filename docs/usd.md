@@ -330,6 +330,13 @@ Ar.GetResolver().RefreshContext(ctx)   # forget remembered answers for this cont
 stage.Reload()                         # USD re-opens layers whose files changed
 ```
 
+`Reload()` decides by each file's modification time. Perforce sets that to
+the time of the sync, so a newly synced version always looks newer. If your
+workspace uses the `modtime` option (a synced file keeps the time it was
+last changed, and two versions can have the same time), Clio gives USD the
+file's Perforce revision number instead, for files you have not opened for
+edit. Nothing to set up: Clio checks the workspace's options itself.
+
 ## Asset information
 
 ```python

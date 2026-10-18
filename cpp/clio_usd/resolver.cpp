@@ -13,6 +13,7 @@
 #include <pxr/usd/ar/assetInfo.h>
 #include <pxr/usd/ar/defineResolver.h>
 #include <pxr/usd/ar/notice.h>
+#include <pxr/usd/ar/timestamp.h>
 #include <pxr/usd/ar/writableAsset.h>
 
 #include <functional>
@@ -169,6 +170,22 @@ ArResolvedPath ClioResolver::_Resolve(const std::string& assetPath) const {
         _WarnOnce(assetPath, "could not use Perforce (unknown error)");
     }
     return ArDefaultResolver::_Resolve(assetPath);
+}
+
+ArTimestamp ClioResolver::_GetModificationTimestamp(const std::string& assetPath,
+                                                    const ArResolvedPath& resolvedPath) const {
+    // Reload() compares timestamps to decide whether a layer changed. The
+    // file's own time is right unless the client uses `modtime`, where two
+    // revisions can share a time; then the workspace revision tells them apart.
+    try {
+        if (const auto core = _GetCoreResolver()) {
+            if (const auto revision = core->revisionTimestamp(resolvedPath.GetPathString())) {
+                return ArTimestamp(*revision);
+            }
+        }
+    } catch (const std::exception&) {
+    }
+    return ArDefaultResolver::_GetModificationTimestamp(assetPath, resolvedPath);
 }
 
 ArResolvedPath ClioResolver::_ResolveForNewAsset(const std::string& assetPath) const {

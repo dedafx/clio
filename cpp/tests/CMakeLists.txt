@@ -19,6 +19,7 @@ add_executable(clio_core_tests
     test_coalescer.cpp
     test_pool.cpp
     test_resolver_cache.cpp
+    test_timestamp.cpp
     test_write.cpp
     test_identifier.cpp
     test_pin.cpp
