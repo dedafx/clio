@@ -7,13 +7,15 @@ configure_file(
     @ONLY)
 
 add_library(clio_core STATIC
+    src/coalescer.cpp
     src/file_lock.cpp
     src/identifier.cpp
     src/pin.cpp
     src/resolver.cpp
     src/settings.cpp
     src/workspace.cpp
-    src/p4/connection.cpp)
+    src/p4/connection.cpp
+    src/p4/pool.cpp)
 add_library(clio::core ALIAS clio_core)
 
 target_include_directories(clio_core

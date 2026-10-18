@@ -15,8 +15,8 @@ This guide is for people using the `deda-clio` package. For how it is
 built and why, see [building.md](building.md) and [design.md](design.md) §10.
 
 > **Status: v0.1 scaffold.** Reading works: latest, have, change and label
-> pins, with fallback to local files. Saving layers back to Perforce and
-> batching many fetches into one request are not done yet. See
+> pins, with fallback to local files, and many missing files are fetched
+> together. Saving layers back to Perforce is not done yet. See
 > [Current limitations](#current-limitations).
 
 Supported: Python 3.13, and OpenUSD 26.08 and 25.08 (both tested), plus
@@ -203,6 +203,9 @@ passed to USD's default resolver as a search path, as before.
 | `policy` | no | `sync` (default), `verify` or `offline` (below) |
 | `timeout` | no | Seconds before a Perforce command is cancelled. Default `120`, `0` = none |
 | `connect_timeout` | no | Seconds to wait for an unreachable server before falling back to local files. Default `10`, `0` = the OS default (can be over 2 minutes) |
+| `cache_ttl` | no | Seconds Clio trusts an answer that can change (`have`, `latest`, a label) before asking again. Default `60`, `0` = ask every time. A change or revision never changes and is kept until `RefreshContext` |
+| `batch_ms` | no | Milliseconds a resolve that needs the server waits for other missing files to join its `sync`. Default `20`, `0` = do not wait |
+| `connections` | no | Most Perforce connections Clio opens in the process (1 to 64). Default `4`; they open only when threads need them at the same time |
 
 Check a string in Python before handing it to USD:
 
@@ -248,6 +251,25 @@ process; if it is invalid, USD prints one warning and Clio stays off.
 
 Answers that came from a fallback are not remembered, so the exact version
 is fetched as soon as the server is reachable again.
+
+### Opening a big stage
+
+USD loads layers on many threads, so a stage can ask for hundreds of missing
+files at once. Clio turns that into few server commands:
+
+* Threads asking for the **same file** share one fetch.
+* Files that miss within `batch_ms` of each other (20 ms by default) are
+  synced with **one** `p4 sync`. Each thread waits only until its batch is
+  done. If the batch fails (for example the server is down), every file in it
+  falls back to the local file with a warning.
+* Files at a **change, label or revision** are fetched on up to
+  `connections` Perforce connections at the same time.
+
+Answers are remembered in memory only. After `cache_ttl` seconds, a `have`,
+`latest` or label answer is checked again the next time it is asked for, so
+a new version submitted by someone else is picked up without
+`RefreshContext` (a stage that is already open keeps what it loaded until
+you reload it). `RefreshContext` still forgets everything at once.
 
 ## Sharing files
 
@@ -343,18 +365,13 @@ assert Plug.Registry().GetPluginWithName("clioUsd").isLoaded
    file. Clio does not run `p4 edit`, take a lock or add new files yet
    (design §10.6). With Perforce's default workspace options, synced files
    are read-only, so check them out with `p4 edit` before saving.
-2. **Fetches are not batched yet.** Each missing file is fetched on its
-   own, one at a time per context, so large stages open slower than they
-   will once fetches are batched (design §10.3).
-3. **`latest` is remembered until `RefreshContext`.** The planned 30–60 s
-   automatic re-check (design §8.3) is not implemented yet.
-4. **Clio is the primary resolver.** Only one primary resolver can be
+2. **Clio is the primary resolver.** Only one primary resolver can be
    active in a process, so Clio cannot yet be combined with another
    custom resolver (for example a DCC's or a studio's). No DCCs are
    targeted yet.
-5. **Pins apply to the whole stage.** Layers cannot hold a pin on a single
+3. **Pins apply to the whole stage.** Layers cannot hold a pin on a single
    path (see [Choosing a version](#choosing-a-version-pins)).
-6. **Project-rooted search paths may cost one server call per probe.**
+4. **Project-rooted search paths may cost one server call per probe.**
    USD first looks for `assets/x.usda` next to the current layer. If that
    location is inside the project, Clio asks the server once, and
    remembers a "not found" answer until refresh. Relative paths avoid

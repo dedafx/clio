@@ -82,3 +82,37 @@ the server even with `-k` (no file changes), so `lock` of 2,000 files stays
 at 10.8 s; `p4 submit` is about 16 ms a file (read, hash, upload). Both
 need a TCP server and a Linux machine to compare before drawing a
 conclusion.
+
+## Phase 3: what was not built (2026-10-18)
+
+Same machine, Python 3.13.16, 20 x 4 MB large files and 2,000 small ones.
+
+| Operation | After the disk check | Now |
+|---|---:|---:|
+| status --no-disk: 2000 files | 122 ms | 102 ms |
+| status (with disk check): 2000 files | 330 ms | 355 ms |
+| get: 20 x 4 MB, 4 threads | | 500 ms (160 MB/s) |
+
+The connection pool, the miss coalescer and the resolver cache time change
+the resolver, not these Python workflow numbers, so they are unchanged
+within noise. Tests cover what they do: twelve threads that miss at once run
+one `p4 sync`, eight threads asking for one file run one resolve, and a
+`latest` answer is trusted for `cache_ttl` and then checked again
+(`cpp/tests/test_resolver_cache.cpp`, `cpp/tests/test_coalescer.cpp`).
+
+**C++ hashing, scan and diff: not justified.** The only per-file Python work
+left in `status` and `save` is the `stat` loop of `Workspace._disk_changes`.
+On 50,000 files it takes 0.52 s: about 10 microseconds a file, so about 1 s for
+100,000 files. `fstat -Ol` for 2,000 files takes about 100 ms of that
+call, which puts 100,000 files near 5 s, so the loop is under a fifth of a large
+`status`. A parallel C++ walk could make the loop 3 to 5 times faster, but
+the whole call would be about 15% faster, below the 3x end-to-end bar the
+design sets (§8.4). Hashing is not on any Clio path any more: Perforce does
+it for the few suspicious files only.
+
+**Status cache and persistent store: not built.** `status` is two server
+commands and 100 ms for 2,000 files; a cache would add a way to show stale
+lock and edit state for a saving of tens of milliseconds. The UI view models
+of phase 5 (§9) are where a time-bounded status cache belongs, with the
+request pipeline that needs it. Revisit with a TCP server and a Linux
+machine (see the note above).

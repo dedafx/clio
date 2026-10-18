@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.4. Phase 0 (C++ core, Python bindings, USD resolver), phase 1 (Python workflow services, `clio` CLI, history cache) and phase 2 (branches and drafts) are implemented; see [workflow.md](workflow.md), [usd.md](usd.md) and [building.md](building.md). |
+| **Status** | Draft v0.5. Phase 0 (C++ core, Python bindings, USD resolver), phase 1 (Python workflow services, `clio` CLI, history cache), phase 2 (branches and drafts) and phase 3 (performance) are implemented; see [workflow.md](workflow.md), [usd.md](usd.md) and [building.md](building.md). |
 | **Package** | `deda.clio` (Python namespace package) |
 | **Targets** | Python 3.13 · USD 26.08 (primary) and USD 25.08 or later · no DCCs yet |
 | **Consumers** | Standalone Python, the `clio` CLI, and USD. Dedaverse, Imagine and DCC integrations are later work. |
@@ -494,9 +494,10 @@ least risk.
    they arrive, instead of building a list of a million dicts in memory.
 6. **One connection per thread.** A P4API `ClientApi` must not be used
    from two threads at the same time. `clio_core` hands out connections
-   from a pool (the scaffold serializes on one connection per workspace),
-   and parallel *metadata* work runs on separate connections, with no GIL
-   involved.
+   from a pool (`ConnectionPool`, up to `connections`, default 4, opened
+   on demand), and parallel *metadata* work runs on separate connections,
+   with no GIL involved. The Python backend keeps one connection per
+   thread.
 7. **Cheap "anything new?" checks.** Before a costly refresh, ask for the
    latest change affecting a path (`p4 changes -m1 -s submitted
    //path/...`). If it has not moved since the last refresh, skip the
@@ -1069,8 +1070,9 @@ USD worker threads
    the process. `latest` and labels are cached until the polling interval
    passes or the context is refreshed. A hit returns the local path in
    microseconds, so composition speed is unchanged when everything is up
-   to date. *(Scaffold: results are kept until `refresh`; the time limit
-   comes with phase 3.)*
+   to date. *(As built, phase 3: a change or revision is kept until
+   `refresh`; `have`, `latest`, labels and their "not found" answers are
+   kept for `cache_ttl`, 60 s by default.)*
 2. **Miss (file missing or stale).** The request goes to the **coalescer**:
    * *Single-flight:* concurrent requests for the same file share one fetch.
    * *Batching window* (for example 10–30 ms, configurable): misses from
@@ -1092,6 +1094,30 @@ objects must not be shared between threads, so `clio_core` keeps a small
 **connection pool** (default 2–4 per process). The coalescer, not the USD
 threads, owns the connections. No Python is involved and the GIL is never
 taken.
+
+**As built (phase 3).** `Workspace` runs its commands on a
+`ConnectionPool` (`connections`, default 4, created only when threads need
+them at the same time). `AssetResolver` coalesces misses in two layers:
+
+1. `SingleFlight`: concurrent resolves of the same (path, pin) run once and
+   share the result or the exception.
+2. `SyncBatcher`: `have` and `latest` misses join a batch per (pin, force).
+   The first thread waits `batch_ms` (20 ms), then runs one `p4 sync` for
+   the batch; at 500 files a batch closes early. A failed batch reaches every
+   caller in it, and each one falls back as a single failure would.
+
+Pinned versions (`@change`, `@label`, `#rev`) are not batched: `p4 print -o`
+writes one output file per command, so each file is its own `print`, run in
+parallel on the pooled connections by the calling threads. (A client-side
+split is not needed: the USD threads already provide the parallelism, and the
+pool bounds it.)
+
+The memo follows §8.3: change and revision answers are kept until
+`refresh()`; everything else for `cache_ttl` (60 s; 0 = always ask). The
+cache time is also what skips the repeated `sync` for `latest` that the
+scaffold ran on every resolve. Server work on the workspace (`sync`) is still
+one at a time, in this process and across processes, because of the
+workspace lock.
 
 **Credentials and prompts.** The resolver never prompts. A USD worker
 thread has no UI, and prompting there would hang the DCC. It uses the
@@ -1146,7 +1172,7 @@ symbol.
 | Method | Clio behaviour |
 |---|---|
 | `_CreateIdentifier` | Inherited from `ArDefaultResolver`: USD's usual anchoring of relative paths and search paths. |
-| `_Resolve` | If a Clio context is bound and the path is inside the workspace root or the version store (search paths are tried under the workspace root), fetch it through `clio_core` at the pin and return the local file. Otherwise, or if Clio cannot provide it, `ArDefaultResolver::_Resolve`. *(Scaffold: no coalescer yet; one fetch at a time per context.)* |
+| `_Resolve` | If a Clio context is bound and the path is inside the workspace root or the version store (search paths are tried under the workspace root), fetch it through `clio_core` at the pin and return the local file. Otherwise, or if Clio cannot provide it, `ArDefaultResolver::_Resolve`. *(Phase 3: threads share one fetch per file, and misses within a short window become one `sync`; see §10.3.)* |
 | `_ResolveForNewAsset` / `_CanWriteAssetToPath` / `_OpenAssetForWrite` | *Planned (phase 4); inherited today, so saving writes the local file only.* When a layer is saved: runs `p4 edit` (with lock for `+l` types) or `p4 add` in the artist's pending change, or refuses with `whyNot` ("locked by Sam"). Never submits (§10.6). |
 | `_IsContextDependentPath` | `true` for project paths while a Clio context is bound, because they resolve to a different file for each pin. Sdf then looks layers up by resolved path, so stages opened at different pins in one process never share a layer. Otherwise inherited. |
 | `_CreateDefaultContext[ForAsset]`, `_CreateContextFromString` | The default resolver's context, plus a `ClioResolverContext` from `$CLIO_RESOLVER_CONTEXT` if set. `CreateContextFromString(settings)` builds a Clio context when the string contains `=`, otherwise the default resolver's search-path context. |
@@ -1564,7 +1590,7 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
 | **0 — Scaffold** *(done)* | CMake project; `clio_core` (P4API connections, pins, `clio:` identifiers, settings, resolve for latest/have/historical pins, version store); `deda.clio._core` (nanobind, abi3); the `clioUsd` resolver plugin; C++, Python and USD tests against a throwaway `p4d`. See [building.md](building.md). |
 | **1 — Core workflow** *(done)* | Python services over `CoreBackend`: connect/login/setup, get (parallel), lock/unlock, save, status, discard, history and folder activity backed by the HistoryCache with watermark refresh (§9.3–9.4), and the `clio` CLI for these ([workflow.md](workflow.md)). Baseline benchmarks ([benchmarks.md](benchmarks.md)). *Deferred:* per-file progress (P4API's progress hook is not exposed yet), a status cache (phase 3), `clio doctor` (phase 5). |
 | **2 — Branching** *(done)* | Streams/task streams, switch, update/publish with binary conflict handling, cross-branch lock check, drafts (shelves) ([workflow.md](workflow.md#branches-and-drafts)). *Deferred:* updating or publishing part of a branch, taking a draft into another branch, virtual streams, stream spec editing (paths, imports). |
-| **3 — Performance** *(started)* | *Done:* stat-first disk check for `status` and `save` ([benchmarks.md](benchmarks.md#phase-3-the-disk-check-2026-10-12)). *Next:* connection pool and miss coalescer in `clio_core`; time-bounded in-memory caches (§8.3); C++ hashing/scan/diff if benchmarks justify it. Measure; add a persistent store only if the numbers call for it. |
+| **3 — Performance** *(done)* | Stat-first disk check for `status` and `save` ([benchmarks.md](benchmarks.md#phase-3-the-disk-check-2026-10-12)); `ConnectionPool` in `clio_core`; the miss coalescer (single-flight plus a batching window for `sync`, parallel fetches of pinned versions); time-bounded resolver memo (§8.3, §10.3 "As built"). *Measured and not built:* C++ hashing, scan and diff, a persistent store and a Python status cache (see [benchmarks.md](benchmarks.md#phase-3-what-was-not-built-2026-10-18)). |
 | **4 — USD completion** | Write side (edit/lock on save, §10.6); revision-based timestamps; `deda.clio.usd.prepare` (option A); CI builds against USD 26.08 and 25.08. |
 | **4½ — Version manifests** | `Manifest` create/save/load/fetch/check/diff (§10.8), `manifest=` context setting, content-addressed pool, `clio usd manifest` CLI, farm guide (proxy + `policy=verify`). |
 | **5 — Ecosystem** | UI view models (`FileListView`, `HistoryView`) with the request pipeline, ContentCache (§9.5), asset resolver plugins, validation hooks, `clio doctor`. Dedaverse/DCC integration when targeted. |

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "clio/core/coalescer.hpp"
 #include "clio/core/identifier.hpp"
 #include "clio/core/settings.hpp"
 #include "clio/core/workspace.hpp"
@@ -8,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -41,7 +43,15 @@ struct ResolvedAsset {
 ///            because labels can be moved
 ///
 /// The server is the authority (design §8.3): results are remembered in
-/// memory only, until refresh(). Thread-safe.
+/// memory only. A change or revision never changes, so its result is kept
+/// until refresh(); a result that can move (have, latest, a label, or "not
+/// found" for those) is kept for `Settings::cacheTtl` and then checked
+/// again. Thread-safe.
+///
+/// Misses are coalesced (design §10.3): threads asking for the same asset
+/// share one resolve, and the `sync`s of threads that miss within
+/// `Settings::batchWindow` of each other become one Perforce command.
+/// Historical versions are fetched in parallel on pooled connections.
 ///
 /// Clio is an enhancement, not a barrier: with the sync and offline
 /// policies, if the server cannot be reached (or refuses, for example
@@ -51,7 +61,11 @@ struct ResolvedAsset {
 /// the verify policy fails instead of falling back.
 class AssetResolver {
 public:
-    explicit AssetResolver(Settings settings);
+    /// Reads the time from this clock to age remembered results (tests
+    /// replace it); the steady clock by default.
+    using Clock = std::function<std::chrono::steady_clock::time_point()>;
+
+    explicit AssetResolver(Settings settings, Clock clock = {});
 
     const Settings& settings() const { return _workspace.settings(); }
     Workspace& workspace() { return _workspace; }
@@ -83,6 +97,10 @@ public:
     /// retries a server that was unavailable.
     void refresh();
 
+    /// How many `sync` commands the coalescer has run. For tests and
+    /// diagnostics: many misses at once should cost few commands.
+    std::size_t syncCommandsRun() const { return _syncBatcher.batchesRun(); }
+
     /// How long to stop contacting the server after it failed.
     static constexpr std::chrono::seconds serverRetryInterval{60};
 
@@ -92,15 +110,27 @@ private:
     std::optional<ResolvedAsset> _resolveUncached(const AssetIdentifier& id, const Pin& pin,
                                                   bool& serverAnswered);
     std::optional<ResolvedAsset> _useWorkspaceFile(ResolvedAsset asset, const std::string& reason) const;
+    std::optional<ResolvedAsset> _resolveAndRemember(const AssetIdentifier& id, const Pin& pin,
+                                                     const std::string& key);
+    std::chrono::steady_clock::time_point _now() const;
     bool _serverAvailable() const;
     void _markServerUnavailable();
 
+    struct MemoEntry {
+        std::optional<ResolvedAsset> asset;
+        bool forever = false; ///< immutable pin: kept until refresh()
+        std::chrono::steady_clock::time_point expires;
+    };
+
+    Clock _clock;
     Workspace _workspace;
     std::atomic<std::int64_t> _serverRetryAt{0}; ///< steady_clock ticks; 0 = available
     std::mutex _memoMutex;
     /// Remembered answers, including "not found" answers from the server
     /// (USD probes paths that do not exist when it looks for search paths).
-    std::unordered_map<std::string, std::optional<ResolvedAsset>> _memo;
+    std::unordered_map<std::string, MemoEntry> _memo;
+    SingleFlight<std::string, std::optional<ResolvedAsset>> _resolves;
+    SyncBatcher _syncBatcher;
 };
 
 } // namespace clio::core

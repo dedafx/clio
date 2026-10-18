@@ -4,7 +4,18 @@
 
 namespace clio::core {
 
-AssetResolver::AssetResolver(Settings settings) : _workspace(std::move(settings)) {}
+AssetResolver::AssetResolver(Settings settings, Clock clock)
+    : _clock(std::move(clock)),
+      _workspace(std::move(settings)),
+      _syncBatcher(
+          [this](const std::vector<AssetIdentifier>& ids, const Pin& pin, bool force) {
+              _workspace.sync(ids, pin, force);
+          },
+          _workspace.settings().batchWindow) {}
+
+std::chrono::steady_clock::time_point AssetResolver::_now() const {
+    return _clock ? _clock() : std::chrono::steady_clock::now();
+}
 
 Pin AssetResolver::effectivePin(const AssetIdentifier& id) const {
     return id.pin() ? *id.pin() : settings().pin;
@@ -17,21 +28,35 @@ std::optional<ResolvedAsset> AssetResolver::resolve(const AssetIdentifier& id) {
     {
         std::lock_guard<std::mutex> lock(_memoMutex);
         if (auto it = _memo.find(key); it != _memo.end()) {
-            return it->second;
+            if (it->second.forever || _now() < it->second.expires) {
+                return it->second.asset;
+            }
+            _memo.erase(it); // too old: ask again
         }
     }
 
-    // TODO(design §10.3): route misses through the coalescer so concurrent
-    // misses from USD worker threads become one batched sync.
+    // Threads that miss on the same asset share one resolve.
+    return _resolves.run(key, [&] { return _resolveAndRemember(id, pin, key); });
+}
+
+std::optional<ResolvedAsset> AssetResolver::_resolveAndRemember(const AssetIdentifier& id, const Pin& pin,
+                                                                const std::string& key) {
     bool serverAnswered = false;
     std::optional<ResolvedAsset> resolved = _resolveUncached(id, pin, serverAnswered);
     // A fallback answer is not remembered, so the exact version is fetched
     // once the server is reachable again. "Not found" is remembered only
     // when the server said so.
     const bool remember = resolved ? resolved->warning.empty() : serverAnswered;
-    if (remember) {
+    if (!remember) {
+        return resolved;
+    }
+    // A change or revision names content that never changes (design §8.3
+    // rule 2). Everything else can move and is only trusted for a while.
+    const bool forever = pin.kind() == Pin::Kind::Change || pin.kind() == Pin::Kind::Revision;
+    const auto ttl = settings().cacheTtl;
+    if (forever || ttl.count() > 0) {
         std::lock_guard<std::mutex> lock(_memoMutex);
-        _memo.emplace(key, resolved);
+        _memo[key] = MemoEntry{resolved, forever, _now() + ttl};
     }
     return resolved;
 }
@@ -50,11 +75,11 @@ std::optional<ResolvedAsset> AssetResolver::resolvePath(const std::filesystem::p
 
 bool AssetResolver::_serverAvailable() const {
     const auto retryAt = _serverRetryAt.load();
-    return retryAt == 0 || std::chrono::steady_clock::now().time_since_epoch().count() >= retryAt;
+    return retryAt == 0 || _now().time_since_epoch().count() >= retryAt;
 }
 
 void AssetResolver::_markServerUnavailable() {
-    const auto retryAt = std::chrono::steady_clock::now() + serverRetryInterval;
+    const auto retryAt = _now() + serverRetryInterval;
     _serverRetryAt.store(retryAt.time_since_epoch().count());
 }
 
@@ -103,6 +128,8 @@ std::optional<ResolvedAsset> AssetResolver::_resolveUncached(const AssetIdentifi
             return _useWorkspaceFile(asset, policy == Policy::Offline ? "Offline" : unavailable);
         }
         try {
+            // Different files fetch in parallel on pooled connections; the
+            // same file is never fetched twice at once (single-flight).
             const FetchResult result = _workspace.fetchVersion(id, pin);
             serverAnswered = true;
             if (result == FetchResult::NotFound) {
@@ -135,11 +162,11 @@ std::optional<ResolvedAsset> AssetResolver::_resolveUncached(const AssetIdentifi
         if (mayContactServer) {
             try {
                 // Never synced to this workspace: take the latest revision.
-                _workspace.sync({id}, Pin::latest());
+                _syncBatcher.sync(id, Pin::latest());
                 if (!std::filesystem::exists(asset.localPath)) {
                     // Perforce thinks it is here, but it was deleted from
                     // disk: restore the revision the workspace has.
-                    _workspace.sync({id}, Pin::have(), /*force=*/true);
+                    _syncBatcher.sync(id, Pin::have(), /*force=*/true);
                 }
                 serverAnswered = true;
             } catch (const P4Error&) {
@@ -154,9 +181,9 @@ std::optional<ResolvedAsset> AssetResolver::_resolveUncached(const AssetIdentifi
 
     if (pin.kind() == Pin::Kind::Latest && mayContactServer) {
         try {
-            // A no-op on the server when the file is already current.
-            // TODO(design §10.3): skip the call when the file is known current.
-            _workspace.sync({id}, pin);
+            // A no-op on the server when the file is already current; the
+            // memo skips the call for `cacheTtl` after an answer.
+            _syncBatcher.sync(id, pin);
             serverAnswered = true;
         } catch (const P4Error& e) {
             _markServerUnavailable();

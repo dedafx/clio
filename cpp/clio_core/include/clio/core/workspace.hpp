@@ -2,6 +2,7 @@
 
 #include "clio/core/identifier.hpp"
 #include "clio/core/p4/connection.hpp"
+#include "clio/core/p4/pool.hpp"
 #include "clio/core/settings.hpp"
 
 #include <filesystem>
@@ -29,9 +30,11 @@ enum class FetchResult {
 /// Maps clio: identifiers to depot and local paths, and runs the Perforce
 /// operations that put files on disk.
 ///
-/// Thread-safe. For now all server work is serialized on one connection;
-/// the connection pool and the miss coalescer (design doc §10.3) replace
-/// this later without changing the interface.
+/// Thread-safe. Server work runs on a small pool of connections
+/// (`Settings::maxConnections`), so threads fetching different files do not
+/// wait for each other. Changes to the workspace itself (`sync`) are
+/// serialized, in this process and across processes; reads into the version
+/// store (`fetchVersion`) run in parallel.
 class Workspace {
 public:
     explicit Workspace(Settings settings);
@@ -75,7 +78,7 @@ public:
     /// Lock file serializing changes to this workspace across processes.
     std::filesystem::path lockPath() const;
 
-    /// Run any command on this workspace's connection (serialized).
+    /// Run any command on a pooled connection.
     p4::CommandResult run(const std::string& command,
                           const std::vector<std::string>& args = {},
                           const std::optional<std::string>& input = std::nullopt);
@@ -85,8 +88,8 @@ private:
     std::filesystem::path _storeBase() const;
 
     Settings _settings;
-    std::mutex _mutex;
-    p4::Connection _connection;
+    std::mutex _syncMutex;
+    p4::ConnectionPool _pool;
     std::string _serverKey;
 };
 

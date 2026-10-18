@@ -207,14 +207,14 @@ std::optional<Pin> pinFromDirName(const std::string& name) {
 } // namespace
 
 Workspace::Workspace(Settings settings)
-    : _settings(std::move(settings)), _connection(_settings.connection) {
+    : _settings(std::move(settings)), _pool(_settings.connection, _settings.maxConnections) {
     // Name the server's store folder by the port actually used, so different
     // servers taken from the environment never share a folder. (Equivalent
     // aliases for one server get separate folders, which is safe.)
     std::string port = _settings.connection.port;
     if (port.empty()) {
         try {
-            port = _connection.effectivePort();
+            port = _pool.effectivePort();
         } catch (const Error&) {
         }
     }
@@ -295,11 +295,11 @@ p4::CommandResult Workspace::sync(const std::vector<AssetIdentifier>& ids, const
     for (const auto& id : ids) {
         args.push_back(depotPath(id) + pin.p4RevSpec());
     }
-    std::lock_guard<std::mutex> lock(_mutex);
+    std::lock_guard<std::mutex> lock(_syncMutex);
     // Other processes (a DCC's resolver, the clio CLI) may change the same
     // workspace; serialize with them too.
     FileLock workspaceLock(lockPath());
-    return _connection.runOrThrow("sync", args);
+    return _pool.runOrThrow("sync", args);
 }
 
 FetchResult Workspace::fetchVersion(const AssetIdentifier& id, const Pin& pin) {
@@ -316,12 +316,9 @@ FetchResult Workspace::fetchVersion(const AssetIdentifier& id, const Pin& pin) {
     // Unique across threads and processes sharing the version store.
     temp += ".clio-tmp-" + std::to_string(CLIO_GETPID()) + "-" + std::to_string(counter.fetch_add(1));
 
-    {
-        std::lock_guard<std::mutex> lock(_mutex);
-        // A file missing at this version is a warning, not an error, so it
-        // does not throw; connection and login failures do.
-        _connection.runOrThrow("print", {"-q", "-o", temp.string(), depotPath(id) + pin.p4RevSpec()});
-    }
+    // A file missing at this version is a warning, not an error, so it
+    // does not throw; connection and login failures do.
+    _pool.runOrThrow("print", {"-q", "-o", temp.string(), depotPath(id) + pin.p4RevSpec()});
 
     if (!fs::exists(temp)) {
         return FetchResult::NotFound;
@@ -351,8 +348,7 @@ FetchResult Workspace::fetchVersion(const AssetIdentifier& id, const Pin& pin) {
 p4::CommandResult Workspace::run(const std::string& command,
                                  const std::vector<std::string>& args,
                                  const std::optional<std::string>& input) {
-    std::lock_guard<std::mutex> lock(_mutex);
-    return _connection.run(command, args, input);
+    return _pool.run(command, args, input);
 }
 
 } // namespace clio::core

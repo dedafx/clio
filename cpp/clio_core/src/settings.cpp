@@ -42,7 +42,7 @@ void validateDepotRoot(const std::string& depot) {
     }
 }
 
-// A whole, non-negative number of seconds. Rejects trailing text such as
+// A whole, non-negative number (of seconds, or of whatever the key counts). Rejects trailing text such as
 // "10seconds", which std::stol would accept as 10.
 std::chrono::seconds parseSeconds(const std::string& key, const std::string& value) {
     long long seconds = -1;
@@ -148,6 +148,16 @@ Settings Settings::parse(const std::string& text) {
             settings.policy = parsePolicy(value);
         } else if (key == "connect_timeout") {
             settings.connection.connectTimeout = parseSeconds(key, value);
+        } else if (key == "connections") {
+            const auto count = parseSeconds(key, value).count();
+            if (count < 1 || count > 64) {
+                throw ConfigError("connections must be between 1 and 64, got '" + value + "'");
+            }
+            settings.maxConnections = static_cast<std::size_t>(count);
+        } else if (key == "batch_ms") {
+            settings.batchWindow = std::chrono::milliseconds(parseSeconds(key, value).count());
+        } else if (key == "cache_ttl") {
+            settings.cacheTtl = parseSeconds(key, value);
         } else if (key == "timeout") {
             settings.connection.commandTimeout = parseSeconds(key, value);
         } else {
@@ -185,6 +195,10 @@ std::string Settings::str() const {
     if (!connection.ticketFile.empty()) add("tickets", connection.ticketFile);
     if (pin != Pin::have()) add("pin", pin.str());
     if (policy != Policy::Sync) add("policy", policyName(policy));
+    const Settings defaults;
+    if (maxConnections != defaults.maxConnections) add("connections", std::to_string(maxConnections));
+    if (batchWindow != defaults.batchWindow) add("batch_ms", std::to_string(batchWindow.count()));
+    if (cacheTtl != defaults.cacheTtl) add("cache_ttl", std::to_string(cacheTtl.count()));
     if (connection.connectTimeout != p4::ConnectionOptions{}.connectTimeout) {
         add("connect_timeout", std::to_string(connection.connectTimeout.count()));
     }
