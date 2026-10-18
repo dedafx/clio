@@ -114,6 +114,13 @@ class Session:
         return HookRegistry()
 
     @cached_property
+    def assets(self):  # -> deda.clio.assets.Assets
+        """Actions on whole assets, through asset resolver plugins (design doc §14)."""
+        from deda.clio.assets import Assets
+
+        return Assets(self)
+
+    @cached_property
     def pipeline(self):  # -> deda.clio.views._pipeline.RequestPipeline
         """The request pipeline that view models share (design doc §9.5)."""
         from deda.clio.views import _handlers

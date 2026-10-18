@@ -1703,6 +1703,27 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
   that the `hooks` setting turns on. A hook that raises, or an entry point that
   does not load, is a warning (fail open). The asset-resolver entry point
   (`deda.clio.resolvers`) waits for Dedaverse/Imagine (open question 6).
+* **Assets and elements.** USD calls a file an *asset*; Dedaverse calls the same
+  thing an *element*. In Dedaverse an *asset* is a higher-level collection of
+  related elements: a 3d character "Bob" is a mesh, a look, textures, a
+  skeleton, animation data, work files and published files. In Imagine an
+  *asset* is a photograph being prepared for print, with all its variants.
+  Two separate jobs follow, and Clio keeps them apart:
+  1. **One file path at a time (the USD resolver, §10).** USD gives
+     `clioUsd` a file path. It checks whether the file is on disk and, if it is
+     not, syncs it from Perforce. If the context names a manifest (§10.8), the
+     manifest decides the revision. Clio needs no idea of "Bob" for this.
+  2. **A whole asset (the asset resolver plugin).** `deda.clio.resolvers`
+     plugins turn an asset id into the project paths of its parts, so that `get`,
+     `lock`, `status`, `save` and `activity` work on "Bob" or a photo as one
+     thing (`session.assets`, `clio asset ...`). The built-in `folder` plugin
+     treats an asset as a folder. Dedaverse and Imagine each ship their own
+     plugin; Clio never imports either.
+  *As built (phase 5):* `deda.clio.assets` (`Assets`, `AssetResolverPlugin`,
+  `FolderResolver`), the `asset_resolver` setting (the kind a bare id means),
+  `AssetNotFoundError` (exit code 15). Not built: asset-level pins (`get` of "Bob"
+  at a change works through `version=`; a per-asset manifest is a manifest
+  created from the asset's root layer).
 * The event bus (§5.6) lets Dedaverse drive lock icons, progress bars, and
   notifications without polling.
 
@@ -1716,7 +1737,7 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
 | **3 — Performance** *(done)* | Stat-first disk check for `status` and `save` ([benchmarks.md](benchmarks.md#phase-3-the-disk-check-2026-10-12)); `ConnectionPool` in `clio_core`; the miss coalescer (single-flight plus a batching window for `sync`, parallel fetches of pinned versions); time-bounded resolver memo (§8.3, §10.3 "As built"). *Measured and not built:* C++ hashing, scan and diff, a persistent store and a Python status cache (see [benchmarks.md](benchmarks.md#phase-3-what-was-not-built-2026-10-18)). |
 | **4 — USD completion** *(done, CI not yet run)* | Write side: edit/add on save, refuse on another user's lock (§10.6); revision-based timestamps for `modtime` clients (§10.3); `deda.clio.usd.prepare`, `prepare_for_edit` and `finish_edit` (option A, §10.2). A Linux CI workflow builds and tests against USD 26.08 and 25.08 (`.github/workflows/ci.yml`); it has not run on GitHub yet. *Deferred:* locking a layer before it is edited (today the edit happens at save), submit hooks. |
 | **4½ — Version manifests** *(done)* | `Manifest` create/save/load/fetch/check/diff (§10.8), `manifest=` context setting, content-addressed pool, `clio usd manifest` CLI, farm guide (proxy + `policy=verify`, [usd.md](usd.md#rendering-on-a-farm-version-manifests)). *Deferred:* shelves for unsubmitted work, expression variables. |
-| **5 — Ecosystem** *(mostly done)* | *Done:* `clio doctor` and `clio doctor --typemap` (§8.5); validation hooks, `deda.clio.hooks` (§14); ContentCache and `clio cache clear/verify` (§9.3); view models `FileListView` and `HistoryView` over a coalescing, deduplicating, prioritized, cancellable `RequestPipeline` (§9.5). *Left:* asset resolver plugins (`deda.clio.resolvers`, waits for open question 6: what an asset is to Dedaverse/Imagine), activity-feed and branch view models, thumbnails (§9.8), Dedaverse/DCC integration when targeted. |
+| **5 — Ecosystem** *(mostly done)* | *Done:* `clio doctor` and `clio doctor --typemap` (§8.5); validation hooks, `deda.clio.hooks` (§14); ContentCache and `clio cache clear/verify` (§9.3); view models `FileListView` and `HistoryView` over a coalescing, deduplicating, prioritized, cancellable `RequestPipeline` (§9.5). *Also done:* asset resolver plugins, `deda.clio.resolvers` and `session.assets` (§14). *Left:* activity-feed and branch view models, thumbnails (§9.8), Dedaverse/DCC integration when targeted. |
 
 ### Backlog
 
@@ -1741,7 +1762,7 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
 4. ~~**Cross-branch locking**~~ *Decided: advisory by default, configurable (see below).*
 5. **Vocabulary:** Do "save / get / lock / draft / publish" suit your
    artists, or do they already know some Perforce terms that should stay?
-6. **Asset identity:** Is an asset a folder (all files under a path), or is
+6. ~~**Asset identity**~~ *Answered (see "Assets and elements" in §14).* Is an asset a folder (all files under a path), or is
    it defined by Dedaverse/Imagine metadata (for example a USD asset or a
    database ID)? This decides how much of the resolver ships in Clio itself.
 7. **Pins:** Is a Perforce **label** the right way to mark approved
@@ -1763,6 +1784,12 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
 
 ### Decided
 
+* **Assets and elements (Q6).** Clio's unit is the **file**. USD calls a file an
+  *asset*; Dedaverse calls it an *element*. A Dedaverse *asset* (a character
+  "Bob": mesh, look, textures, skeleton, animation, work and published files) and
+  an Imagine *asset* (a photograph and all its variants) are groups of elements
+  that Clio does not interpret. A plugin lists the files of a group
+  (`deda.clio.resolvers`, §14).
 * Cross-branch locks: a warning by default; `cross_branch_locks` can make
   them block or turn the check off (Q4, §7.3).
 * CLI: `click` (Q3). It is the one runtime dependency besides Clio's own

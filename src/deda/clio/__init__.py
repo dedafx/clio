@@ -23,6 +23,7 @@ from deda.clio._core import (
 )
 from deda.clio.config import Config, load_config
 from deda.clio.errors import (
+    AssetNotFoundError,
     AuthError,
     CancelledError,
     ClioError,
@@ -67,6 +68,7 @@ from deda.clio.session import Session, connect
 
 __all__ = [
     "AssetIdentifier",
+    "AssetNotFoundError",
     "AssetResolver",
     "AuthError",
     "Branch",

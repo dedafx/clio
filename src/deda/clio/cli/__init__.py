@@ -7,7 +7,8 @@ Exit codes: 0 success, 1 other Clio error, 2 usage error, 3 not logged in,
 4 server unreachable, 5 locked by someone else, 6 out of date, 7 nothing to
 save, 8 refused by the server, 9 cancelled or not confirmed, 10 outside the
 workspace, 11 configuration error, 12 conflicts need a choice (branch update),
-13 a version manifest cannot be made or used.
+13 a version manifest cannot be made or used, 14 a validation check stopped
+the save, 15 no such asset.
 """
 
 from __future__ import annotations
@@ -605,6 +606,98 @@ def draft_drop(state: State, number: int, yes: bool) -> None:
         click.confirm(f"Drop draft {number}?", abort=True)
     state.session.drafts.drop(number, confirm=True)
     state.out.emit({"dropped": number}, lambda: click.echo(f"Dropped draft {number}"))
+
+
+# --- assets -------------------------------------------------------------------
+
+
+@cli.group()
+def asset() -> None:
+    """Whole assets: every file that makes up "Bob" or a photo (design doc §14).
+
+    SPEC is "kind:id" (for example dedaverse:Bob), or a folder path. The kind
+    names an asset resolver plugin."""
+
+
+@asset.command("files")
+@click.argument("spec")
+@pass_state
+@handles_errors
+def asset_files(state: State, spec: str) -> None:
+    """List the files and folders that make up an asset."""
+    found = state.session.assets.files(spec)
+    state.out.emit(found, lambda: [click.echo(p) for p in found.paths])
+
+
+@asset.command("status")
+@click.argument("spec")
+@click.option("--all", "show_all", is_flag=True, help="Also list files that are up to date.")
+@pass_state
+@handles_errors
+def asset_status(state: State, spec: str, show_all: bool) -> None:
+    """Changed, locked and out-of-date files of an asset."""
+    files = state.session.assets.status(spec)
+    shown = files if show_all else [f for f in files if f.state is not clio.FileState.SYNCED or f.locked_by]
+
+    def human() -> None:
+        for f in shown:
+            click.echo(_status_line(f))
+        if not shown:
+            click.echo("Everything is up to date")
+
+    state.out.emit(shown, human)
+
+
+@asset.command("get")
+@click.argument("spec")
+@click.option("--version", "version", help="latest (default), have, @CHANGE, @LABEL or #REV.")
+@click.option("--preview", is_flag=True, help="Show what would be transferred; change nothing.")
+@pass_state
+@handles_errors
+def asset_get(state: State, spec: str, version: str | None, preview: bool) -> None:
+    """Get every file of an asset."""
+    result = state.session.assets.get(spec, version=version, preview=preview)
+
+    def human() -> None:
+        if isinstance(result, clio.SyncPlan):
+            click.echo(f"Would get {result.file_count} file(s), {_size(result.bytes_to_transfer)}")
+        else:
+            click.echo(f"Got {result.file_count} file(s), {_size(result.bytes_transferred)}"
+                       if result.file_count else "Already up to date")
+
+    state.out.emit(result, human)
+
+
+@asset.command("lock")
+@click.argument("spec")
+@pass_state
+@handles_errors
+def asset_lock(state: State, spec: str) -> None:
+    """Lock every file of an asset."""
+    locks = state.session.assets.lock(spec)
+    state.out.emit(locks, lambda: [click.echo(f"locked  {lk.asset_path}") for lk in locks])
+
+
+@asset.command("unlock")
+@click.argument("spec")
+@pass_state
+@handles_errors
+def asset_unlock(state: State, spec: str) -> None:
+    """Release the locks on an asset."""
+    unlocked = state.session.assets.unlock(spec)
+    state.out.emit(unlocked, lambda: [click.echo(f"unlocked  {p}") for p in unlocked])
+
+
+@asset.command("save")
+@click.argument("spec")
+@click.option("-m", "--message", required=True, help="What changed.")
+@click.option("--no-validate", is_flag=True, help="Skip the validation hooks.")
+@pass_state
+@handles_errors
+def asset_save(state: State, spec: str, message: str, no_validate: bool) -> None:
+    """Save the changes to an asset's files, in one change."""
+    result = state.session.assets.save(spec, message=message, validate=not no_validate)
+    state.out.emit(result, lambda: click.echo(f"Saved change {result.change.number}"))
 
 
 # --- caches -------------------------------------------------------------------

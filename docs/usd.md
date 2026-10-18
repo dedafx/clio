@@ -60,6 +60,23 @@ Before you start:
   `//imagine/main/...` must map to `/work/imagine/...`. Clio does not
   create workspaces yet.
 
+## Words: asset, element, file
+
+USD calls every file a layer or other thing it loads an **asset**.
+Dedaverse calls that same file an **element**, and uses **asset** for
+something bigger: a group of related elements, such as a character "Bob"
+(mesh, look, textures, skeleton, animation, work files and published files).
+In Imagine, an asset is a photograph with all its variants.
+
+This guide is about the first meaning: the plugin takes **one file path** from
+USD, makes sure the file is there (using it as it is if it is on disk,
+syncing it from Perforce if it is not) and, if the context names a
+[manifest](#rendering-on-a-farm-version-manifests), uses the manifest's
+revision. To work on a whole Dedaverse or Imagine asset (get, lock, save all its
+parts), see [asset plugins](workflow.md#whole-assets-asset-resolver-plugins).
+
+---
+
 ## Writing paths in layers
 
 Use paths that plain USD can open:

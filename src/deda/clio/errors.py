@@ -20,6 +20,7 @@ __all__ = [
     "ConfigError",
     "ConfirmationRequiredError",
     "ConflictError",
+    "AssetNotFoundError",
     "IdentifierError",
     "LockedByOtherError",
     "ManifestError",
@@ -127,6 +128,13 @@ class ConflictError(WorkflowError):
         super().__init__(message, **kwargs)
         #: The :class:`~deda.clio.models.Conflict` for each file.
         self.conflicts = tuple(conflicts)
+
+
+class AssetNotFoundError(WorkflowError):
+    """An asset resolver plugin knows no asset of that name, or lists no
+    files for it (design doc §14)."""
+
+    exit_code = 15
 
 
 class ManifestError(WorkflowError):

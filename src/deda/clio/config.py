@@ -82,6 +82,9 @@ class Config:
     #: Built-in validation hooks to run before a save (``no-absolute-paths``,
     #: ``naming``; see ``deda.clio.hooks``). Hooks from entry points always run.
     hooks: tuple[str, ...] = ()
+    #: Which asset resolver plugin a bare asset id means (``folder``, or the
+    #: name of a plugin from the ``deda.clio.resolvers`` entry points).
+    asset_resolver: str = ""
     #: Size limit of the content cache (file bytes fetched for display), in MB.
     content_cache_mb: int = 5120
     #: Regular expression every new file name must match (the ``naming`` hook).

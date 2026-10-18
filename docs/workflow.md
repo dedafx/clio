@@ -71,6 +71,7 @@ clio --project imagine status
 | `cross_branch_locks` | On lock, someone has the file open in a related branch: `warn`, `block` or `off` | `warn` |
 | `connect_timeout`, `timeout` | Seconds to reach the server, and per command | 10, 120 |
 | `hooks` | Built-in checks to run before a save: `no-absolute-paths`, `naming` (a list, or comma-separated text) | none |
+| `asset_resolver` | The asset kind a bare asset id means (`folder`, or a plugin's name) | `folder` |
 | `content_cache_mb` | Size limit of the cache of file content shown in UIs, in MB | 5120 |
 | `naming_pattern` | Regular expression that every new file name must match (the `naming` check) | |
 
@@ -111,7 +112,7 @@ says what to do next.
 save, 8 refused by the server, 9 cancelled or not confirmed, 10 outside the
 workspace, 11 configuration error, 12 conflicts need a choice, 13 a
 version manifest cannot be made or used, 14 a validation check stopped the
-save.
+save, 15 no such asset.
 
 ### Checks before a save
 
@@ -261,6 +262,39 @@ and `p4_messages`: `AuthError`, `ServerUnavailableError`,
 `CancelledError`, `ConfirmationRequiredError`, `NotInWorkspaceError`,
 `ManifestError` (`problems`) and `ValidationError` (`problems`, `issues`).
 Perforce warnings such as "file(s) up-to-date" are never raised.
+
+### Whole assets: asset resolver plugins
+
+Clio works on files. A Dedaverse **asset** (a character "Bob": mesh, look,
+textures, skeleton, animation, work and published files) and an Imagine
+**asset** (a photograph and its variants) are groups of files. An *asset
+resolver plugin* says which files make up an asset; then the everyday actions
+work on all of them together:
+
+```python
+s.assets.files("dedaverse:Bob")            # the project paths of Bob's parts
+s.assets.get("dedaverse:Bob")              # also version=..., preview=True
+s.assets.lock("dedaverse:Bob")
+report = s.assets.status("dedaverse:Bob")
+s.assets.save("dedaverse:Bob", message="Bob: new look")   # one change
+s.assets.activity("dedaverse:Bob")         # recent changes to any part
+```
+
+```
+clio asset files dedaverse:Bob
+clio asset status | get | lock | unlock dedaverse:Bob
+clio asset save dedaverse:Bob -m "Bob: new look"
+```
+
+An asset is written `kind:id`. The `folder` kind is built in: the asset is
+the folder at that path, and a bare path such as `props/crate` means it. Set
+`asset_resolver = "dedaverse"` to make another kind the default for bare ids.
+
+A plugin is a Python object with a `name` and `files(session, asset_id)`
+that returns the project paths (files or folders) of the parts, or raises
+`clio.AssetNotFoundError`. A package declares it in the entry point group
+`deda.clio.resolvers`, or code adds it with `session.assets.register(plugin)`.
+Dedaverse and Imagine each ship their own; Clio imports neither.
 
 ### For user interfaces: `deda.clio.views`
 
