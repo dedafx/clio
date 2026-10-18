@@ -19,7 +19,32 @@ to its own (in Qt, a queued signal).
 """
 
 from deda.clio.views._pipeline import RequestPipeline, Signal
+from deda.clio.views.activity import ActivityRow, ActivityView
+from deda.clio.views.branches import (
+    BranchDiffRow,
+    BranchDiffView,
+    BranchListView,
+    BranchRow,
+    DiffKind,
+    Relation,
+)
 from deda.clio.views.filelist import COLUMNS, FileListView, FileRow
 from deda.clio.views.history import HistoryRow, HistoryView
 
-__all__ = ["COLUMNS", "FileListView", "FileRow", "HistoryRow", "HistoryView", "RequestPipeline", "Signal"]
+__all__ = [
+    "COLUMNS",
+    "ActivityRow",
+    "ActivityView",
+    "BranchDiffRow",
+    "BranchDiffView",
+    "BranchListView",
+    "BranchRow",
+    "DiffKind",
+    "FileListView",
+    "FileRow",
+    "HistoryRow",
+    "HistoryView",
+    "Relation",
+    "RequestPipeline",
+    "Signal",
+]

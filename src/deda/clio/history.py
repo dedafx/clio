@@ -58,6 +58,8 @@ class HistoryCache:
         #: Who submitted a revision: immutable, kept for the process (§9.2).
         self.revisions: OrderedDict[tuple[str, int], Revision] = OrderedDict()
         self.max_revisions = 20000
+        #: The files of a submitted change: immutable, kept for the process.
+        self.change_files: OrderedDict[int, tuple[str, ...]] = OrderedDict()
 
     @classmethod
     def for_server(cls, server_id: str, user: str) -> HistoryCache:
@@ -305,3 +307,4 @@ class History:
             cache.scopes.clear()
             cache.listings.clear()
             cache.revisions.clear()
+            cache.change_files.clear()

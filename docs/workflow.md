@@ -318,6 +318,31 @@ hist.fetch_more()                             # the next, older page, when the u
 path = hist.content(2).result()               # that revision's bytes, in the content cache
 ```
 
+Two more views cover the activity feed and branches:
+
+```python
+from deda.clio.views import ActivityView, BranchListView, BranchDiffView
+
+feed = ActivityView(s, "props", page_size=20)            # changes under a folder, newest first
+feed.rows_inserted.connect(on_inserted)                  # (first, last): news at the top, older pages at the end
+feed.fetch_more()                                        # going back in time
+today = ActivityView(s, "props", since=midnight)         # a "today" feed: stops at the date
+bob = ActivityView(s, s.assets.files("dedaverse:Bob").paths)   # one feed for an asset's parts
+feed.files(0).result()                                   # the depot paths in that change
+
+branches = BranchListView(s)       # rows: branch + relation (current, parent, child, sibling)
+branches.behind                    # files the parent changed since your last update; None on a mainline
+diff = BranchDiffView(s)           # files that differ between your branch and its parent
+[(r.asset_path, r.kind) for r in diff]    # different, only_here, only_there
+```
+
+The feed shows its cached rows at once and checks for news with the cheap
+watermark call; the files of the changes on screen are one `describe` and are
+kept (a submitted change never changes). The branch list is one `streams` plus
+one `merge -n` for the behind count. The branch diff is one `diff2` however many
+files there are. All three are display only: switching, updating and publishing
+ask the server themselves.
+
 * **One call opens a folder.** The whole folder is listed with one `fstat`,
   and kept, so a second view of the same folder has its rows at once.
 * **Rows say how fresh they are** (`FRESH`, `STALE`, or the view is
