@@ -203,6 +203,8 @@ NB_MODULE(_core, m) {
             "path"_a,
             "Resolve a local path as USD would: a workspace path uses the settings pin, a "
             "version-store path the version its folder holds. None if not managed or not available.")
+        .def_prop_ro("sync_commands_run", &AssetResolver::syncCommandsRun,
+                     "How many 'p4 sync' commands this resolver has run (misses are batched).")
         .def("manages", &AssetResolver::manages, "path"_a,
              "True if the path is inside the workspace root or this project's version store.")
         .def("resolve_for_new_asset", &AssetResolver::resolveForNewAsset, "identifier"_a)

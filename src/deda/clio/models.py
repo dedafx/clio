@@ -17,6 +17,7 @@ __all__ = [
     "Change",
     "Conflict",
     "Draft",
+    "EditReport",
     "FileState",
     "FileStatus",
     "Freshness",
@@ -31,6 +32,19 @@ __all__ = [
     "SyncedFile",
     "UpdateResult",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class EditReport:
+    """Files made ready to be written (design doc §10.6)."""
+
+    #: Asset paths open for edit now (including files that already were).
+    opened: tuple[str, ...] = ()
+    #: Asset paths that are not in Perforce yet. Add them with
+    #: ``Workspace.add_new`` once they have been written.
+    new: tuple[str, ...] = ()
+    #: Things the user should know, for example that a copy is out of date.
+    warnings: tuple[str, ...] = ()
 
 
 class FileState(Enum):

@@ -15,6 +15,18 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
+
+__all__ = [
+    "PrepareReport",
+    "create_context",
+    "finish_edit",
+    "plugin_path",
+    "prepare",
+    "prepare_for_edit",
+    "register_plugin",
+    "resolver_settings",
+]
 
 _RESOURCES = Path(__file__).parent / "plugin" / "clioUsd" / "resources"
 
@@ -53,3 +65,16 @@ def create_context(settings: str):
     from pxr import Ar
 
     return Ar.GetResolver().CreateContextFromString(settings)
+
+
+_LAZY = ("PrepareReport", "finish_edit", "prepare", "prepare_for_edit", "resolver_settings")
+
+
+def __getattr__(name: str) -> Any:
+    # The Python-only path (option A, design doc §10.2) lives in _prepare;
+    # it is loaded on first use so that importing this module stays cheap.
+    if name in _LAZY:
+        from deda.clio.usd import _prepare
+
+        return getattr(_prepare, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

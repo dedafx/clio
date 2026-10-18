@@ -966,6 +966,18 @@ How it works (the "wave" walker):
 5. Keep the opened layers alive until `Usd.Stage.Open` runs. USD's layer
    registry then reuses them, so each layer is parsed only once.
 
+*As built (phase 4).* `prepare` walks the waves on a thread pool and
+resolves each wave through `deda.clio._core.AssetResolver`, so the C++
+coalescer (§10.3) turns a wave into one `sync` (or parallel `print`s for a
+pinned version) and the files land exactly where the plugin puts them. That
+shares the placement rules instead of repeating them in Python, which is the
+"one specification" this section asks for. Payloads are filtered by prim,
+`assets` collects asset-valued attributes (default and time samples) and clip
+asset paths, and `` `expressions` `` are reported, not evaluated. Layers
+opened by the walk are kept in the report so that `Usd.Stage.Open` reuses
+them. `prepare_for_edit` and `finish_edit` are the Python side of §10.6, over
+`Workspace.open_for_edit` and `Workspace.add_new`.
+
 Pros: pure Python, works in every DCC today, no compiled USD plugin, easy to
 debug. Cons: works from layer content, so it is a *superset*. It syncs every
 variant's references, not only the selected ones (can be filtered by the

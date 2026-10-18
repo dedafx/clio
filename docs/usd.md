@@ -353,6 +353,56 @@ info.resolverInfo["depotPath"]     # "//imagine/main/assets/crate/crate.usda"
 `GetAssetInfo` makes no server calls. Outside the project, or with no Clio
 context, it returns what USD's default resolver returns.
 
+## Without the plugin: `prepare`
+
+For a DCC or USD version the plugin is not built for, for a farm prefetch,
+or when you want to see what a stage needs, `deda.clio.usd.prepare` does the
+same job in Python. It needs USD's Python bindings, not the plugin.
+
+```python
+from deda import clio
+from deda.clio import usd as clio_usd
+from pxr import Usd
+
+session = clio.connect(...)
+report = clio_usd.prepare(
+    session, "shots/sq010/sh0100/shot.usda",
+    pin="@18234",          # "have" (default), "latest", "@<change>" or "@<label>"
+    payloads="all",        # "all", "none", or callable(prim_path, asset_path) -> bool
+    assets=True,           # also textures, clips and volumes
+    progress=print)
+stage = Usd.Stage.Open(report.root_path)     # every file is already on disk
+```
+
+It reads each layer, collects the sublayers, references, payloads and (with
+`assets`) asset paths, and gets them all in one round. A shot that is five
+layers deep takes about five rounds, each one `p4 sync` (or parallel
+`p4 print` for a pinned version), not one command per file. The files go
+where the plugin would put them, because both use the same C++ core, so a
+stage opened from `report.root_path` sees the same files either way.
+
+`report` lists the `layers` and `assets` it reached, the `missing`
+references (a missing file is reported, not an error) and `warnings` (for
+example a local file used instead of the exact version, or a path written as
+an expression, which is not evaluated). The walk reads layer contents, so it
+covers every variant, not only the selected ones; `payloads` narrows it. It
+cannot react to a variant switch later; the plugin can.
+
+To get layers ready to be saved without the plugin, call
+`prepare_for_edit` from the DCC's save callback and `finish_edit` after the
+save:
+
+```python
+edit = clio_usd.prepare_for_edit(session, ["assets/crate/crate.usda", "assets/crate/new.usda"])
+layer.Save()
+clio_usd.finish_edit(session, edit)       # opens new files for add
+```
+
+`prepare_for_edit` opens existing files for edit (one `fstat` and one `edit`
+for all of them), raises `LockedByOtherError` before opening anything if
+someone else holds a lock, and lists in `edit.new` the files that are not in
+Perforce yet. Like the plugin, it never submits.
+
 ## Using the same rules from Python, without USD
 
 `deda.clio` exposes the resolver core. It is the same C++ code the plugin

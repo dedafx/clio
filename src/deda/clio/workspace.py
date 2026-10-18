@@ -32,6 +32,7 @@ from deda.clio.errors import (
 from deda.clio.events import CancelToken, ProgressCallback, ProgressEvent
 from deda.clio.models import (
     Change,
+    EditReport,
     FileState,
     FileStatus,
     Lock,
@@ -370,6 +371,77 @@ class Workspace:
             if text.startswith(depot) and (m := re.search(r"(?:locked|also opened) by (\S+)@(\S+)", text)):
                 self._raise_locked(depot, m.group(1), m.group(2), messages)
         raise WorkflowError(f"Could not open {self._asset(depot)} for editing", p4_messages=messages)
+
+    def open_for_edit(self, *paths: PathArg, local_base: Path | None = None) -> EditReport:
+        """Get files ready to be written, as the USD plugin does when a layer
+        is saved (design doc §10.6): open them for edit (a ``+l`` file type
+        locks them by that), in one ``fstat`` and one ``edit`` however many
+        files there are. Never submits.
+
+        Files that are not in Perforce yet are reported in ``new``; write
+        them, then call :meth:`add_new`. Raises :class:`LockedByOtherError`
+        before opening anything if someone else holds a lock, and
+        :class:`NotInWorkspaceError` for a file that is in Perforce but not in
+        this workspace. A copy that is not the latest version is a warning.
+        """
+        s = self._session
+        targets = self.targets(paths, local_base=local_base)
+        folders = [t.asset_path or "." for t in targets if t.is_folder]
+        if folders:
+            raise WorkflowError(f"open_for_edit takes files, not folders: {', '.join(folders)}",
+                                hint="List the files to be written")
+        records = {r["depotFile"]: r for r in
+                   self._run("fstat", [t.depot_spec(s.paths.depot_root) for t in targets]).records
+                   if "depotFile" in r}
+
+        to_edit: list[Target] = []
+        already: list[str] = []
+        new: list[str] = []
+        warnings: list[str] = []
+        for target in targets:
+            depot = s.paths.depot_path(target.asset_path)
+            rec = records.get(depot)
+            if rec is not None and rec.get("action"):
+                already.append(target.asset_path)
+            elif rec is None or rec.get("headAction") in _DELETED_AT_HEAD:
+                new.append(target.asset_path)
+            else:
+                self._raise_if_locked_by_other(depot, rec)
+                have, head = _int(rec.get("haveRev")), _int(rec.get("headRev"))
+                if have is None:
+                    raise NotInWorkspaceError(
+                        f"{target.asset_path} is in Perforce but not in your workspace",
+                        hint="Get the file first ('clio get'), then change it")
+                if have != head:
+                    warnings.append(f"{target.asset_path}: your copy is not the latest version")
+                to_edit.append(target)
+
+        opened = list(already)
+        if to_edit:
+            result = self._run("edit", [os.fspath(s.paths.local_path(t.asset_path)) for t in to_edit])
+            done = {r["depotFile"] for r in result.records if r.get("action")}
+            for target in to_edit:
+                depot = s.paths.depot_path(target.asset_path)
+                if depot not in done:
+                    self._raise_open_failure(depot, result.texts)
+                opened.append(target.asset_path)
+        return EditReport(tuple(sorted(opened)), tuple(sorted(new)), tuple(warnings))
+
+    def add_new(self, *paths: PathArg, local_base: Path | None = None) -> tuple[str, ...]:
+        """Open files for add (``p4 add``), in one command: the second half
+        of :meth:`open_for_edit` for files it reported as new. A path that was
+        not written is skipped. Returns the asset paths opened for add."""
+        s = self._session
+        files = []
+        for target in self.targets(paths, local_base=local_base):
+            local = s.paths.local_path(target.asset_path)
+            if not target.is_folder and local.is_file():
+                files.append((target.asset_path, os.fspath(local)))
+        if not files:
+            return ()
+        result = self._check(self._run("add", ["-f", *(local for _, local in files)]), "add files")
+        opened = {s.paths.asset_path_of_depot(r["depotFile"]) for r in result.records if r.get("action")}
+        return tuple(sorted(opened))
 
     def unlock(self, *paths: PathArg, local_base: Path | None = None) -> tuple[str, ...]:
         """Release locks. Files that were not changed are closed again
