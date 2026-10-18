@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.5. Phase 0 (C++ core, Python bindings, USD resolver), phase 1 (Python workflow services, `clio` CLI, history cache), phase 2 (branches and drafts) and phase 3 (performance) are implemented; see [workflow.md](workflow.md), [usd.md](usd.md) and [building.md](building.md). |
+| **Status** | Draft v0.6. Phase 0 (C++ core, Python bindings, USD resolver), phase 1 (Python workflow services, `clio` CLI, history cache), phase 2 (branches and drafts), phase 3 (performance) and phase 4 (USD write side, timestamps, `prepare`) are implemented; see [workflow.md](workflow.md), [usd.md](usd.md) and [building.md](building.md). |
 | **Package** | `deda.clio` (Python namespace package) |
 | **Targets** | Python 3.13 · USD 26.08 (primary) and USD 25.08 or later · no DCCs yet |
 | **Consumers** | Standalone Python, the `clio` CLI, and USD. Dedaverse, Imagine and DCC integrations are later work. |
@@ -1622,7 +1622,7 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
 | **1 — Core workflow** *(done)* | Python services over `CoreBackend`: connect/login/setup, get (parallel), lock/unlock, save, status, discard, history and folder activity backed by the HistoryCache with watermark refresh (§9.3–9.4), and the `clio` CLI for these ([workflow.md](workflow.md)). Baseline benchmarks ([benchmarks.md](benchmarks.md)). *Deferred:* per-file progress (P4API's progress hook is not exposed yet), a status cache (phase 3), `clio doctor` (phase 5). |
 | **2 — Branching** *(done)* | Streams/task streams, switch, update/publish with binary conflict handling, cross-branch lock check, drafts (shelves) ([workflow.md](workflow.md#branches-and-drafts)). *Deferred:* updating or publishing part of a branch, taking a draft into another branch, virtual streams, stream spec editing (paths, imports). |
 | **3 — Performance** *(done)* | Stat-first disk check for `status` and `save` ([benchmarks.md](benchmarks.md#phase-3-the-disk-check-2026-10-12)); `ConnectionPool` in `clio_core`; the miss coalescer (single-flight plus a batching window for `sync`, parallel fetches of pinned versions); time-bounded resolver memo (§8.3, §10.3 "As built"). *Measured and not built:* C++ hashing, scan and diff, a persistent store and a Python status cache (see [benchmarks.md](benchmarks.md#phase-3-what-was-not-built-2026-10-18)). |
-| **4 — USD completion** | Write side (edit/lock on save, §10.6); revision-based timestamps; `deda.clio.usd.prepare` (option A); CI builds against USD 26.08 and 25.08. |
+| **4 — USD completion** *(done, CI not yet run)* | Write side: edit/add on save, refuse on another user's lock (§10.6); revision-based timestamps for `modtime` clients (§10.3); `deda.clio.usd.prepare`, `prepare_for_edit` and `finish_edit` (option A, §10.2). A Linux CI workflow builds and tests against USD 26.08 and 25.08 (`.github/workflows/ci.yml`); it has not run on GitHub yet. *Deferred:* locking a layer before it is edited (today the edit happens at save), submit hooks. |
 | **4½ — Version manifests** | `Manifest` create/save/load/fetch/check/diff (§10.8), `manifest=` context setting, content-addressed pool, `clio usd manifest` CLI, farm guide (proxy + `policy=verify`). |
 | **5 — Ecosystem** | UI view models (`FileListView`, `HistoryView`) with the request pipeline, ContentCache (§9.5), asset resolver plugins, validation hooks, `clio doctor`. Dedaverse/DCC integration when targeted. |
 

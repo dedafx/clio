@@ -130,6 +130,13 @@ the USD tests are skipped when `pxr` or the plugin is missing. Set
 `CLIO_TEST_USD_PLUGIN` to a `.../clioUsd/resources` folder to test a plugin
 from a CMake build tree.
 
+## CI
+
+`.github/workflows/ci.yml` follows the steps above on Ubuntu, once for each
+supported USD version (26.08 and 25.08, cached after the first build) and
+once without USD. It has not run on GitHub yet; fix it as the first runs
+show. Windows is built by hand for now.
+
 ## 5. Using the resolver
 
 See [usd.md](usd.md) for the full guide. In short:
