@@ -4,7 +4,30 @@
 
 namespace clio::core {
 
-AssetResolver::AssetResolver(Settings settings) : _workspace(std::move(settings)) {}
+AssetResolver::AssetResolver(Settings settings, Clock clock)
+    : _clock(std::move(clock)),
+      _workspace(std::move(settings)),
+      _syncBatcher(
+          [this](const std::vector<AssetIdentifier>& ids, const Pin& pin, bool force) {
+              _workspace.sync(ids, pin, force);
+              std::lock_guard<std::mutex> lock(_haveMutex);
+              _haveCache.clear(); // revisions have changed
+          },
+          _workspace.settings().batchWindow) {
+    const auto& manifestPath = _workspace.settings().manifest;
+    if (!manifestPath.empty()) {
+        _manifest = Manifest::load(manifestPath.string());
+        if (_manifest->depot() != _workspace.settings().depotRoot) {
+            throw ConfigError("The manifest " + manifestPath.string() + " is for " + _manifest->depot() +
+                              ", not " + _workspace.settings().depotRoot);
+        }
+        _workspace.useManifest(*_manifest);
+    }
+}
+
+std::chrono::steady_clock::time_point AssetResolver::_now() const {
+    return _clock ? _clock() : std::chrono::steady_clock::now();
+}
 
 Pin AssetResolver::effectivePin(const AssetIdentifier& id) const {
     return id.pin() ? *id.pin() : settings().pin;
@@ -17,21 +40,35 @@ std::optional<ResolvedAsset> AssetResolver::resolve(const AssetIdentifier& id) {
     {
         std::lock_guard<std::mutex> lock(_memoMutex);
         if (auto it = _memo.find(key); it != _memo.end()) {
-            return it->second;
+            if (it->second.forever || _now() < it->second.expires) {
+                return it->second.asset;
+            }
+            _memo.erase(it); // too old: ask again
         }
     }
 
-    // TODO(design §10.3): route misses through the coalescer so concurrent
-    // misses from USD worker threads become one batched sync.
+    // Threads that miss on the same asset share one resolve.
+    return _resolves.run(key, [&] { return _resolveAndRemember(id, pin, key); });
+}
+
+std::optional<ResolvedAsset> AssetResolver::_resolveAndRemember(const AssetIdentifier& id, const Pin& pin,
+                                                                const std::string& key) {
     bool serverAnswered = false;
     std::optional<ResolvedAsset> resolved = _resolveUncached(id, pin, serverAnswered);
     // A fallback answer is not remembered, so the exact version is fetched
     // once the server is reachable again. "Not found" is remembered only
     // when the server said so.
     const bool remember = resolved ? resolved->warning.empty() : serverAnswered;
-    if (remember) {
+    if (!remember) {
+        return resolved;
+    }
+    // A change or revision names content that never changes (design §8.3
+    // rule 2). Everything else can move and is only trusted for a while.
+    const bool forever = pin.kind() == Pin::Kind::Change || pin.kind() == Pin::Kind::Revision;
+    const auto ttl = settings().cacheTtl;
+    if (forever || ttl.count() > 0) {
         std::lock_guard<std::mutex> lock(_memoMutex);
-        _memo.emplace(key, resolved);
+        _memo[key] = MemoEntry{resolved, forever, _now() + ttl};
     }
     return resolved;
 }
@@ -50,11 +87,11 @@ std::optional<ResolvedAsset> AssetResolver::resolvePath(const std::filesystem::p
 
 bool AssetResolver::_serverAvailable() const {
     const auto retryAt = _serverRetryAt.load();
-    return retryAt == 0 || std::chrono::steady_clock::now().time_since_epoch().count() >= retryAt;
+    return retryAt == 0 || _now().time_since_epoch().count() >= retryAt;
 }
 
 void AssetResolver::_markServerUnavailable() {
-    const auto retryAt = std::chrono::steady_clock::now() + serverRetryInterval;
+    const auto retryAt = _now() + serverRetryInterval;
     _serverRetryAt.store(retryAt.time_since_epoch().count());
 }
 
@@ -69,8 +106,45 @@ std::optional<ResolvedAsset> AssetResolver::_useWorkspaceFile(ResolvedAsset asse
     return asset;
 }
 
+std::optional<ResolvedAsset> AssetResolver::_resolveFromManifest(const AssetIdentifier& id, const Pin& pin,
+                                                                 bool& serverAnswered) {
+    const Policy policy = settings().policy;
+    const ManifestEntry* entry = _manifest->find(id.relativePath());
+    if (!entry) {
+        if (policy != Policy::Sync) {
+            return std::nullopt; // nothing outside the manifest is ever loaded
+        }
+        auto asset = _resolveUncached(id, pin, serverAnswered, /*ignoreManifest=*/true);
+        if (asset) {
+            const std::string note = id.path() + " is not in the manifest " + _manifest->folderName().substr(9, 8);
+            asset->warning = asset->warning.empty() ? note : note + "; " + asset->warning;
+        }
+        return asset;
+    }
+    ResolvedAsset asset{id, Pin::revision(entry->rev), _workspace.depotPath(id),
+                        _workspace.manifestPath(*_manifest, entry->path), {}};
+    if (std::filesystem::exists(asset.localPath)) {
+        return asset;
+    }
+    if (policy != Policy::Sync || !_serverAvailable()) {
+        return std::nullopt; // verify: the manifest must be fetched first
+    }
+    try {
+        _workspace.materialize(*_manifest, *entry, /*verifyPresent=*/false);
+        serverAnswered = true;
+        return asset;
+    } catch (const P4Error&) {
+        _markServerUnavailable();
+        return std::nullopt;
+    }
+}
+
 std::optional<ResolvedAsset> AssetResolver::_resolveUncached(const AssetIdentifier& id,
-                                                             const Pin& pin, bool& serverAnswered) {
+                                                             const Pin& pin, bool& serverAnswered,
+                                                             bool ignoreManifest) {
+    if (_manifest && !ignoreManifest) {
+        return _resolveFromManifest(id, pin, serverAnswered);
+    }
     const Policy policy = settings().policy;
     ResolvedAsset asset{id, pin, _workspace.depotPath(id), {}, {}};
     const bool mayContactServer = policy == Policy::Sync && _serverAvailable();
@@ -103,6 +177,8 @@ std::optional<ResolvedAsset> AssetResolver::_resolveUncached(const AssetIdentifi
             return _useWorkspaceFile(asset, policy == Policy::Offline ? "Offline" : unavailable);
         }
         try {
+            // Different files fetch in parallel on pooled connections; the
+            // same file is never fetched twice at once (single-flight).
             const FetchResult result = _workspace.fetchVersion(id, pin);
             serverAnswered = true;
             if (result == FetchResult::NotFound) {
@@ -135,11 +211,11 @@ std::optional<ResolvedAsset> AssetResolver::_resolveUncached(const AssetIdentifi
         if (mayContactServer) {
             try {
                 // Never synced to this workspace: take the latest revision.
-                _workspace.sync({id}, Pin::latest());
+                _syncBatcher.sync(id, Pin::latest());
                 if (!std::filesystem::exists(asset.localPath)) {
                     // Perforce thinks it is here, but it was deleted from
                     // disk: restore the revision the workspace has.
-                    _workspace.sync({id}, Pin::have(), /*force=*/true);
+                    _syncBatcher.sync(id, Pin::have(), /*force=*/true);
                 }
                 serverAnswered = true;
             } catch (const P4Error&) {
@@ -154,9 +230,9 @@ std::optional<ResolvedAsset> AssetResolver::_resolveUncached(const AssetIdentifi
 
     if (pin.kind() == Pin::Kind::Latest && mayContactServer) {
         try {
-            // A no-op on the server when the file is already current.
-            // TODO(design §10.3): skip the call when the file is known current.
-            _workspace.sync({id}, pin);
+            // A no-op on the server when the file is already current; the
+            // memo skips the call for `cacheTtl` after an answer.
+            _syncBatcher.sync(id, pin);
             serverAnswered = true;
         } catch (const P4Error& e) {
             _markServerUnavailable();
@@ -175,7 +251,85 @@ std::filesystem::path AssetResolver::resolveForNewAsset(const AssetIdentifier& i
     return _workspace.workspacePath(id);
 }
 
+std::optional<double> AssetResolver::revisionTimestamp(const std::filesystem::path& localPath) {
+    if (settings().policy != Policy::Sync || !_serverAvailable()) {
+        return std::nullopt;
+    }
+    const auto match = _workspace.matchLocalPath(localPath);
+    if (!match || match->inVersionStore) {
+        return std::nullopt; // stored versions never change; their file time is fine
+    }
+    const std::string key = match->id.path();
+    try {
+        if (!_workspace.clientUsesModtime()) {
+            return std::nullopt;
+        }
+        std::optional<HaveInfo> info;
+        bool cached = false;
+        {
+            std::lock_guard<std::mutex> lock(_haveMutex);
+            if (auto it = _haveCache.find(key); it != _haveCache.end() && _now() < it->second.expires) {
+                info = it->second.info;
+                cached = true;
+            }
+        }
+        if (!cached) {
+            info = _workspace.haveInfo(match->id);
+            std::lock_guard<std::mutex> lock(_haveMutex);
+            _haveCache[key] = HaveEntry{info, _now() + settings().cacheTtl};
+        }
+        if (!info || info->opened) {
+            return std::nullopt;
+        }
+        return static_cast<double>(info->haveRev);
+    } catch (const P4Error&) {
+        _markServerUnavailable();
+        return std::nullopt;
+    }
+}
+
+WriteCheck AssetResolver::prepareForWrite(const AssetIdentifier& id) {
+    if (settings().policy != Policy::Sync) {
+        return {};
+    }
+    const std::string notSaved = "; the file is saved locally and not opened for edit in Perforce";
+    if (!_serverAvailable()) {
+        WriteCheck check;
+        check.warning = "Perforce is not available" + notSaved;
+        return check;
+    }
+    {
+        // Opening the file for edit changes what its timestamp should be.
+        std::lock_guard<std::mutex> lock(_haveMutex);
+        _haveCache.erase(id.path());
+    }
+    try {
+        return _workspace.prepareForWrite(id);
+    } catch (const P4Error& e) {
+        _markServerUnavailable();
+        WriteCheck check;
+        check.warning = std::string("Perforce is not available (") + e.what() + ")" + notSaved;
+        return check;
+    }
+}
+
+std::string AssetResolver::finishWrite(const AssetIdentifier& id) {
+    if (settings().policy != Policy::Sync || !_serverAvailable()) {
+        return {};
+    }
+    try {
+        return _workspace.addNewFile(id);
+    } catch (const P4Error& e) {
+        _markServerUnavailable();
+        return id.path() + " was saved but not added to Perforce (" + e.what() + ")";
+    }
+}
+
 void AssetResolver::refresh() {
+    {
+        std::lock_guard<std::mutex> lock(_haveMutex);
+        _haveCache.clear();
+    }
     std::lock_guard<std::mutex> lock(_memoMutex);
     _memo.clear();
     _serverRetryAt.store(0);

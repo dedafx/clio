@@ -17,6 +17,7 @@ __all__ = [
     "Change",
     "Conflict",
     "Draft",
+    "EditReport",
     "FileState",
     "FileStatus",
     "Freshness",
@@ -31,6 +32,19 @@ __all__ = [
     "SyncedFile",
     "UpdateResult",
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class EditReport:
+    """Files made ready to be written (design doc §10.6)."""
+
+    #: Asset paths open for edit now (including files that already were).
+    opened: tuple[str, ...] = ()
+    #: Asset paths that are not in Perforce yet. Add them with
+    #: ``Workspace.add_new`` once they have been written.
+    new: tuple[str, ...] = ()
+    #: Things the user should know, for example that a copy is out of date.
+    warnings: tuple[str, ...] = ()
 
 
 class FileState(Enum):
@@ -121,6 +135,8 @@ class SaveResult:
     added: tuple[str, ...] = ()
     edited: tuple[str, ...] = ()
     deleted: tuple[str, ...] = ()
+    #: Warnings from validation hooks (errors stop the save).
+    warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -212,6 +228,7 @@ class Draft:
 class Freshness(Enum):
     FRESH = "fresh"  # checked against the server within the polling interval
     STALE = "stale"  # from the cache, not re-checked (the server was not asked)
+    LOADING = "loading"  # nothing yet: the first answer is on its way
 
 
 @dataclass(frozen=True, slots=True)

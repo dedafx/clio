@@ -53,6 +53,16 @@ def test_settings_canonical_form():
     assert a.pin == clio.Pin.have()  # the default: the file on disk, synced only if missing
 
 
+def test_settings_pool_and_cache_options():
+    default = clio.Settings.parse("root=/w;depot=//d/main;store=/s")
+    assert (default.max_connections, default.batch_ms, default.cache_ttl) == (4, 20, 60)
+    tuned = clio.Settings.parse("root=/w;depot=//d/main;store=/s;connections=2;batch_ms=0;cache_ttl=5")
+    assert (tuned.max_connections, tuned.batch_ms, tuned.cache_ttl) == (2, 0, 5)
+    assert str(tuned) == "depot=//d/main;root=/w;store=/s;connections=2;batch_ms=0;cache_ttl=5"
+    with pytest.raises(clio.ConfigError):
+        clio.Settings.parse("root=/w;depot=//d/main;connections=0")
+
+
 def test_connection_does_not_prompt_without_callback():
     # No server is contacted before the first command.
     conn = clio.Connection(port="localhost:1", timeout=5)

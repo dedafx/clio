@@ -1,0 +1,91 @@
+name: CI
+
+# Builds Clio on Linux against each supported OpenUSD version and runs the
+# C++, Python and USD tests (design doc §15, phase 4). The steps follow
+# docs/building.md.
+#
+# Not yet run on GitHub: it was written from the local Windows build and
+# building.md. Expect to fix the first run (paths, package names, the USD
+# site-packages folder). Windows is not in the matrix yet.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  P4_RELEASE: r26.1
+  P4_API_FILE: p4api-glibc2.12-openssl3.tgz
+
+jobs:
+  test:
+    name: Linux, USD ${{ matrix.usd }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # `usd: none` builds the core and the Python package only.
+        usd: ["26.08", "25.08", "none"]
+        include:
+          # Where USD's build script puts its Python modules (building.md §4).
+          - usd: "26.08"
+            usd_python: lib/python3.13/site-packages
+          - usd: "25.08"
+            usd_python: lib/python
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: System packages
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build libssl-dev
+
+      - name: Perforce API and p4d
+        run: |
+          B=https://ftp.perforce.com/perforce/${P4_RELEASE}/bin.linux26x86_64
+          curl -fsSO $B/SHA256SUMS -fsSO $B/${P4_API_FILE} -fsSO $B/p4d
+          grep -E "\*(${P4_API_FILE}|p4d)\$" SHA256SUMS | sha256sum -c -
+          mkdir p4api && tar -xzf ${P4_API_FILE} -C p4api --strip-components=1
+          chmod +x p4d
+          echo "CLIO_P4API_ROOT=$PWD/p4api" >> "$GITHUB_ENV"
+          echo "CLIO_TEST_P4D=$PWD/p4d" >> "$GITHUB_ENV"
+
+      - name: OpenUSD ${{ matrix.usd }} (cached)
+        if: matrix.usd != 'none'
+        id: usd-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/usd-${{ matrix.usd }}
+          key: usd-${{ matrix.usd }}-py3.13-ubuntu-24.04-v1
+
+      - name: Build OpenUSD ${{ matrix.usd }}
+        if: matrix.usd != 'none' && steps.usd-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v${{ matrix.usd }} https://github.com/PixarAnimationStudios/OpenUSD.git
+          python OpenUSD/build_scripts/build_usd.py \
+              --no-imaging --no-examples --no-tutorials --no-tools --no-docs --no-materialx \
+              --python --build-variant release ~/usd-${{ matrix.usd }}
+
+      - name: Configure USD environment
+        if: matrix.usd != 'none'
+        run: |
+          echo "PXR_ROOT=$HOME/usd-${{ matrix.usd }}" >> "$GITHUB_ENV"
+          echo "CLIO_BUILD_USD=ON" >> "$GITHUB_ENV"
+          echo "PYTHONPATH=$HOME/usd-${{ matrix.usd }}/${{ matrix.usd_python }}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$HOME/usd-${{ matrix.usd }}/lib" >> "$GITHUB_ENV"
+
+      - name: C++ tests
+        run: |
+          python -m pip install nanobind scikit-build-core
+          PRESET=$([ "${{ matrix.usd }}" = none ] && echo dev || echo dev-usd)
+          cmake --preset $PRESET
+          cmake --build --preset $PRESET
+          ctest --test-dir build/$PRESET --output-on-failure
+
+      - name: Install Clio and run the Python and USD tests
+        run: |
+          python -m pip install pytest
+          python -m pip install .
+          python -m pytest -q

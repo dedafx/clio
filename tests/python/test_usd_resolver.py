@@ -276,3 +276,232 @@ def test_one_process_keeps_stages_at_different_pins_apart(p4_server):
     assert out.returncode == 0, out.stderr
 
     assert json.loads(out.stdout.strip().splitlines()[-1]) == [[2, 2], [1, 1], [2, 2]]
+
+
+# --- the write side (design §10.6) ---------------------------------------
+
+_SAVE_SCRIPT = textwrap.dedent(
+    """
+    import json, sys
+    from pxr import Ar, Sdf, Tf
+
+    settings, path, mode = sys.argv[1:4]
+    ctx = Ar.GetResolver().CreateContextFromString(settings) if settings else None
+    errors = []
+    saved = False
+    try:
+        with Ar.ResolverContextBinder(ctx) if ctx else Ar.ResolverContextBinder(Ar.ResolverContext()):
+            mark = Tf.Error.Mark()
+            if mode == "new":
+                layer = Sdf.Layer.CreateNew(path)
+            else:
+                layer = Sdf.Layer.FindOrOpen(path)
+            prim = Sdf.PrimSpec(layer, "Written", Sdf.SpecifierDef)
+            Sdf.AttributeSpec(prim, "version", Sdf.ValueTypeNames.Int).default = 99
+            saved = bool(layer.Save())
+            errors = [e.commentary for e in mark.GetErrors()]
+    except Exception as e:  # Tf errors surface as exceptions in some builds
+        errors.append(str(e))
+    print(json.dumps({"saved": saved, "errors": errors}))
+    """
+)
+
+
+def _save_layer(settings: str, path: Path, mode: str, *, plugin: Path | None):
+    out = subprocess.run([sys.executable, "-c", _SAVE_SCRIPT, settings, os.fspath(path), mode],
+                         env=_env(plugin), capture_output=True, text=True, check=False)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout.strip().splitlines()[-1]), out.stderr
+
+
+def _opened(server) -> dict[str, str]:
+    result = server.connection().run("opened", ["//depot/proj/..."])
+    return {r["depotFile"].removeprefix("//depot/proj/"): r["action"] for r in result.records}
+
+
+def test_saving_a_layer_opens_it_for_edit(p4_server):
+    resources = _plugin_resources()
+    _submit_v1_v2(p4_server)
+    crate = p4_server.workspace_root / "assets/crate/crate.usda"
+
+    result, stderr = _save_layer(p4_server.settings_text(), crate, "edit", plugin=resources)
+
+    assert result["saved"], (result, stderr)
+    assert "Written" in crate.read_text()
+    assert _opened(p4_server) == {"assets/crate/crate.usda": "edit"}  # opened, never submitted
+
+
+def test_saving_a_new_layer_adds_it_after_it_is_written(p4_server):
+    resources = _plugin_resources()
+    _submit_v1_v2(p4_server)
+    new_layer = p4_server.workspace_root / "assets/crate/new_layer.usda"
+
+    result, stderr = _save_layer(p4_server.settings_text(), new_layer, "new", plugin=resources)
+
+    assert result["saved"], (result, stderr)
+    assert new_layer.is_file()
+    assert _opened(p4_server) == {"assets/crate/new_layer.usda": "add"}
+
+
+def _lock_from_another_workspace(server, tmp_path: Path, depot_file: str) -> None:
+    from deda import clio
+
+    root = tmp_path / "other_ws"
+    root.mkdir()
+    spec = (f"Client: other_ws\nOwner: clio_tester\nRoot: {root}\n"
+            "Options: allwrite noclobber nocompress unlocked nomodtime normdir\nLineEnd: local\n"
+            "View:\n\t//depot/proj/... //other_ws/...\n")
+    server.connection().run_or_throw("client", ["-i"], spec)
+    other = clio.Connection(port=server.port, user="clio_tester", client="other_ws", cwd=os.fspath(root),
+                            tickets=os.fspath(server.tickets))
+    other.run_or_throw("sync", ["-q", depot_file])
+    other.run_or_throw("edit", [depot_file])
+    other.run_or_throw("lock", [depot_file])
+
+
+def test_a_save_is_refused_while_someone_else_holds_the_lock(p4_server, tmp_path):
+    resources = _plugin_resources()
+    _submit_v1_v2(p4_server)
+    crate = p4_server.workspace_root / "assets/crate/crate.usda"
+    before = crate.read_text()
+    _lock_from_another_workspace(p4_server, tmp_path, "//depot/proj/assets/crate/crate.usda")
+
+    result, stderr = _save_layer(p4_server.settings_text(), crate, "edit", plugin=resources)
+
+    assert not result["saved"]
+    assert "locked by clio_tester (workspace other_ws)" in " ".join(result["errors"]) + stderr
+    assert crate.read_text() == before  # nothing was lost or half-written
+    assert "assets/crate/crate.usda" not in _opened(p4_server)  # not opened here
+
+
+def test_a_pinned_version_in_the_store_cannot_be_saved_over(p4_server):
+    resources = _plugin_resources()
+    v1 = _submit_v1_v2(p4_server)
+    # Fetch it into the version store first.
+    _open_stage(p4_server.settings_text(pin=f"@{v1}"), _shot(p4_server), plugin=resources)
+    stored = next(p for p in p4_server.version_store.rglob("crate.usda"))
+    before = stored.read_text()
+
+    result, stderr = _save_layer(p4_server.settings_text(pin=f"@{v1}"), stored, "edit", plugin=resources)
+
+    assert not result["saved"]
+    assert stored.read_text() == before
+
+
+def test_saving_without_a_clio_context_does_not_touch_perforce(p4_server):
+    resources = _plugin_resources()
+    _submit_v1_v2(p4_server)
+    crate = p4_server.workspace_root / "assets/crate/crate.usda"
+
+    result, _ = _save_layer("", crate, "edit", plugin=resources)
+
+    assert result["saved"]
+    assert _opened(p4_server) == {}
+
+
+def test_a_save_goes_ahead_with_a_warning_when_perforce_is_unavailable(p4_server):
+    resources = _plugin_resources()
+    _submit_v1_v2(p4_server)
+    crate = p4_server.workspace_root / "assets/crate/crate.usda"
+
+    result, stderr = _save_layer(p4_server.settings_text(port="localhost:1"), crate, "edit", plugin=resources)
+
+    assert result["saved"]
+    assert "Perforce is not available" in stderr
+    assert "Written" in crate.read_text()
+
+
+_TIMESTAMP_SCRIPT = textwrap.dedent(
+    """
+    import json, sys
+    from pxr import Ar
+
+    settings, path = sys.argv[1:3]
+    resolver = Ar.GetResolver()
+    with Ar.ResolverContextBinder(resolver.CreateContextFromString(settings)):
+        stamp = resolver.GetModificationTimestamp(path, Ar.ResolvedPath(path))
+        print(json.dumps({"time": stamp.GetTime() if stamp.IsValid() else None}))
+    """
+)
+
+
+def _timestamp(settings: str, path: Path, plugin: Path):
+    out = subprocess.run([sys.executable, "-c", _TIMESTAMP_SCRIPT, settings, os.fspath(path)],
+                         env=_env(plugin), capture_output=True, text=True, check=False)
+    assert out.returncode == 0, out.stderr
+    return json.loads(out.stdout.strip().splitlines()[-1])["time"]
+
+
+def _set_client_options(server, options: str) -> None:
+    spec = (f"Client: clio_test_ws\nOwner: clio_tester\nRoot: {server.workspace_root}\n"
+            f"Options: {options}\nLineEnd: local\nView:\n\t//depot/proj/... //clio_test_ws/...\n")
+    server.connection().run_or_throw("client", ["-i"], spec)
+
+
+def test_modtime_client_timestamp_is_the_workspace_revision(p4_server):
+    resources = _plugin_resources()
+    _submit_v1_v2(p4_server)  # crate.usda is at revision 2
+    crate = p4_server.workspace_root / "assets/crate/crate.usda"
+
+    # The default test client has nomodtime: the file's own time is used.
+    assert _timestamp(p4_server.settings_text(), crate, resources) == pytest.approx(crate.stat().st_mtime, abs=1)
+
+    _set_client_options(p4_server, "allwrite noclobber nocompress unlocked modtime rmdir")
+    assert _timestamp(p4_server.settings_text(), crate, resources) == 2.0
+    p4_server.connection().run_or_throw("sync", ["-q", "//depot/proj/assets/crate/crate.usda#1"])
+    assert _timestamp(p4_server.settings_text(), crate, resources) == 1.0
+
+
+# --- loading through a version manifest (design §10.8) -----------------------
+
+_RESOLVE_SCRIPT = textwrap.dedent(
+    """
+    import json, sys
+    from pxr import Ar
+
+    settings, *paths = sys.argv[1:]
+    resolver = Ar.GetResolver()
+    with Ar.ResolverContextBinder(resolver.CreateContextFromString(settings)):
+        print(json.dumps([str(resolver.Resolve(p)) for p in paths]))
+    """
+)
+
+
+def test_a_stage_loads_through_a_manifest_and_nothing_outside_it(p4_server, make_session):
+    from deda.clio import usd as clio_usd
+
+    resources = _plugin_resources()
+    _submit_v1_v2(p4_server)  # head: crate 2, geo 2
+    p4_server.submit({"assets/crate/other.usda": _geo(9)}, "not in the manifest")
+    alice = make_session()
+    alice.workspace.get()
+    alice.workspace.get("assets/crate/crate.usda", version="#1")  # the artist looked at crate v1
+    store = p4_server.version_store
+
+    manifest = clio_usd.Manifest.create(alice, "shots/sh010/shot.usda", store=store)
+    assert manifest.files["assets/crate/crate.usda"].rev == 1
+    path = manifest.save(p4_server.workspace_root.parent / "job.clio-manifest.json")
+    assert manifest.fetch(alice, store=store).ok
+
+    # The farm's workspace holds the latest files (crate v2) ...
+    assert "version = 2" in (p4_server.workspace_root / "assets/crate/crate.usda").read_text()
+    settings = p4_server.settings_text(manifest=path, policy="verify")  # verify: no server calls
+
+    # ... but the stage loads the manifest's revisions, from the manifest's folder.
+    result, stderr = _open_stage(settings, _shot(p4_server), plugin=resources)
+    assert (result["value"], result["geo"]) == (1, 2), stderr
+    assert len(result["real_paths"]) == 3
+    folder = f"manifest-{manifest.sha256[:16]}"
+    assert all(folder in p for p in result["real_paths"])
+
+    # A file the manifest does not list does not resolve, although it is on disk.
+    inside = os.fspath(p4_server.workspace_root / "assets/crate/geo.usda")
+    outside = os.fspath(p4_server.workspace_root / "assets/crate/other.usda")
+    assert Path(outside).is_file()
+    out = subprocess.run([sys.executable, "-c", _RESOLVE_SCRIPT, settings, inside, outside],
+                         env=_env(resources), capture_output=True, text=True, check=False)
+    assert out.returncode == 0, out.stderr
+    resolved_inside, resolved_outside = json.loads(out.stdout.strip().splitlines()[-1])
+    assert folder in resolved_inside
+    assert resolved_outside == ""
+    assert "not in the manifest" in out.stderr

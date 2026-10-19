@@ -1,6 +1,8 @@
 #pragma once
 
+#include "clio/core/coalescer.hpp"
 #include "clio/core/identifier.hpp"
+#include "clio/core/manifest.hpp"
 #include "clio/core/settings.hpp"
 #include "clio/core/workspace.hpp"
 
@@ -8,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -41,7 +44,24 @@ struct ResolvedAsset {
 ///            because labels can be moved
 ///
 /// The server is the authority (design §8.3): results are remembered in
-/// memory only, until refresh(). Thread-safe.
+/// memory only. A change or revision never changes, so its result is kept
+/// until refresh(); a result that can move (have, latest, a label, or "not
+/// found" for those) is kept for `Settings::cacheTtl` and then checked
+/// again. Thread-safe.
+///
+/// With a manifest (`Settings::manifest`, design doc §10.8) a file is loaded
+/// only as the manifest lists it: the manifest's revision, from the
+/// manifest's own folder in the version store. Pins do not apply. A path the
+/// manifest does not list is not provided (nullopt) under the verify and
+/// offline policies, which is the guarantee that nothing outside the
+/// manifest is ever loaded; under sync it is resolved as without a manifest,
+/// with a warning. A listed file that is not in the folder yet is fetched
+/// under sync (use Workspace::fetchManifest to fetch them all first).
+///
+/// Misses are coalesced (design §10.3): threads asking for the same asset
+/// share one resolve, and the `sync`s of threads that miss within
+/// `Settings::batchWindow` of each other become one Perforce command.
+/// Historical versions are fetched in parallel on pooled connections.
 ///
 /// Clio is an enhancement, not a barrier: with the sync and offline
 /// policies, if the server cannot be reached (or refuses, for example
@@ -51,10 +71,17 @@ struct ResolvedAsset {
 /// the verify policy fails instead of falling back.
 class AssetResolver {
 public:
-    explicit AssetResolver(Settings settings);
+    /// Reads the time from this clock to age remembered results (tests
+    /// replace it); the steady clock by default.
+    using Clock = std::function<std::chrono::steady_clock::time_point()>;
+
+    explicit AssetResolver(Settings settings, Clock clock = {});
 
     const Settings& settings() const { return _workspace.settings(); }
     Workspace& workspace() { return _workspace; }
+
+    /// The manifest the settings name, or null.
+    const Manifest* manifest() const { return _manifest ? &*_manifest : nullptr; }
 
     /// The pin that applies to `id`: its own pin, else the settings pin.
     Pin effectivePin(const AssetIdentifier& id) const;
@@ -79,9 +106,39 @@ public:
     /// server calls.
     std::filesystem::path resolveForNewAsset(const AssetIdentifier& id) const;
 
+    /// Get a workspace file ready to be written (design doc §10.6): open it
+    /// for edit, or refuse before anything is lost when someone else holds
+    /// the lock. Never submits.
+    ///
+    /// Clio is an enhancement, not a barrier: with the verify and offline
+    /// policies the server is not contacted, and if it cannot be reached the
+    /// write is allowed with a warning (the file is then saved locally, not
+    /// opened for edit). Only a lock held by someone else refuses a write.
+    WriteCheck prepareForWrite(const AssetIdentifier& id);
+
+    /// After a file that was reported `isNew` has been written: open it for
+    /// add. Returns a warning, or an empty string.
+    std::string finishWrite(const AssetIdentifier& id);
+
     /// Forget remembered results, so the next resolve checks again. Also
     /// retries a server that was unavailable.
     void refresh();
+
+    /// A change marker for the file at `localPath`, for USD's
+    /// GetModificationTimestamp (design doc §10.3): the workspace's revision
+    /// number. It is for the one case where the file's own modification time
+    /// cannot tell revisions apart: a client with the `modtime` option, where
+    /// synced files keep the time they were last changed, so two revisions
+    /// can have the same time. Nullopt means "use the file's modification
+    /// time": the path is not a workspace file, the policy does not allow the
+    /// server, the client does not use `modtime`, the file is open for edit
+    /// (the local file may differ from the revision), or the server could not
+    /// be asked.
+    std::optional<double> revisionTimestamp(const std::filesystem::path& localPath);
+
+    /// How many `sync` commands the coalescer has run. For tests and
+    /// diagnostics: many misses at once should cost few commands.
+    std::size_t syncCommandsRun() const { return _syncBatcher.batchesRun(); }
 
     /// How long to stop contacting the server after it failed.
     static constexpr std::chrono::seconds serverRetryInterval{60};
@@ -90,17 +147,39 @@ private:
     /// `serverAnswered` is set when the result, including "not found", came
     /// from the server and may be remembered.
     std::optional<ResolvedAsset> _resolveUncached(const AssetIdentifier& id, const Pin& pin,
-                                                  bool& serverAnswered);
+                                                  bool& serverAnswered, bool ignoreManifest = false);
+    std::optional<ResolvedAsset> _resolveFromManifest(const AssetIdentifier& id, const Pin& pin,
+                                                      bool& serverAnswered);
     std::optional<ResolvedAsset> _useWorkspaceFile(ResolvedAsset asset, const std::string& reason) const;
+    std::optional<ResolvedAsset> _resolveAndRemember(const AssetIdentifier& id, const Pin& pin,
+                                                     const std::string& key);
+    std::chrono::steady_clock::time_point _now() const;
     bool _serverAvailable() const;
     void _markServerUnavailable();
 
+    struct MemoEntry {
+        std::optional<ResolvedAsset> asset;
+        bool forever = false; ///< immutable pin: kept until refresh()
+        std::chrono::steady_clock::time_point expires;
+    };
+
+    struct HaveEntry {
+        std::optional<HaveInfo> info;
+        std::chrono::steady_clock::time_point expires;
+    };
+
+    Clock _clock;
     Workspace _workspace;
+    std::optional<Manifest> _manifest;
+    std::mutex _haveMutex;
+    std::unordered_map<std::string, HaveEntry> _haveCache; ///< by workspace path, for cacheTtl
     std::atomic<std::int64_t> _serverRetryAt{0}; ///< steady_clock ticks; 0 = available
     std::mutex _memoMutex;
     /// Remembered answers, including "not found" answers from the server
     /// (USD probes paths that do not exist when it looks for search paths).
-    std::unordered_map<std::string, std::optional<ResolvedAsset>> _memo;
+    std::unordered_map<std::string, MemoEntry> _memo;
+    SingleFlight<std::string, std::optional<ResolvedAsset>> _resolves;
+    SyncBatcher _syncBatcher;
 };
 
 } // namespace clio::core

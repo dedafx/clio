@@ -1,10 +1,13 @@
 #pragma once
 
 #include "clio/core/identifier.hpp"
+#include "clio/core/manifest.hpp"
 #include "clio/core/p4/connection.hpp"
+#include "clio/core/p4/pool.hpp"
 #include "clio/core/settings.hpp"
 
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -17,7 +20,22 @@ struct LocalPathMatch {
     AssetIdentifier id;
     std::optional<Pin> pin; ///< Set for version-store paths (the version the folder holds).
     bool inVersionStore = false;
+    bool inManifest = false; ///< in the manifest's folder (a kind of version store path)
 };
+
+/// What fetching a manifest did.
+struct ManifestFetchReport {
+    std::size_t files = 0;   ///< files in the manifest
+    std::size_t fetched = 0; ///< downloaded from the server
+    std::size_t linked = 0;  ///< taken from the pool of files already stored
+    std::size_t present = 0; ///< already in the manifest's folder and correct
+    std::int64_t bytes = 0;  ///< bytes downloaded
+    /// "path: reason" for each file that could not be provided.
+    std::vector<std::string> failures;
+};
+
+/// Called as files complete: (done, total, path).
+using ManifestProgress = std::function<void(std::size_t, std::size_t, const std::string&)>;
 
 /// Outcome of fetching a historical version into the version store.
 enum class FetchResult {
@@ -26,12 +44,33 @@ enum class FetchResult {
     KeptExisting, ///< Fetched, but an existing stored copy could not be replaced and was kept.
 };
 
+/// What to do before a file in the workspace is written (design doc §10.6).
+struct WriteCheck {
+    bool allowed = true;
+    /// Why the write is refused (for example "locked by sam"), when not allowed.
+    std::string whyNot;
+    /// Something the user should know although the write may go ahead, for
+    /// example that the local copy is not the latest version.
+    std::string warning;
+    /// The file is not in Perforce. Call Workspace::addNewFile() after
+    /// writing it.
+    bool isNew = false;
+};
+
+/// Which revision of a file the workspace has, and whether it is open.
+struct HaveInfo {
+    long haveRev = 0;
+    bool opened = false; ///< open for edit, add or delete here: the local file may differ
+};
+
 /// Maps clio: identifiers to depot and local paths, and runs the Perforce
 /// operations that put files on disk.
 ///
-/// Thread-safe. For now all server work is serialized on one connection;
-/// the connection pool and the miss coalescer (design doc §10.3) replace
-/// this later without changing the interface.
+/// Thread-safe. Server work runs on a small pool of connections
+/// (`Settings::maxConnections`), so threads fetching different files do not
+/// wait for each other. Changes to the workspace itself (`sync`) are
+/// serialized, in this process and across processes; reads into the version
+/// store (`fetchVersion`) run in parallel.
 class Workspace {
 public:
     explicit Workspace(Settings settings);
@@ -67,6 +106,61 @@ public:
     /// place.
     FetchResult fetchVersion(const AssetIdentifier& id, const Pin& pin);
 
+    /// Make a workspace file ready to be written: open it for edit (which
+    /// also locks it when its file type is exclusive, +l), or refuse before
+    /// anything is lost if someone else holds the lock. A file that is not
+    /// in Perforce is allowed and reported as `isNew`. Never submits.
+    /// Two commands at most (`fstat`, `edit`), however often it is called
+    /// for a file that is already open. Throws P4Error if the server cannot
+    /// be reached.
+    WriteCheck prepareForWrite(const AssetIdentifier& id);
+
+    /// `p4 add` a file that was new when prepareForWrite() looked at it and
+    /// has been written since. Returns a warning for the user, or an empty
+    /// string if the file was opened for add (or was already open). A file
+    /// that was not written is skipped. Throws P4Error if the server cannot
+    /// be reached.
+    std::string addNewFile(const AssetIdentifier& id);
+
+    /// The workspace's revision of a file (`fstat`), or nullopt if the file
+    /// is not in the workspace. Throws P4Error if the server cannot be reached.
+    std::optional<HaveInfo> haveInfo(const AssetIdentifier& id);
+
+    /// True if the client has the `modtime` option, so that synced files get
+    /// the time they were last changed instead of the time of the sync. Asked
+    /// once (`p4 client -o`) and remembered. Throws P4Error if the server
+    /// cannot be reached.
+    bool clientUsesModtime();
+
+    /// Name the manifest whose folder matchLocalPath() should recognize.
+    void useManifest(const Manifest& manifest);
+
+    /// Where a manifest's copy of a file is (or will be): the manifest's own
+    /// folder in the version store, which mirrors the depot so that relative
+    /// paths between layers keep working (design doc §10.8).
+    std::filesystem::path manifestPath(const Manifest& manifest, const std::string& relativePath) const;
+
+    /// Make sure the manifest's copy of one file exists and is correct. It
+    /// is taken from the pool of stored files (`<store>/objects/<digest>`,
+    /// linked into place, so two manifests share a big file) or fetched with
+    /// `p4 print` at the manifest's revision and checked against its digest.
+    /// Throws Error if the revision is gone or its digest differs, P4Error if
+    /// the server cannot be reached.
+    enum class Materialized { Present, Linked, Fetched };
+    Materialized materialize(const Manifest& manifest, const ManifestEntry& entry, bool verifyPresent,
+                             std::int64_t* bytesFetched = nullptr);
+
+    /// Materialize every file of the manifest, on up to `threads` threads
+    /// (and as many pooled connections as the pool allows). Failures are
+    /// collected in the report, not thrown.
+    ManifestFetchReport fetchManifest(const Manifest& manifest, std::size_t threads,
+                                      const ManifestProgress& progress = {});
+
+    /// Ask the server whether every revision in the manifest can still be
+    /// fetched, and still has the manifest's digest. Returns one sentence per
+    /// problem; empty means all is well. One `fstat` per 500 files.
+    std::vector<std::string> checkManifest(const Manifest& manifest);
+
     /// The version-store folder name for this server: the effective P4PORT
     /// (configured, or from the Perforce environment), encoded reversibly as
     /// a folder name (a long port is shortened with a hash).
@@ -75,7 +169,7 @@ public:
     /// Lock file serializing changes to this workspace across processes.
     std::filesystem::path lockPath() const;
 
-    /// Run any command on this workspace's connection (serialized).
+    /// Run any command on a pooled connection.
     p4::CommandResult run(const std::string& command,
                           const std::vector<std::string>& args = {},
                           const std::optional<std::string>& input = std::nullopt);
@@ -85,8 +179,11 @@ private:
     std::filesystem::path _storeBase() const;
 
     Settings _settings;
-    std::mutex _mutex;
-    p4::Connection _connection;
+    std::string _manifestFolder; ///< see useManifest()
+    std::mutex _syncMutex;
+    std::mutex _modtimeMutex;
+    std::optional<bool> _usesModtime;
+    p4::ConnectionPool _pool;
     std::string _serverKey;
 };
 

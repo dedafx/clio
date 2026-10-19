@@ -62,6 +62,8 @@ class Session:
         self.close()
 
     def close(self) -> None:
+        if (pipeline := self.__dict__.get("pipeline")) is not None:
+            pipeline.close()
         with self._lock:
             executor, self._executor = self._executor, None
         if executor:
@@ -103,6 +105,38 @@ class Session:
         otherwise its address and root (design doc §9.3)."""
         info = self.info()
         return info.get("serverID") or f"{info.get('serverAddress', '')}|{info.get('serverRoot', '')}|{self.config.port}"
+
+    @cached_property
+    def hooks(self):  # -> deda.clio.hooks.HookRegistry
+        """Validation hooks for this session (see :mod:`deda.clio.hooks`)."""
+        from deda.clio.hooks import HookRegistry
+
+        return HookRegistry()
+
+    @cached_property
+    def assets(self):  # -> deda.clio.assets.Assets
+        """Actions on whole assets, through asset resolver plugins (design doc §14)."""
+        from deda.clio.assets import Assets
+
+        return Assets(self)
+
+    @cached_property
+    def pipeline(self):  # -> deda.clio.views._pipeline.RequestPipeline
+        """The request pipeline that view models share (design doc §9.5)."""
+        from deda.clio.views import _handlers
+        from deda.clio.views._pipeline import RequestPipeline
+
+        pipeline = RequestPipeline()
+        _handlers.install(pipeline, self)
+        return pipeline
+
+    @cached_property
+    def content(self):  # -> deda.clio.content.ContentCache
+        """The content cache for file bytes shown in UIs (design doc §9.3)."""
+        from deda.clio.config import cache_dir
+        from deda.clio.content import ContentCache
+
+        return ContentCache(cache_dir() / "content", self.config.content_cache_mb * 2**20)
 
     @cached_property
     def paths(self) -> ProjectPaths:

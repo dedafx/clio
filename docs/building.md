@@ -50,11 +50,13 @@ the OpenSSL that Python or a host application loads.
   ```
 * Run CMake, pip and `build_usd.py` from an "x64 Native Tools" prompt (or
   after `vcvars64.bat`).
-* The Python headers must match the interpreter. A python.org 3.13 install
-  that has ever had the free-threaded option installed can be left with a
-  `pyconfig.h` that defines `Py_GIL_DISABLED`, and links then fail with
-  `cannot open file 'python313t.lib'`. Repair that Python install, or use
-  another 3.13 (for example the `python` NuGet package).
+* The Python headers must match the interpreter. Use the latest 3.13 patch
+  release from python.org (tested with 3.13.16, the same as Dedaverse). An
+  older install (for example 3.13.4) that has ever had the free-threaded
+  option installed can be left with a `pyconfig.h` that defines
+  `Py_GIL_DISABLED`, and links then fail with `cannot open file
+  'python313t.lib'`. Upgrade or repair that Python install, or use another
+  3.13 (for example the `python` NuGet package).
 
 ### USD (only for the resolver plugin)
 
@@ -127,6 +129,13 @@ Tests that need a server are skipped when `CLIO_TEST_P4D` is not set, and
 the USD tests are skipped when `pxr` or the plugin is missing. Set
 `CLIO_TEST_USD_PLUGIN` to a `.../clioUsd/resources` folder to test a plugin
 from a CMake build tree.
+
+## CI
+
+`.github/workflows/ci.yml` follows the steps above on Ubuntu, once for each
+supported USD version (26.08 and 25.08, cached after the first build) and
+once without USD. It has not run on GitHub yet; fix it as the first runs
+show. Windows is built by hand for now.
 
 ## 5. Using the resolver
 

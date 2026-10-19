@@ -52,6 +52,14 @@ class HistoryCache:
         self.lock = threading.RLock()
         self.files: OrderedDict[str, _Entry[Revision]] = OrderedDict()
         self.scopes: OrderedDict[str, _Entry[Change]] = OrderedDict()
+        #: Folder listings for file list views: scope -> (fstat records by
+        #: depot path, when they were fetched). Volatile data (§9.2).
+        self.listings: OrderedDict[str, tuple[dict[str, dict[str, str]], float]] = OrderedDict()
+        #: Who submitted a revision: immutable, kept for the process (§9.2).
+        self.revisions: OrderedDict[tuple[str, int], Revision] = OrderedDict()
+        self.max_revisions = 20000
+        #: The files of a submitted change: immutable, kept for the process.
+        self.change_files: OrderedDict[int, tuple[str, ...]] = OrderedDict()
 
     @classmethod
     def for_server(cls, server_id: str, user: str) -> HistoryCache:
@@ -74,6 +82,13 @@ class HistoryCache:
                 table.move_to_end(key)
             return entry
 
+    def remember_revision(self, revision: Revision) -> None:
+        with self.lock:
+            self.revisions[(revision.depot_path, revision.rev)] = revision
+            self.revisions.move_to_end((revision.depot_path, revision.rev))
+            while len(self.revisions) > self.max_revisions:
+                self.revisions.popitem(last=False)
+
     def mark_stale(self, depot_paths: Iterable[str]) -> None:
         """Files changed by this process: re-check them (and folders above
         them) on next use, without waiting for the polling interval."""
@@ -82,6 +97,9 @@ class HistoryCache:
             for path in paths:
                 if path in self.files:
                     self.files[path].checked_at = 0.0
+            for scope in list(self.listings):  # listings show heads and locks: re-ask
+                if any(p.startswith(scope.removesuffix("...")) for p in paths):
+                    del self.listings[scope]
             for scope, entry in self.scopes.items():
                 prefix = scope.removesuffix("...")
                 if any(p.startswith(prefix) for p in paths):
@@ -253,9 +271,40 @@ class History:
         """Called after a save: the next read re-checks affected entries."""
         self.cache.mark_stale(depot_paths)
 
+    def verify(self, path: str = "") -> int:
+        """Check cached file histories against the server and drop the ones
+        that disagree (a revision was obliterated), so the next read fetches
+        them again. History is cached as if it never changed (design doc
+        §9.2); this is the check for the exceptions. One ``p4 files`` per 200
+        files. ``path`` limits it to a folder. Returns the number dropped.
+        Folder activity is not checked: ``refresh()`` clears it."""
+        prefix = self._session.paths.depot_path(path.strip("/")) if path else self._session.paths.depot_root
+        cache = self.cache
+        with cache.lock:
+            wanted = {depot: {r.rev for r in entry.items} for depot, entry in cache.files.items()
+                      if entry.items and depot.startswith(prefix)}
+        dropped = 0
+        depots = list(wanted)
+        for start in range(0, len(depots), 200):
+            chunk = depots[start:start + 200]
+            result = self._session.backend.run("files", ["-a", *(f"{d}#1,#{max(wanted[d])}" for d in chunk)])
+            present: dict[str, set[int]] = {}
+            for rec in result.records:
+                if "depotFile" in rec and "rev" in rec:
+                    present.setdefault(rec["depotFile"], set()).add(int(rec["rev"]))
+            with cache.lock:
+                for depot in chunk:
+                    if wanted[depot] - present.get(depot, set()):
+                        cache.files.pop(depot, None)
+                        dropped += 1
+        return dropped
+
     def refresh(self) -> None:
         """Forget everything cached for this server and user."""
         cache = self.cache
         with cache.lock:
             cache.files.clear()
             cache.scopes.clear()
+            cache.listings.clear()
+            cache.revisions.clear()
+            cache.change_files.clear()

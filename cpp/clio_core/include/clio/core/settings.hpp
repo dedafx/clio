@@ -3,6 +3,8 @@
 #include "clio/core/p4/connection.hpp"
 #include "clio/core/pin.hpp"
 
+#include <chrono>
+#include <cstddef>
 #include <filesystem>
 #include <string>
 
@@ -37,6 +39,18 @@ Policy parsePolicy(const std::string& text);
 ///   timeout  command timeout in seconds (default 120, 0 = none)
 ///   connect_timeout
 ///            seconds to wait for an unreachable server (default 10, 0 = OS default)
+///   manifest path of a version manifest (design doc §10.8). Files are then
+///            loaded only as the manifest lists them, from its own folder in
+///            the version store; `pin` is not used for them
+///   connections
+///            most Perforce connections the process opens (default 4); they
+///            are opened only when threads need them at the same time
+///   batch_ms milliseconds a resolve that needs the server waits for other
+///            misses to join its `sync` (default 20, 0 = do not wait)
+///   cache_ttl
+///            seconds a resolve of a moving target (have, latest, label) is
+///            remembered (default 60, 0 = check every time). Changes and
+///            revisions never change and are remembered until refresh()
 struct Settings {
     p4::ConnectionOptions connection;
     std::string depotRoot;
@@ -44,6 +58,10 @@ struct Settings {
     std::filesystem::path versionStore;
     Pin pin = Pin::have();
     Policy policy = Policy::Sync;
+    std::filesystem::path manifest; ///< empty: no manifest
+    std::size_t maxConnections = 4;
+    std::chrono::milliseconds batchWindow{20};
+    std::chrono::seconds cacheTtl{60};
 
     /// Parse the text form. Throws ConfigError or PinError.
     static Settings parse(const std::string& text);

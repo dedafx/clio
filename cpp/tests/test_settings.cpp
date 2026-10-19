@@ -46,6 +46,25 @@ TEST_CASE("invalid settings are rejected") {
     }
 }
 
+TEST_CASE("pool, batching and cache settings") {
+    const auto defaults = Settings::parse("depot=//d/main;root=/w;store=/s");
+    CHECK(defaults.maxConnections == 4);
+    CHECK(defaults.batchWindow.count() == 20);
+    CHECK(defaults.cacheTtl.count() == 60);
+
+    const auto s = Settings::parse("depot=//d/main;root=/w;store=/s;connections=2;batch_ms=0;cache_ttl=5");
+    CHECK(s.maxConnections == 2);
+    CHECK(s.batchWindow.count() == 0);
+    CHECK(s.cacheTtl.count() == 5);
+    CHECK(s.str() == "depot=//d/main;root=/w;store=/s;connections=2;batch_ms=0;cache_ttl=5");
+    CHECK(Settings::parse(s.str()) == s);
+
+    for (const char* bad : {"connections=0", "connections=65", "connections=two", "batch_ms=-1", "cache_ttl=1m"}) {
+        CAPTURE(bad);
+        CHECK_THROWS_AS(Settings::parse(std::string("depot=//d/main;root=/w;") + bad), ConfigError);
+    }
+}
+
 TEST_CASE("the default pin is have") {
     const auto s = Settings::parse("depot=//d/main;root=/w;store=/s");
     CHECK(s.pin == Pin::have());

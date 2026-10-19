@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -31,6 +32,7 @@ from deda.clio.errors import (
 from deda.clio.events import CancelToken, ProgressCallback, ProgressEvent
 from deda.clio.models import (
     Change,
+    EditReport,
     FileState,
     FileStatus,
     Lock,
@@ -59,6 +61,8 @@ _OPENED_STATE = {
     "move/delete": FileState.DELETING,
 }
 _DELETED_AT_HEAD = ("delete", "move/delete", "purge", "archive")
+#: Files per reconcile command when only some files need a closer look.
+_RECONCILE_CHUNK = 200
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +70,50 @@ class DiscardResult:
     asset_paths: tuple[str, ...]
     #: Where copies of the discarded files were kept, if any were.
     backup_dir: Path | None
+
+
+def _size_is_suspect(head_type: str, depot_size: int | None, local_size: int) -> bool:
+    """Whether a read-only file's size says it was changed (and so is worth
+    a closer look by Perforce). Only the size of the head revision is known,
+    and only some types keep their size on disk: binary files always;
+    text files unless the client converts line endings, which on Windows
+    only makes them bigger, so only a smaller file is suspicious there.
+    Unicode types are converted, so their size says nothing."""
+    if depot_size is None:
+        return False
+    base = head_type.split("+", 1)[0]
+    if base in ("binary", "ubinary"):
+        return local_size != depot_size
+    if base in ("text", "xtext", "ctext", "ktext"):
+        return local_size < depot_size if os.name == "nt" else local_size != depot_size
+    return False
+
+
+def file_state(rec: dict[str, str]) -> FileState | None:
+    """Where a file stands, from one ``fstat`` record (no disk check). None
+    for a file that was deleted at the head and is not in the workspace."""
+    action = rec.get("action")
+    have, head = _int(rec.get("haveRev")), _int(rec.get("headRev"))
+    deleted_at_head = rec.get("headAction") in _DELETED_AT_HEAD
+    if action:
+        return _OPENED_STATE.get(action, FileState.EDITING)
+    if deleted_at_head and have is None:
+        return None
+    if have is None:
+        return FileState.MISSING
+    if deleted_at_head or have != head:
+        return FileState.OUT_OF_DATE
+    return FileState.SYNCED
+
+
+def locked_by_other(rec: dict[str, str]) -> str | None:
+    """Who else holds a lock on the file, from one ``fstat`` record: an
+    explicit lock, or the exclusive open that a ``+l`` file type takes."""
+    if "otherLock" in rec:
+        return next(iter(_others(rec, "otherLock")), None) or "someone"
+    if "+l" in rec.get("headType", "") and _others(rec, "otherOpen"):
+        return _others(rec, "otherOpen")[0]
+    return None
 
 
 def _int(value: str | None) -> int | None:
@@ -351,6 +399,77 @@ class Workspace:
                 self._raise_locked(depot, m.group(1), m.group(2), messages)
         raise WorkflowError(f"Could not open {self._asset(depot)} for editing", p4_messages=messages)
 
+    def open_for_edit(self, *paths: PathArg, local_base: Path | None = None) -> EditReport:
+        """Get files ready to be written, as the USD plugin does when a layer
+        is saved (design doc §10.6): open them for edit (a ``+l`` file type
+        locks them by that), in one ``fstat`` and one ``edit`` however many
+        files there are. Never submits.
+
+        Files that are not in Perforce yet are reported in ``new``; write
+        them, then call :meth:`add_new`. Raises :class:`LockedByOtherError`
+        before opening anything if someone else holds a lock, and
+        :class:`NotInWorkspaceError` for a file that is in Perforce but not in
+        this workspace. A copy that is not the latest version is a warning.
+        """
+        s = self._session
+        targets = self.targets(paths, local_base=local_base)
+        folders = [t.asset_path or "." for t in targets if t.is_folder]
+        if folders:
+            raise WorkflowError(f"open_for_edit takes files, not folders: {', '.join(folders)}",
+                                hint="List the files to be written")
+        records = {r["depotFile"]: r for r in
+                   self._run("fstat", [t.depot_spec(s.paths.depot_root) for t in targets]).records
+                   if "depotFile" in r}
+
+        to_edit: list[Target] = []
+        already: list[str] = []
+        new: list[str] = []
+        warnings: list[str] = []
+        for target in targets:
+            depot = s.paths.depot_path(target.asset_path)
+            rec = records.get(depot)
+            if rec is not None and rec.get("action"):
+                already.append(target.asset_path)
+            elif rec is None or rec.get("headAction") in _DELETED_AT_HEAD:
+                new.append(target.asset_path)
+            else:
+                self._raise_if_locked_by_other(depot, rec)
+                have, head = _int(rec.get("haveRev")), _int(rec.get("headRev"))
+                if have is None:
+                    raise NotInWorkspaceError(
+                        f"{target.asset_path} is in Perforce but not in your workspace",
+                        hint="Get the file first ('clio get'), then change it")
+                if have != head:
+                    warnings.append(f"{target.asset_path}: your copy is not the latest version")
+                to_edit.append(target)
+
+        opened = list(already)
+        if to_edit:
+            result = self._run("edit", [os.fspath(s.paths.local_path(t.asset_path)) for t in to_edit])
+            done = {r["depotFile"] for r in result.records if r.get("action")}
+            for target in to_edit:
+                depot = s.paths.depot_path(target.asset_path)
+                if depot not in done:
+                    self._raise_open_failure(depot, result.texts)
+                opened.append(target.asset_path)
+        return EditReport(tuple(sorted(opened)), tuple(sorted(new)), tuple(warnings))
+
+    def add_new(self, *paths: PathArg, local_base: Path | None = None) -> tuple[str, ...]:
+        """Open files for add (``p4 add``), in one command: the second half
+        of :meth:`open_for_edit` for files it reported as new. A path that was
+        not written is skipped. Returns the asset paths opened for add."""
+        s = self._session
+        files = []
+        for target in self.targets(paths, local_base=local_base):
+            local = s.paths.local_path(target.asset_path)
+            if not target.is_folder and local.is_file():
+                files.append((target.asset_path, os.fspath(local)))
+        if not files:
+            return ()
+        result = self._check(self._run("add", ["-f", *(local for _, local in files)]), "add files")
+        opened = {s.paths.asset_path_of_depot(r["depotFile"]) for r in result.records if r.get("action")}
+        return tuple(sorted(opened))
+
     def unlock(self, *paths: PathArg, local_base: Path | None = None) -> tuple[str, ...]:
         """Release locks. Files that were not changed are closed again
         (``p4 revert -a``); changed files stay open for ``save``."""
@@ -364,7 +483,8 @@ class Workspace:
 
     # --- save -----------------------------------------------------------
 
-    def save(self, *paths: PathArg, message: str, local_base: Path | None = None) -> SaveResult:
+    def save(self, *paths: PathArg, message: str, local_base: Path | None = None,
+             validate: bool = True) -> SaveResult:
         """Save (submit) every added, changed or deleted file under
         ``paths``, in a new change with ``message``.
 
@@ -372,22 +492,27 @@ class Workspace:
         edited without being locked are included. If the server refuses the
         submit (a trigger, or a file that changed on the server), the change
         stays pending and the local files are untouched (§5.2).
+
+        Validation hooks (:mod:`deda.clio.hooks`) run first; an error from one
+        raises :class:`~deda.clio.ValidationError` and nothing is submitted.
+        ``validate=False`` skips them.
         """
         if not message.strip():
             raise WorkflowError("A save needs a description", hint="Say what changed, for example -m 'Crate: UV fix'")
         s = self._session
         targets = self.targets(paths, local_base=local_base)
-        specs, add_specs = self._specs(targets), self._add_specs(targets)
+        specs = self._specs(targets)
         number = self._new_change(message)
         try:
+            records = [r for r in self._run("fstat", ["-Ol", *specs]).records if "depotFile" in r]
             self._run("reopen", ["-c", str(number), *specs])
-            self._check(self._run("reconcile", ["-c", str(number), "-e", "-a", "-d", "-f", *add_specs]),
-                        "detect changed files")
+            self._disk_changes(targets, records, ["-c", str(number)])
             opened = [r for r in self._run("opened", ["-c", str(number)]).records if "depotFile" in r]
             if not opened:
                 raise NothingToSaveError("Nothing to save: no added, changed or deleted files",
                                          hint="Change files first, or check the paths")
             self._precheck_submit(number)
+            warnings = self._validate(opened, message) if validate else ()
         except Exception:
             self._abandon_change(number)
             raise
@@ -405,7 +530,21 @@ class Workspace:
                         tuple(r["depotFile"] for r in opened))
         s.events.emit("change_submitted", change=change)
         s.history.note_submitted(change.files)
-        return SaveResult(change, *(tuple(by_action[k]) for k in ("added", "edited", "deleted")))
+        return SaveResult(change, *(tuple(by_action[k]) for k in ("added", "edited", "deleted")), warnings)
+
+    def _validate(self, opened: Sequence[dict[str, str]], message: str) -> tuple[str, ...]:
+        """Run the validation hooks on the files of the change. Returns the
+        warnings; raises on errors."""
+        from deda.clio.hooks import HookContext, HookFile, run_hooks
+
+        s = self._session
+        files = tuple(
+            HookFile(self._asset(r["depotFile"]), r["depotFile"], s.paths.local_of_depot(r["depotFile"]),
+                     r.get("action", ""), r.get("type", ""))
+            for r in opened
+        )
+        report = run_hooks(HookContext(s, files, message))
+        return tuple(str(i) for i in report.warnings)
 
     def _new_change(self, message: str) -> int:
         s = self._session
@@ -470,37 +609,22 @@ class Workspace:
         targets = self.targets(paths, local_base=local_base)
         specs = self._specs(targets)
         statuses: dict[str, FileStatus] = {}
-        for rec in self._run("fstat", specs).records:
-            depot = rec.get("depotFile")
-            if not depot:
-                continue
-            action = rec.get("action")
+        records = [r for r in self._run("fstat", ["-Ol", *specs]).records if r.get("depotFile")]
+        for rec in records:
+            depot = rec["depotFile"]
             have, head = _int(rec.get("haveRev")), _int(rec.get("headRev"))
-            deleted_at_head = rec.get("headAction") in _DELETED_AT_HEAD
-            if action:
-                state = _OPENED_STATE.get(action, FileState.EDITING)
-            elif deleted_at_head and have is None:
+            state = file_state(rec)
+            if state is None:
                 continue
-            elif have is None:
-                state = FileState.MISSING
-            elif deleted_at_head or have != head:
-                state = FileState.OUT_OF_DATE
-            else:
-                state = FileState.SYNCED
-            locked_by = None
-            if "otherLock" in rec:
-                locked_by = next(iter(_others(rec, "otherLock")), None) or "someone"
-            elif "+l" in rec.get("headType", "") and _others(rec, "otherOpen"):
-                locked_by = _others(rec, "otherOpen")[0]
+            locked_by = locked_by_other(rec)
             asset = self._asset(depot)
             statuses[depot] = FileStatus(
                 asset, depot, s.paths.local_path(asset), state, have, head, _int(rec.get("headChange")),
                 "ourLock" in rec, locked_by, _others(rec, "otherOpen"),
             )
         if check_disk:
-            reconcile = self._run("reconcile", ["-n", "-e", "-a", "-d", "-f", *self._add_specs(targets)])
             local_state = {"edit": FileState.MODIFIED, "add": FileState.NEW, "delete": FileState.DELETED}
-            for rec in reconcile.records:
+            for rec in self._disk_changes(targets, records, ["-n"]):
                 depot, state = rec.get("depotFile"), local_state.get(rec.get("action", ""))
                 if not depot or not state:
                     continue
@@ -511,6 +635,48 @@ class Workspace:
                 elif current.state in (FileState.SYNCED, FileState.OUT_OF_DATE, FileState.MISSING):
                     statuses[depot] = replace(current, state=state)
         return sorted(statuses.values(), key=lambda f: f.asset_path)
+
+    def _disk_changes(
+        self, targets: Sequence[Target], records: Sequence[dict[str, str]], reconcile_args: Sequence[str]
+    ) -> list[dict[str, str]]:
+        """Run ``p4 reconcile`` for what changed on disk without Perforce
+        knowing, and return its records. ``records`` are ``fstat -Ol`` records
+        for the targets; ``reconcile_args`` are ``-n`` (just look) or
+        ``-c N`` (open into a change).
+
+        ``p4 reconcile`` opens and hashes every file, which costs about
+        3 ms a file on Windows (virus scanners) against a few microseconds
+        to ``stat`` it. So the files are looked at first without opening
+        them, and only the suspicious ones go to reconcile: a file that is
+        missing, writable (Perforce leaves unopened files read-only), or the
+        wrong size (see :func:`_size_is_suspect`). Files already opened are
+        left alone. New files are found by a separate scoped ``reconcile
+        -a``, which does not open the files that are already known.
+        Perforce still makes every final decision.
+        """
+        suspects: list[str] = []
+        for rec in records:
+            if rec.get("action") or _int(rec.get("haveRev")) is None or "clientFile" not in rec:
+                continue  # opened, or not in the workspace
+            local = rec["clientFile"]
+            try:
+                info = os.stat(local)
+            except OSError:  # missing, or unreadable: let Perforce say
+                suspects.append(local)
+                continue
+            if info.st_mode & stat.S_IWRITE or (
+                    rec.get("haveRev") == rec.get("headRev")
+                    and _size_is_suspect(rec.get("headType", ""), _int(rec.get("fileSize")), info.st_size)):
+                suspects.append(local)
+        found = list(self._check(
+            self._run("reconcile", [*reconcile_args, "-a", "-f", *self._add_specs(targets)]),
+            "detect new files").records)
+        for start in range(0, len(suspects), _RECONCILE_CHUNK):
+            chunk = suspects[start:start + _RECONCILE_CHUNK]
+            found.extend(self._check(
+                self._run("reconcile", [*reconcile_args, "-e", "-d", "-f", *chunk]),
+                "detect changed files").records)
+        return found
 
     # --- discard --------------------------------------------------------
 

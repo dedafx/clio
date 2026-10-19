@@ -23,6 +23,7 @@ from deda.clio._core import (
 )
 from deda.clio.config import Config, load_config
 from deda.clio.errors import (
+    AssetNotFoundError,
     AuthError,
     CancelledError,
     ClioError,
@@ -31,6 +32,7 @@ from deda.clio.errors import (
     ConflictError,
     IdentifierError,
     LockedByOtherError,
+    ManifestError,
     NothingToSaveError,
     NotInWorkspaceError,
     OutOfDateError,
@@ -38,6 +40,7 @@ from deda.clio.errors import (
     PinError,
     ServerPolicyError,
     ServerUnavailableError,
+    ValidationError,
     WorkflowError,
 )
 from deda.clio.events import CancelToken, EventBus, ProgressEvent
@@ -46,6 +49,7 @@ from deda.clio.models import (
     Change,
     Conflict,
     Draft,
+    EditReport,
     FileState,
     FileStatus,
     Freshness,
@@ -64,6 +68,7 @@ from deda.clio.session import Session, connect
 
 __all__ = [
     "AssetIdentifier",
+    "AssetNotFoundError",
     "AssetResolver",
     "AuthError",
     "Branch",
@@ -79,6 +84,7 @@ __all__ = [
     "ConflictError",
     "Connection",
     "Draft",
+    "EditReport",
     "EventBus",
     "FileState",
     "FileStatus",
@@ -87,6 +93,7 @@ __all__ = [
     "IdentifierError",
     "Lock",
     "LockedByOtherError",
+    "ManifestError",
     "Message",
     "NotInWorkspaceError",
     "NothingToSaveError",
@@ -109,6 +116,7 @@ __all__ = [
     "SyncReport",
     "SyncedFile",
     "UpdateResult",
+    "ValidationError",
     "WorkflowError",
     "__version__",
     "connect",

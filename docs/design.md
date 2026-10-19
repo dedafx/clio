@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.4. Phase 0 (C++ core, Python bindings, USD resolver), phase 1 (Python workflow services, `clio` CLI, history cache) and phase 2 (branches and drafts) are implemented; see [workflow.md](workflow.md), [usd.md](usd.md) and [building.md](building.md). |
+| **Status** | Draft v0.7. Phase 0 (C++ core, Python bindings, USD resolver), phase 1 (Python workflow services, `clio` CLI, history cache), phase 2 (branches and drafts), phase 3 (performance), phase 4 (USD write side, timestamps, `prepare`) and phase 4½ (version manifests) are implemented; see [workflow.md](workflow.md), [usd.md](usd.md) and [building.md](building.md). |
 | **Package** | `deda.clio` (Python namespace package) |
 | **Targets** | Python 3.13 · USD 26.08 (primary) and USD 25.08 or later · no DCCs yet |
 | **Consumers** | Standalone Python, the `clio` CLI, and USD. Dedaverse, Imagine and DCC integrations are later work. |
@@ -494,9 +494,10 @@ least risk.
    they arrive, instead of building a list of a million dicts in memory.
 6. **One connection per thread.** A P4API `ClientApi` must not be used
    from two threads at the same time. `clio_core` hands out connections
-   from a pool (the scaffold serializes on one connection per workspace),
-   and parallel *metadata* work runs on separate connections, with no GIL
-   involved.
+   from a pool (`ConnectionPool`, up to `connections`, default 4, opened
+   on demand), and parallel *metadata* work runs on separate connections,
+   with no GIL involved. The Python backend keeps one connection per
+   thread.
 7. **Cheap "anything new?" checks.** Before a costly refresh, ask for the
    latest change affecting a path (`p4 changes -m1 -s submitted
    //path/...`). If it has not moved since the last refresh, skip the
@@ -601,6 +602,12 @@ check and a recommended **typemap** for the admins:
 | `.exr .png .jpg .tif .mp4 .zip .fbx(binary) .abc .usdc .vdb` | `binary+Fl` | `+F` stores the file uncompressed on the server, which skips pointless server-side gzip of data that is already compressed. That saves server CPU and time on submit and sync. |
 | Derived / cache outputs (bakes, caches, previews) | `binary+FS<n>` (e.g. `+S3`) | Keep only the last *n* revisions, to control depot growth. |
 | `.usda .json .py .txt .mtlx` | `text` | Mergeable. No lock needed. |
+
+*As built (phase 5):* `clio doctor` (`deda.clio.doctor`) runs the checks
+for config, server, login, workspace, workspace options (`allwrite` defeats the
+read-only clue that `status` uses), `net.parallel.max`, this typemap
+(`clio doctor --typemap` prints it), the USD plugin and the version store. A
+check never raises; one that cannot run is `skip`.
 
 Also recommended: **P4 Proxy** (or edge servers) for remote artists, so
 repeated syncs of the same large files come from a local cache;
@@ -722,6 +729,18 @@ Notes:
   its server digest (MD5) and size. Identical content, such as a file copied
   to a branch, is stored once and never downloaded twice. Content comes from
   `p4 print -o`, which does not change the workspace.
+
+*As built (phase 5):* `ContentCache` (`deda.clio.content`, `session.content`)
+is a folder under Clio's cache folder (`.../clio/content`) named
+`<digest>-<size><extension>`, filled with `p4 print -o` and checked against the
+digest (text files with `\r\n` counted as `\n`, as in §10.8). Identical content is
+stored once. It is size-limited by `content_cache_mb` and evicts the least
+recently used files down to 90% of the limit. `get_many` fetches several
+revisions in parallel; one that cannot be fetched is reported on its own.
+`clio cache verify` re-hashes the content files and, for history, asks the
+server (`p4 files -a`, 200 files per command) whether every cached revision
+still exists, dropping the entries that disagree; `clio cache clear` empties
+both. Folder activity is not verified, only cleared.
 
 **HistoryCache data model (sketch).** Shown as tables, but held in memory
 for the MVP. The same shape would become the schema of a persistent store.
@@ -856,6 +875,42 @@ Each result carries **freshness** (`FRESH`, `STALE` with its age, or
    come back as events, which the consumer marshals to its UI thread (in Qt,
    a queued signal).
 
+*As built (phase 5):* `deda.clio.views`.
+
+* **`RequestPipeline`** (`session.pipeline`) implements the five steps above:
+  a 30 ms window that merges requests of one kind into one batch (`fstat` for
+  rows, one `filelog -m1` for the submitters of many rows), deduplication of a
+  key that is waiting or running, priorities (visible, selected, prefetch),
+  cancellation of requests that have not started, and a few worker threads. A
+  failing batch fails only its own requests; the session closes the pipeline.
+* **`FileListView`**: one `fstat` for the folder (split folder by folder if the
+  server reports `MaxResults`/`MaxScanRows`), kept in the `HistoryCache` as a
+  listing; rows carry freshness against `volatile_ttl` (20 s);
+  `set_visible_range` asks for stale visible rows and prefetches as many below;
+  rows whose file left the server (not in the workspace and deleted at head) are
+  removed with a `reset`; `changed_by` is asked once per revision and kept
+  (immutable). `fstat -T` lists `otherOpen0..2` and `otherLock0..1`
+  explicitly, because a wildcard drops them.
+* **`HistoryView`**: the cached first page at once (stale), then the §9.4 check
+  for newer revisions; `fetch_more` loads an older page; `content(i)` goes
+  through the pipeline to the content cache.
+* Polling is a timer per view that is paused while hidden. Signals call their
+  slots on the emitting (worker) thread.
+* **`ActivityView`**: changes under one path or several (an asset's parts, merged
+  newest first); the cached feed at once, then the §9.4 watermark check;
+  `fetch_more` grows the page; `since` makes a "today" feed and ends paging at
+  the date; `files(i)` goes through the pipeline as one `describe` for all rows
+  asked together, kept in the `HistoryCache` (immutable).
+* **`BranchListView`**: one `streams`, each row with its relation to the branch
+  you are on, and for a branch with a parent the files it is behind (`merge -n`),
+  announced with `behind_changed`.
+* **`BranchDiffView`**: one `diff2 -q branch/... other/...` (default: the branch
+  you are on against its parent); rows are `different`, `only_here` or
+  `only_there` with the revision on each side.
+* *Not built:* "which branch a revision came from" (integration records in the
+  history rows), thumbnails (§9.8), lock badges for folders other than the
+  visible rows, a persistent cache.
+
 ### 9.6 Cached vs live: decision table
 
 | UI need | Source | Server calls |
@@ -965,6 +1020,18 @@ How it works (the "wave" walker):
 5. Keep the opened layers alive until `Usd.Stage.Open` runs. USD's layer
    registry then reuses them, so each layer is parsed only once.
 
+*As built (phase 4).* `prepare` walks the waves on a thread pool and
+resolves each wave through `deda.clio._core.AssetResolver`, so the C++
+coalescer (§10.3) turns a wave into one `sync` (or parallel `print`s for a
+pinned version) and the files land exactly where the plugin puts them. That
+shares the placement rules instead of repeating them in Python, which is the
+"one specification" this section asks for. Payloads are filtered by prim,
+`assets` collects asset-valued attributes (default and time samples) and clip
+asset paths, and `` `expressions` `` are reported, not evaluated. Layers
+opened by the walk are kept in the report so that `Usd.Stage.Open` reuses
+them. `prepare_for_edit` and `finish_edit` are the Python side of §10.6, over
+`Workspace.open_for_edit` and `Workspace.add_new`.
+
 Pros: pure Python, works in every DCC today, no compiled USD plugin, easy to
 debug. Cons: works from layer content, so it is a *superset*. It syncs every
 variant's references, not only the selected ones (can be filtered by the
@@ -1069,8 +1136,9 @@ USD worker threads
    the process. `latest` and labels are cached until the polling interval
    passes or the context is refreshed. A hit returns the local path in
    microseconds, so composition speed is unchanged when everything is up
-   to date. *(Scaffold: results are kept until `refresh`; the time limit
-   comes with phase 3.)*
+   to date. *(As built, phase 3: a change or revision is kept until
+   `refresh`; `have`, `latest`, labels and their "not found" answers are
+   kept for `cache_ttl`, 60 s by default.)*
 2. **Miss (file missing or stale).** The request goes to the **coalescer**:
    * *Single-flight:* concurrent requests for the same file share one fetch.
    * *Batching window* (for example 10–30 ms, configurable): misses from
@@ -1092,6 +1160,30 @@ objects must not be shared between threads, so `clio_core` keeps a small
 **connection pool** (default 2–4 per process). The coalescer, not the USD
 threads, owns the connections. No Python is involved and the GIL is never
 taken.
+
+**As built (phase 3).** `Workspace` runs its commands on a
+`ConnectionPool` (`connections`, default 4, created only when threads need
+them at the same time). `AssetResolver` coalesces misses in two layers:
+
+1. `SingleFlight`: concurrent resolves of the same (path, pin) run once and
+   share the result or the exception.
+2. `SyncBatcher`: `have` and `latest` misses join a batch per (pin, force).
+   The first thread waits `batch_ms` (20 ms), then runs one `p4 sync` for
+   the batch; at 500 files a batch closes early. A failed batch reaches every
+   caller in it, and each one falls back as a single failure would.
+
+Pinned versions (`@change`, `@label`, `#rev`) are not batched: `p4 print -o`
+writes one output file per command, so each file is its own `print`, run in
+parallel on the pooled connections by the calling threads. (A client-side
+split is not needed: the USD threads already provide the parallelism, and the
+pool bounds it.)
+
+The memo follows §8.3: change and revision answers are kept until
+`refresh()`; everything else for `cache_ttl` (60 s; 0 = always ask). The
+cache time is also what skips the repeated `sync` for `latest` that the
+scaffold ran on every resolve. Server work on the workspace (`sync`) is still
+one at a time, in this process and across processes, because of the
+workspace lock.
 
 **Credentials and prompts.** The resolver never prompts. A USD worker
 thread has no UI, and prompting there would hang the DCC. It uses the
@@ -1146,12 +1238,12 @@ symbol.
 | Method | Clio behaviour |
 |---|---|
 | `_CreateIdentifier` | Inherited from `ArDefaultResolver`: USD's usual anchoring of relative paths and search paths. |
-| `_Resolve` | If a Clio context is bound and the path is inside the workspace root or the version store (search paths are tried under the workspace root), fetch it through `clio_core` at the pin and return the local file. Otherwise, or if Clio cannot provide it, `ArDefaultResolver::_Resolve`. *(Scaffold: no coalescer yet; one fetch at a time per context.)* |
-| `_ResolveForNewAsset` / `_CanWriteAssetToPath` / `_OpenAssetForWrite` | *Planned (phase 4); inherited today, so saving writes the local file only.* When a layer is saved: runs `p4 edit` (with lock for `+l` types) or `p4 add` in the artist's pending change, or refuses with `whyNot` ("locked by Sam"). Never submits (§10.6). |
+| `_Resolve` | If a Clio context is bound and the path is inside the workspace root or the version store (search paths are tried under the workspace root), fetch it through `clio_core` at the pin and return the local file. Otherwise, or if Clio cannot provide it, `ArDefaultResolver::_Resolve`. *(Phase 3: threads share one fetch per file, and misses within a short window become one `sync`; see §10.3.)* |
+| `_ResolveForNewAsset` / `_CanWriteAssetToPath` / `_OpenAssetForWrite` | *Phase 4, write side as built in §10.6.* When a layer is saved: runs `p4 edit` (with lock for `+l` types) or `p4 add` in the artist's pending change, or refuses with `whyNot` ("locked by Sam"). Never submits (§10.6). |
 | `_IsContextDependentPath` | `true` for project paths while a Clio context is bound, because they resolve to a different file for each pin. Sdf then looks layers up by resolved path, so stages opened at different pins in one process never share a layer. Otherwise inherited. |
 | `_CreateDefaultContext[ForAsset]`, `_CreateContextFromString` | The default resolver's context, plus a `ClioResolverContext` from `$CLIO_RESOLVER_CONTEXT` if set. `CreateContextFromString(settings)` builds a Clio context when the string contains `=`, otherwise the default resolver's search-path context. |
 | `_GetAssetInfo` | Fills `assetName` (project path), `version` (the pin, for example `@18234`) and `resolverInfo` (`depotPath`, `pin`), with no server calls, so DCC UIs can show "crate.usd @18234". *(Planned: the revision number and digest.)* |
-| `_GetModificationTimestamp` | *Planned (phase 4): a timestamp derived from the revision or change number.* Inherited today: the local file's modification time. Perforce sets that to the sync time by default, so `Reload()` already picks up a newly synced version (tested), but a client with the `modtime` option would not. |
+| `_GetModificationTimestamp` | The local file's modification time, as inherited, except for one case. Perforce sets that time to the sync time by default, so `Reload()` picks up a newly synced version (tested). A client with the `modtime` option keeps each revision's own time, and two revisions can share it. For such a client (`p4 client -o`, asked once), an unopened workspace file gets its **revision number** (`fstat haveRev`) as the timestamp. A file open for edit keeps its file time, because the local content may differ from the revision. The revision is remembered for `cache_ttl` and dropped by `refresh()`, by Clio's own syncs and by opening the file for edit. The `verify` and `offline` policies, and an unreachable server, use the file time. *(Phase 4.)* |
 | `_RefreshContext` | Forgets remembered answers (so moving pins such as "latest" and labels are checked again on the next resolve) and sends `ArNotice::ResolverChanged` for the context. |
 | `_OpenAsset` | Inherited: resolved paths are ordinary local files. A later option is to stream pinned versions without writing files. |
 
@@ -1265,6 +1357,25 @@ When USD saves a layer from a DCC, the resolver's write hooks let Clio:
   (`_CanWriteAssetToPath` with a `whyNot` message);
 * never submit. Saving a layer is a local action. Submitting stays an
   explicit Clio `save`.
+
+**As built (phase 4).** `AssetResolver::prepareForWrite` (clio_core) does
+the work: `fstat` the file; if it is already open here, nothing more; if it
+is not in Perforce (or deleted at head) it is `isNew`; if another client holds
+a lock (`otherLock`, or an exclusive-open `+l` type) the write is refused with
+`<path> is locked by <user> (workspace <client>)`; if it is not in this
+workspace the write is refused ("get it first"); otherwise `p4 edit`, with a
+warning when the copy is not the head revision. `finishWrite` runs `p4 add`
+for a new file after it was written. At most two commands, under the
+workspace lock. The `verify` and `offline` policies do nothing, and an
+unreachable server allows the write with a warning (Clio is an enhancement,
+not a barrier).
+
+Sdf asks `_CanWriteAssetToPath` as a query (`SdfLayer::PermissionToSave`
+passes no `whyNot` and may call it often), so the plugin answers it locally
+(stored versions only) and does the Perforce work in `_OpenAssetForWrite`,
+which runs before the file is touched. A refusal there is a runtime error
+with the reason, and the layer on disk is unchanged. A wrapper around the
+default writable asset runs `finishWrite` when the asset is closed.
 
 Under option A (no plugin), the same behaviour is available as
 `clio_usd.prepare_for_edit(layer_paths)`, which DCC integrations call from
@@ -1432,6 +1543,46 @@ depot=//imagine/main;root=/farm/ws;manifest=/jobs/551/sh0100.clio-manifest.json;
   variables with the stage's defaults. Paths that depend on values set
   only at render time must be listed explicitly (`--extra PATH…`).
 
+#### As built (phase 4½)
+
+* **Python** (`deda.clio.usd`): `Manifest` with `create`, `load`, `save`,
+  `fetch`, `check`, `diff`, `settings` and `sha256`, over a canonical JSON
+  text (fixed key order, sorted files), so a saved manifest has the same id
+  when it is loaded again. `clio usd manifest create | fetch | check | diff`.
+  Failures to make a manifest raise `ManifestError` (exit code 13) with the
+  list of files.
+* **Creation** reuses `prepare`'s dependency walk instead of
+  `UsdUtils.ComputeAllDependencies`: it already resolves through the same
+  core, fetches what is missing, and follows pins. `fstat -Ol` runs on 500
+  files at a time, with `#have`, no suffix, or `@change`/`@label` by pin.
+  Digests of workspace files are checked on 8 threads (text ignoring `\r`).
+* **C++** (`clio_core`): `Manifest` (its own JSON reader; the format needs
+  nothing more), MD5 and SHA-256 written out so that the core does not use
+  the OpenSSL that P4API carries, `Workspace::materialize` /
+  `fetchManifest` / `checkManifest`, and the manifest branch of
+  `AssetResolver`. `Settings` has a `manifest=` key.
+* **Digests and line endings.** Perforce's digest is of the file as the server
+  stores it. `p4 print` writes text with the client's line endings, so text
+  copies (types `text`, `unicode`, `utf8`) are hashed with `\r\n` counted as
+  `\n`. `utf16` files are converted in a way that changes the bytes, so their
+  digest is not checked.
+* **Pool.** `<store>/objects/<digest>` holds each stored content once;
+  every manifest folder gets a hard link (a copy where the file system cannot
+  link). The pool is read-only and trusted once written: content is checked
+  before it enters the pool.
+* **Resolve.** A listed file resolves to the manifest folder's copy, with the
+  pin `#rev`. Not listed: `nullopt` under verify and offline, the normal
+  resolve with a warning under sync. In the USD plugin a project path that
+  resolves to nothing under a manifest returns an empty path instead of
+  falling back to `ArDefaultResolver`, because the fallback would load the
+  machine's own copy. The manifest's folder is recognized by
+  `matchLocalPath`, so relative references inside manifest layers resolve.
+* The store folder is named by the server (§10.4), so fetch and render must
+  reach the same server address.
+* **Not built:** shelf support (a `"shelf"` per file for unsubmitted work,
+  open question 10), evaluating expression variables, and submitting the
+  manifest to Perforce from Clio.
+
 #### API sketch
 
 ```python
@@ -1554,6 +1705,37 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
   absolute texture paths", "file naming convention"). Hooks run
   client-side before submit, so artists get feedback before a server
   trigger rejects the change.
+* *As built (phase 5):* `deda.clio.hooks`. `HookContext` carries the session,
+  the files of the change (asset path, local path, action, file type) and the
+  message; a hook returns `HookIssue`s (`error` stops the save with
+  `ValidationError`, exit code 14, after the change has been put back as for
+  any refused save; `warning` goes into `SaveResult.warnings`). Hooks come from
+  the `deda.clio.hooks` entry point group, `hooks.register` and
+  `session.hooks.register`, and the built-ins `no-absolute-paths` and `naming`
+  that the `hooks` setting turns on. A hook that raises, or an entry point that
+  does not load, is a warning (fail open). The asset-resolver entry point
+  (`deda.clio.resolvers`) waits for Dedaverse/Imagine (open question 6).
+* **Assets and elements.** USD calls a file an *asset*; Dedaverse calls the same
+  thing an *element*. In Dedaverse an *asset* is a higher-level collection of
+  related elements: a 3d character "Bob" is a mesh, a look, textures, a
+  skeleton, animation data, work files and published files. In Imagine an
+  *asset* is a photograph being prepared for print, with all its variants.
+  Two separate jobs follow, and Clio keeps them apart:
+  1. **One file path at a time (the USD resolver, §10).** USD gives
+     `clioUsd` a file path. It checks whether the file is on disk and, if it is
+     not, syncs it from Perforce. If the context names a manifest (§10.8), the
+     manifest decides the revision. Clio needs no idea of "Bob" for this.
+  2. **A whole asset (the asset resolver plugin).** `deda.clio.resolvers`
+     plugins turn an asset id into the project paths of its parts, so that `get`,
+     `lock`, `status`, `save` and `activity` work on "Bob" or a photo as one
+     thing (`session.assets`, `clio asset ...`). The built-in `folder` plugin
+     treats an asset as a folder. Dedaverse and Imagine each ship their own
+     plugin; Clio never imports either.
+  *As built (phase 5):* `deda.clio.assets` (`Assets`, `AssetResolverPlugin`,
+  `FolderResolver`), the `asset_resolver` setting (the kind a bare id means),
+  `AssetNotFoundError` (exit code 15). Not built: asset-level pins (`get` of "Bob"
+  at a change works through `version=`; a per-asset manifest is a manifest
+  created from the asset's root layer).
 * The event bus (§5.6) lets Dedaverse drive lock icons, progress bars, and
   notifications without polling.
 
@@ -1564,10 +1746,10 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
 | **0 — Scaffold** *(done)* | CMake project; `clio_core` (P4API connections, pins, `clio:` identifiers, settings, resolve for latest/have/historical pins, version store); `deda.clio._core` (nanobind, abi3); the `clioUsd` resolver plugin; C++, Python and USD tests against a throwaway `p4d`. See [building.md](building.md). |
 | **1 — Core workflow** *(done)* | Python services over `CoreBackend`: connect/login/setup, get (parallel), lock/unlock, save, status, discard, history and folder activity backed by the HistoryCache with watermark refresh (§9.3–9.4), and the `clio` CLI for these ([workflow.md](workflow.md)). Baseline benchmarks ([benchmarks.md](benchmarks.md)). *Deferred:* per-file progress (P4API's progress hook is not exposed yet), a status cache (phase 3), `clio doctor` (phase 5). |
 | **2 — Branching** *(done)* | Streams/task streams, switch, update/publish with binary conflict handling, cross-branch lock check, drafts (shelves) ([workflow.md](workflow.md#branches-and-drafts)). *Deferred:* updating or publishing part of a branch, taking a draft into another branch, virtual streams, stream spec editing (paths, imports). |
-| **3 — Performance** | Connection pool and miss coalescer in `clio_core`; time-bounded in-memory caches (§8.3); C++ hashing/scan/diff if benchmarks justify it. Measure; add a persistent store only if the numbers call for it. |
-| **4 — USD completion** | Write side (edit/lock on save, §10.6); revision-based timestamps; `deda.clio.usd.prepare` (option A); CI builds against USD 26.08 and 25.08. |
-| **4½ — Version manifests** | `Manifest` create/save/load/fetch/check/diff (§10.8), `manifest=` context setting, content-addressed pool, `clio usd manifest` CLI, farm guide (proxy + `policy=verify`). |
-| **5 — Ecosystem** | UI view models (`FileListView`, `HistoryView`) with the request pipeline, ContentCache (§9.5), asset resolver plugins, validation hooks, `clio doctor`. Dedaverse/DCC integration when targeted. |
+| **3 — Performance** *(done)* | Stat-first disk check for `status` and `save` ([benchmarks.md](benchmarks.md#phase-3-the-disk-check-2026-10-12)); `ConnectionPool` in `clio_core`; the miss coalescer (single-flight plus a batching window for `sync`, parallel fetches of pinned versions); time-bounded resolver memo (§8.3, §10.3 "As built"). *Measured and not built:* C++ hashing, scan and diff, a persistent store and a Python status cache (see [benchmarks.md](benchmarks.md#phase-3-what-was-not-built-2026-10-18)). |
+| **4 — USD completion** *(done, CI not yet run)* | Write side: edit/add on save, refuse on another user's lock (§10.6); revision-based timestamps for `modtime` clients (§10.3); `deda.clio.usd.prepare`, `prepare_for_edit` and `finish_edit` (option A, §10.2). A Linux CI workflow builds and tests against USD 26.08 and 25.08 (`.github/workflows/ci.yml`); it has not run on GitHub yet. *Deferred:* locking a layer before it is edited (today the edit happens at save), submit hooks. |
+| **4½ — Version manifests** *(done)* | `Manifest` create/save/load/fetch/check/diff (§10.8), `manifest=` context setting, content-addressed pool, `clio usd manifest` CLI, farm guide (proxy + `policy=verify`, [usd.md](usd.md#rendering-on-a-farm-version-manifests)). *Deferred:* shelves for unsubmitted work, expression variables. |
+| **5 — Ecosystem** *(mostly done)* | *Done:* `clio doctor` and `clio doctor --typemap` (§8.5); validation hooks, `deda.clio.hooks` (§14); ContentCache and `clio cache clear/verify` (§9.3); view models `FileListView` and `HistoryView` over a coalescing, deduplicating, prioritized, cancellable `RequestPipeline` (§9.5). *Also done:* asset resolver plugins, `deda.clio.resolvers` and `session.assets` (§14). *Also done:* `ActivityView`, `BranchListView` and `BranchDiffView`. *Left:* integration records in history rows, thumbnails (§9.8), Dedaverse/DCC integration when targeted. |
 
 ### Backlog
 
@@ -1592,7 +1774,7 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
 4. ~~**Cross-branch locking**~~ *Decided: advisory by default, configurable (see below).*
 5. **Vocabulary:** Do "save / get / lock / draft / publish" suit your
    artists, or do they already know some Perforce terms that should stay?
-6. **Asset identity:** Is an asset a folder (all files under a path), or is
+6. ~~**Asset identity**~~ *Answered (see "Assets and elements" in §14).* Is an asset a folder (all files under a path), or is
    it defined by Dedaverse/Imagine metadata (for example a USD asset or a
    database ID)? This decides how much of the resolver ships in Clio itself.
 7. **Pins:** Is a Perforce **label** the right way to mark approved
@@ -1614,6 +1796,12 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
 
 ### Decided
 
+* **Assets and elements (Q6).** Clio's unit is the **file**. USD calls a file an
+  *asset*; Dedaverse calls it an *element*. A Dedaverse *asset* (a character
+  "Bob": mesh, look, textures, skeleton, animation, work and published files) and
+  an Imagine *asset* (a photograph and all its variants) are groups of elements
+  that Clio does not interpret. A plugin lists the files of a group
+  (`deda.clio.resolvers`, §14).
 * Cross-branch locks: a warning by default; `cross_branch_locks` can make
   them block or turn the check off (Q4, §7.3).
 * CLI: `click` (Q3). It is the one runtime dependency besides Clio's own

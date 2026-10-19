@@ -285,3 +285,64 @@ def test_parallel_get_and_save(make_session, p4_server, monkeypatch):
 def test_no_parallel_transfer_with_a_ticket_file_setting(make_session):
     alice = make_session("clio_tester", parallel_threads=4)
     assert alice.workspace._parallel_args() == []
+
+
+def _reconcile_edit_args(ws, monkeypatch) -> list[list[str]]:
+    """Record the arguments of every ``reconcile -e`` the workspace runs."""
+    calls: list[list[str]] = []
+    original = ws._run
+
+    def spy(command, args=(), input=None):
+        if command == "reconcile" and "-e" in args:
+            calls.append(list(args))
+        return original(command, args, input)
+
+    monkeypatch.setattr(ws, "_run", spy)
+    return calls
+
+
+def test_status_does_not_open_files_that_look_untouched(alice, monkeypatch):
+    seed(alice, {"q/a.ma": "1", "q/b.ma": "2", "q/c.usda": "#usda\n"})
+    calls = _reconcile_edit_args(alice.workspace, monkeypatch)
+    states = {f.asset_path: f.state for f in alice.workspace.status("q")}
+    assert set(states.values()) == {FileState.SYNCED}
+    assert calls == []  # read-only, same size: nothing for Perforce to look at
+
+
+def test_status_checks_only_the_suspicious_files(alice, monkeypatch):
+    seed(alice, {"q/same.ma": "1", "q/touched.ma": "2", "q/shrunk.ma": "3333", "q/other.ma": "4"})
+    touched = alice.paths.local_path("q/touched.ma")
+    touched.chmod(touched.stat().st_mode | stat.S_IWRITE)  # writable, content the same
+    shrunk = alice.paths.local_path("q/shrunk.ma")
+    shrunk.chmod(shrunk.stat().st_mode | stat.S_IWRITE)
+    shrunk.write_text("3")
+    shrunk.chmod(stat.S_IREAD)  # changed, then made read-only again: caught by its size
+    calls = _reconcile_edit_args(alice.workspace, monkeypatch)
+    states = {f.asset_path: f.state for f in alice.workspace.status("q")}
+    assert states["q/shrunk.ma"] is FileState.MODIFIED
+    assert states["q/touched.ma"] is FileState.SYNCED  # Perforce compared the content
+    assert states["q/same.ma"] is states["q/other.ma"] is FileState.SYNCED
+    [args] = calls
+    assert sorted(Path(a).name for a in args if not a.startswith("-")) == ["shrunk.ma", "touched.ma"]
+
+
+@pytest.mark.parametrize(("head_type", "depot", "local", "expected"), [
+    ("binary+l", 10, 10, False),
+    ("binary+l", 10, 11, True),
+    ("binary", 10, 9, True),
+    ("utf16", 10, 20, False),
+    ("symlink", 10, 20, False),
+    ("binary", None, 20, False),
+    ("text", 10, 9, True),
+])
+def test_size_is_suspect(head_type, depot, local, expected):
+    from deda.clio.workspace import _size_is_suspect
+    assert _size_is_suspect(head_type, depot, local) is expected
+
+
+def test_size_is_suspect_for_text_depends_on_line_endings(monkeypatch):
+    from deda.clio import workspace
+    monkeypatch.setattr(workspace.os, "name", "nt")
+    assert not workspace._size_is_suspect("text", 10, 14)  # CRLF made it longer
+    monkeypatch.setattr(workspace.os, "name", "posix")
+    assert workspace._size_is_suspect("text", 10, 14)

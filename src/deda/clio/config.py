@@ -67,6 +67,9 @@ class Config:
     parallel_min_files: int = 8
     #: How long history and activity stay fresh before a cheap server check.
     poll_interval: float = 30.0
+    #: How long a file list row (head revision, locks) stays fresh before it
+    #: is asked for again, in seconds (design doc §9.2, "volatile").
+    volatile_ttl: float = 20.0
     #: Where ``discard`` copies files before reverting them.
     backup_dir: str = ""
     #: On lock, what to do when someone has the same file open in a related
@@ -76,6 +79,16 @@ class Config:
     connect_timeout: int = 10
     #: Seconds a single Perforce command may run.
     timeout: int = 120
+    #: Built-in validation hooks to run before a save (``no-absolute-paths``,
+    #: ``naming``; see ``deda.clio.hooks``). Hooks from entry points always run.
+    hooks: tuple[str, ...] = ()
+    #: Which asset resolver plugin a bare asset id means (``folder``, or the
+    #: name of a plugin from the ``deda.clio.resolvers`` entry points).
+    asset_resolver: str = ""
+    #: Size limit of the content cache (file bytes fetched for display), in MB.
+    content_cache_mb: int = 5120
+    #: Regular expression every new file name must match (the ``naming`` hook).
+    naming_pattern: str = ""
     #: Where each setting came from, for ``clio doctor`` style reports.
     sources: dict[str, str] = field(default_factory=dict, compare=False)
 
@@ -125,6 +138,11 @@ def _coerce(key: str, value: Any, source: str) -> Any:
             return int(value)
         if kind == "float":
             return float(value)
+        if kind.startswith("tuple"):
+            items = [p.strip() for p in value.split(",")] if isinstance(value, str) else list(value)
+            if not all(isinstance(i, str) for i in items):
+                raise TypeError
+            return tuple(i for i in items if i)
         if isinstance(value, os.PathLike):
             return os.fspath(value)
         if not isinstance(value, str):

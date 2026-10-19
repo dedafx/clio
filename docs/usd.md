@@ -15,8 +15,8 @@ This guide is for people using the `deda-clio` package. For how it is
 built and why, see [building.md](building.md) and [design.md](design.md) §10.
 
 > **Status: v0.1 scaffold.** Reading works: latest, have, change and label
-> pins, with fallback to local files. Saving layers back to Perforce and
-> batching many fetches into one request are not done yet. See
+> pins, with fallback to local files, and many missing files are fetched
+> together. Saving a layer opens it for edit in Perforce. See
 > [Current limitations](#current-limitations).
 
 Supported: Python 3.13, and OpenUSD 26.08 and 25.08 (both tested), plus
@@ -59,6 +59,23 @@ Before you start:
 * **Your client workspace must map `depot` to `root`.** For example,
   `//imagine/main/...` must map to `/work/imagine/...`. Clio does not
   create workspaces yet.
+
+## Words: asset, element, file
+
+USD calls every file a layer or other thing it loads an **asset**.
+Dedaverse calls that same file an **element**, and uses **asset** for
+something bigger: a group of related elements, such as a character "Bob"
+(mesh, look, textures, skeleton, animation, work files and published files).
+In Imagine, an asset is a photograph with all its variants.
+
+This guide is about the first meaning: the plugin takes **one file path** from
+USD, makes sure the file is there (using it as it is if it is on disk,
+syncing it from Perforce if it is not) and, if the context names a
+[manifest](#rendering-on-a-farm-version-manifests), uses the manifest's
+revision. To work on a whole Dedaverse or Imagine asset (get, lock, save all its
+parts), see [asset plugins](workflow.md#whole-assets-asset-resolver-plugins).
+
+---
 
 ## Writing paths in layers
 
@@ -203,6 +220,10 @@ passed to USD's default resolver as a search path, as before.
 | `policy` | no | `sync` (default), `verify` or `offline` (below) |
 | `timeout` | no | Seconds before a Perforce command is cancelled. Default `120`, `0` = none |
 | `connect_timeout` | no | Seconds to wait for an unreachable server before falling back to local files. Default `10`, `0` = the OS default (can be over 2 minutes) |
+| `manifest` | no | Path of a version manifest. Files then load only as the manifest lists them (see [Rendering on a farm](#rendering-on-a-farm-version-manifests)). `pin` is not used |
+| `cache_ttl` | no | Seconds Clio trusts an answer that can change (`have`, `latest`, a label) before asking again. Default `60`, `0` = ask every time. A change or revision never changes and is kept until `RefreshContext` |
+| `batch_ms` | no | Milliseconds a resolve that needs the server waits for other missing files to join its `sync`. Default `20`, `0` = do not wait |
+| `connections` | no | Most Perforce connections Clio opens in the process (1 to 64). Default `4`; they open only when threads need them at the same time |
 
 Check a string in Python before handing it to USD:
 
@@ -216,7 +237,7 @@ clio.Settings.parse(settings)   # raises clio.ConfigError with the reason
 | Policy | Contacts the server? | Use it for |
 |---|---|---|
 | `sync` | Yes, to fetch what is missing or out of date. Falls back to local files, with a warning, if the server is unavailable. | Everyday work |
-| `verify` | No. A file must already be on disk at the required version. Never falls back. | Render farms and reproducible builds, after a prefetch step (planned: version manifests, design §10.8) |
+| `verify` | No. A file must already be on disk at the required version. Never falls back. | Render farms and reproducible builds, after a prefetch step; see [version manifests](#rendering-on-a-farm-version-manifests) |
 | `offline` | No. Uses what is on disk (for historical pins: the version store, then the workspace). | Working without a connection |
 
 ### A default context for every stage
@@ -249,6 +270,53 @@ process; if it is invalid, USD prints one warning and Clio stays off.
 Answers that came from a fallback are not remembered, so the exact version
 is fetched as soon as the server is reachable again.
 
+### Saving layers
+
+When you save a layer inside the project (`layer.Save()`, or a DCC's save),
+Clio gets the file ready first, so the save works like it does for any
+other Perforce file:
+
+* **An existing file is opened for edit** (`p4 edit`). A file type with an
+  exclusive lock (`+l`) is locked by that.
+* **A new file is added** to Perforce right after USD has written it.
+* **A file someone else has locked is refused before anything is
+  written.** The save fails with the reason, for example
+  `assets/crate/crate.usda is locked by sam (workspace sam_ws)`, and your
+  file on disk is not touched.
+* **A stored version cannot be saved over** (a file in the version store, from
+  a `@change`, `@label` or `#rev` pin). Save to the workspace instead.
+* If your copy is not the latest version, the save goes ahead and Clio
+  warns you. Get the latest version and merge it before you submit.
+
+Saving never submits. Submit with `clio save` (or `Workspace.save`), as for
+any other file. With the `verify` and `offline` policies Clio does not touch
+Perforce, and if the server cannot be reached the file is saved locally with
+a warning, so a dead network never loses an artist's work. Without a Clio
+context, saving is plain USD.
+
+Because Sdf asks `PermissionToSave` as a plain question (it passes no
+reason and may ask often), Clio answers it without contacting the server;
+the lock check and the edit happen when the file is opened for writing.
+
+### Opening a big stage
+
+USD loads layers on many threads, so a stage can ask for hundreds of missing
+files at once. Clio turns that into few server commands:
+
+* Threads asking for the **same file** share one fetch.
+* Files that miss within `batch_ms` of each other (20 ms by default) are
+  synced with **one** `p4 sync`. Each thread waits only until its batch is
+  done. If the batch fails (for example the server is down), every file in it
+  falls back to the local file with a warning.
+* Files at a **change, label or revision** are fetched on up to
+  `connections` Perforce connections at the same time.
+
+Answers are remembered in memory only. After `cache_ttl` seconds, a `have`,
+`latest` or label answer is checked again the next time it is asked for, so
+a new version submitted by someone else is picked up without
+`RefreshContext` (a stage that is already open keeps what it loaded until
+you reload it). `RefreshContext` still forgets everything at once.
+
 ## Sharing files
 
 Because layers contain ordinary paths, **anyone can open them from a copy
@@ -280,6 +348,13 @@ Ar.GetResolver().RefreshContext(ctx)   # forget remembered answers for this cont
 stage.Reload()                         # USD re-opens layers whose files changed
 ```
 
+`Reload()` decides by each file's modification time. Perforce sets that to
+the time of the sync, so a newly synced version always looks newer. If your
+workspace uses the `modtime` option (a synced file keeps the time it was
+last changed, and two versions can have the same time), Clio gives USD the
+file's Perforce revision number instead, for files you have not opened for
+edit. Nothing to set up: Clio checks the workspace's options itself.
+
 ## Asset information
 
 ```python
@@ -295,6 +370,167 @@ info.resolverInfo["depotPath"]     # "//imagine/main/assets/crate/crate.usda"
 
 `GetAssetInfo` makes no server calls. Outside the project, or with no Clio
 context, it returns what USD's default resolver returns.
+
+## Rendering on a farm: version manifests
+
+`have` and `latest` depend on the machine: `have` loads whatever each
+workspace holds, and `latest` depends on *when* each machine resolves. A
+render split over 500 machines must load **exactly the same file revisions**
+on every frame, even while artists keep submitting. A change pin (`@18234`)
+is close, but it cannot say what an artist actually looked at: a mix of
+revisions synced at different times.
+
+A **manifest** records the exact revision of every file the stage can load,
+with the server's digest. Every machine then loads through the manifest and
+nothing else. The same manifest gives the same pixels today or in a year,
+and its SHA-256 is the job's version id.
+
+### 1. Make it (on the artist's or the submitter's machine)
+
+```
+clio usd manifest create shots/sq010/sh0100/shot.usda --pin have -o sh0100.clio-manifest.json
+```
+
+```python
+from deda.clio import usd as clio_usd
+
+manifest = clio_usd.Manifest.create(session, "shots/sq010/sh0100/shot.usda", pin="have")
+manifest.save("sh0100.clio-manifest.json")
+print(manifest.sha256)          # the job's version id
+```
+
+The walk reads layer contents, like [`prepare`](#without-the-plugin-prepare),
+so the manifest is a **superset** of what one render loads: every variant and
+payload, so a variant switch on the farm never finds a file missing. Use
+`--no-payloads` to leave payloads out, and `--extra PATH` (repeatable) for a
+file no layer mentions, such as a path built at render time. Expressions in
+asset paths are not evaluated.
+
+| `--pin` | Revision recorded |
+|---|---|
+| `have` (default) | The one in your workspace: what you were looking at |
+| `latest` | The head revision, all read in one moment |
+| `@18234` or `@approved` | The revision at that change or label |
+
+**Clio refuses to make a manifest a farm machine could not reproduce**, and
+lists the files (exit code 13): a file that is **not in Perforce**, a file
+that is **open for edit**, a file whose **content differs from its
+revision** (edited without checking out), and a reference that cannot be
+provided (unless `--allow-missing`). Submit or revert those files and run it
+again.
+
+Keep the manifest with the render job. You can also submit it to Perforce
+(for example under `//imagine/main/manifests/`) so that any render can be
+reproduced later.
+
+### 2. Fetch it (once per farm machine, before rendering)
+
+```
+clio usd manifest fetch sh0100.clio-manifest.json --threads 8
+```
+
+This downloads every listed revision with parallel `p4 print` and checks each
+file against its digest. Files go into the manifest's own folder of the
+version store, which mirrors the depot so relative paths between layers keep
+working:
+
+```
+<store>/<server>/<depot>/manifest-<first 16 characters of the id>/shots/sq010/sh0100/shot.usda
+```
+
+A file that another manifest already stored (same digest) is **linked** from a
+shared pool (`<store>/objects/<digest>`), not downloaded again: two jobs with
+similar manifests store a big file once, and the second job fetches only the
+difference. Everything is stored read-only. Run it again at any time; files
+already in place are checked and left alone.
+
+**Reach Perforce through a P4 Proxy near the farm**, so 500 machines fetching
+the same files hit the proxy's cache and not the commit server.
+
+### 3. Render with the manifest
+
+```
+depot=//imagine/main;root=/farm/ws;manifest=/jobs/551/sh0100.clio-manifest.json;policy=verify
+```
+
+Use this as the resolver context (or `$CLIO_RESOLVER_CONTEXT`) and open the
+stage as usual. In Python, `manifest.settings(session, path)` builds it.
+
+* A path in the manifest resolves to the manifest's copy of that revision,
+  wherever the stage found it (a workspace path, or a relative path inside
+  another layer of the manifest).
+* A path **not in the manifest does not resolve**, even if the file is on
+  disk, and Clio prints one warning. That is the guarantee: nothing outside
+  the manifest is ever loaded. The same holds for a listed file that was not
+  fetched yet.
+* With `policy=verify` there are **no server calls** during the render.
+  With `policy=sync` (for interactive use) a listed file that is not stored
+  yet is fetched, and a path outside the manifest is resolved as without a
+  manifest, with a warning.
+
+### Checking and comparing
+
+```
+clio usd manifest check sh0100.clio-manifest.json     # is every revision still on the server?
+clio usd manifest diff  old.json new.json              # what changed between two jobs
+```
+
+`check` asks the server (one `fstat` per 500 files) whether each revision can
+still be fetched with the manifest's digest. An obliterated or archived
+revision cannot, so run it before a long re-render. `diff` needs no server;
+it exits with 1 when the manifests differ.
+
+---
+
+## Without the plugin: `prepare`
+
+For a DCC or USD version the plugin is not built for, for a farm prefetch,
+or when you want to see what a stage needs, `deda.clio.usd.prepare` does the
+same job in Python. It needs USD's Python bindings, not the plugin.
+
+```python
+from deda import clio
+from deda.clio import usd as clio_usd
+from pxr import Usd
+
+session = clio.connect(...)
+report = clio_usd.prepare(
+    session, "shots/sq010/sh0100/shot.usda",
+    pin="@18234",          # "have" (default), "latest", "@<change>" or "@<label>"
+    payloads="all",        # "all", "none", or callable(prim_path, asset_path) -> bool
+    assets=True,           # also textures, clips and volumes
+    progress=print)
+stage = Usd.Stage.Open(report.root_path)     # every file is already on disk
+```
+
+It reads each layer, collects the sublayers, references, payloads and (with
+`assets`) asset paths, and gets them all in one round. A shot that is five
+layers deep takes about five rounds, each one `p4 sync` (or parallel
+`p4 print` for a pinned version), not one command per file. The files go
+where the plugin would put them, because both use the same C++ core, so a
+stage opened from `report.root_path` sees the same files either way.
+
+`report` lists the `layers` and `assets` it reached, the `missing`
+references (a missing file is reported, not an error) and `warnings` (for
+example a local file used instead of the exact version, or a path written as
+an expression, which is not evaluated). The walk reads layer contents, so it
+covers every variant, not only the selected ones; `payloads` narrows it. It
+cannot react to a variant switch later; the plugin can.
+
+To get layers ready to be saved without the plugin, call
+`prepare_for_edit` from the DCC's save callback and `finish_edit` after the
+save:
+
+```python
+edit = clio_usd.prepare_for_edit(session, ["assets/crate/crate.usda", "assets/crate/new.usda"])
+layer.Save()
+clio_usd.finish_edit(session, edit)       # opens new files for add
+```
+
+`prepare_for_edit` opens existing files for edit (one `fstat` and one `edit`
+for all of them), raises `LockedByOtherError` before opening anything if
+someone else holds a lock, and lists in `edit.new` the files that are not in
+Perforce yet. Like the plugin, it never submits.
 
 ## Using the same rules from Python, without USD
 
@@ -339,22 +575,13 @@ assert Plug.Registry().GetPluginWithName("clioUsd").isLoaded
 
 ## Current limitations
 
-1. **Saving layers does not check out files.** USD writes to the local
-   file. Clio does not run `p4 edit`, take a lock or add new files yet
-   (design §10.6). With Perforce's default workspace options, synced files
-   are read-only, so check them out with `p4 edit` before saving.
-2. **Fetches are not batched yet.** Each missing file is fetched on its
-   own, one at a time per context, so large stages open slower than they
-   will once fetches are batched (design §10.3).
-3. **`latest` is remembered until `RefreshContext`.** The planned 30–60 s
-   automatic re-check (design §8.3) is not implemented yet.
-4. **Clio is the primary resolver.** Only one primary resolver can be
+1. **Clio is the primary resolver.** Only one primary resolver can be
    active in a process, so Clio cannot yet be combined with another
    custom resolver (for example a DCC's or a studio's). No DCCs are
    targeted yet.
-5. **Pins apply to the whole stage.** Layers cannot hold a pin on a single
+2. **Pins apply to the whole stage.** Layers cannot hold a pin on a single
    path (see [Choosing a version](#choosing-a-version-pins)).
-6. **Project-rooted search paths may cost one server call per probe.**
+3. **Project-rooted search paths may cost one server call per probe.**
    USD first looks for `assets/x.usda` next to the current layer. If that
    location is inside the project, Clio asks the server once, and
    remembers a "not found" answer until refresh. Relative paths avoid

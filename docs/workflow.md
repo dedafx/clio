@@ -70,6 +70,10 @@ clio --project imagine status
 | `backup_dir` | Where `discard` keeps copies | `%LOCALAPPDATA%\clio\backups`, `~/.local/state/clio/backups` |
 | `cross_branch_locks` | On lock, someone has the file open in a related branch: `warn`, `block` or `off` | `warn` |
 | `connect_timeout`, `timeout` | Seconds to reach the server, and per command | 10, 120 |
+| `hooks` | Built-in checks to run before a save: `no-absolute-paths`, `naming` (a list, or comma-separated text) | none |
+| `asset_resolver` | The asset kind a bare asset id means (`folder`, or a plugin's name) | `folder` |
+| `content_cache_mb` | Size limit of the cache of file content shown in UIs, in MB | 5120 |
+| `naming_pattern` | Regular expression that every new file name must match (the `naming` check) | |
 
 ## The command line
 
@@ -92,6 +96,9 @@ clio discard props/crate --yes    # throw away changes (a copy is kept)
 clio history props/crate/crate.ma # versions of a file
 clio activity props               # recent changes in a folder
 clio login | logout | whoami
+clio doctor                       # is this machine set up well? (see below)
+clio cache clear [--history|--content]   # forget cached history, delete cached file content
+clio cache verify [PATH]          # drop cached entries the server no longer agrees with
 ```
 
 `save` finds what you changed under the paths you give (new, edited and
@@ -103,7 +110,52 @@ says what to do next.
 **Exit codes:** 0 success, 1 other error, 2 wrong usage, 3 not logged in,
 4 server unreachable, 5 locked by someone else, 6 out of date, 7 nothing to
 save, 8 refused by the server, 9 cancelled or not confirmed, 10 outside the
-workspace, 11 configuration error, 12 conflicts need a choice.
+workspace, 11 configuration error, 12 conflicts need a choice, 13 a
+version manifest cannot be made or used, 14 a validation check stopped the
+save, 15 no such asset.
+
+### Checks before a save
+
+`clio save` can run checks first, so you hear about a problem before the
+server's triggers reject the change, with a message written for you. If a
+check finds an error, **nothing is saved and your files are unchanged**; the
+error says which files and what to do. Warnings are printed and the save goes
+on. `clio save --no-validate` skips the checks.
+
+Turn on Clio's own checks in your config:
+
+```toml
+hooks = ["no-absolute-paths", "naming"]
+naming_pattern = '[a-z0-9_]+\.[a-z0-9]+'     # new files only
+```
+
+* `no-absolute-paths`: USD layers must not point at `D:/work/x.exr` or
+  `/mnt/x.usd`, which exist on one machine only (needs USD's Python bindings).
+* `naming`: new files must match `naming_pattern`. Old files with old names
+  never block a save.
+
+A studio adds its own checks as a Python function `check(context)` that
+returns `HookIssue`s, either in a package that declares an entry point in the
+group `deda.clio.hooks`, or in code with `deda.clio.hooks.register(name, fn)`
+(`session.hooks.register` for one session). The context has the session, the
+files (asset path, local path, action such as `add` or `edit`, file type) and
+the description. A check that crashes is reported as a warning and does not
+stop the save.
+
+### `clio doctor`
+
+`clio doctor` checks the configuration, the server, your login (and when
+the ticket expires), the workspace, the workspace options, the server's
+parallel-transfer setting, the file-type map, USD and the Clio plugin, and
+the version store. Each line is `ok`, `warn` (it works, but slower or riskier
+than it needs to), `FAIL` or `skip` (could not be checked, for example
+because the server is unreachable), with what to do about it. It exits with 1
+only if something failed.
+
+Clio does not change the server. For the admin, `clio doctor --typemap`
+prints the recommended file-type map: exclusive locks (`+l`) for files that
+cannot be merged, no server compression (`+F`) for files that are already
+compressed, and plain text for text. Paste it into `p4 typemap`.
 
 ## Branches and drafts
 
@@ -207,8 +259,107 @@ asset path, a depot path and a local path.
 and `p4_messages`: `AuthError`, `ServerUnavailableError`,
 `LockedByOtherError` (`path`, `user`, `workspace`), `OutOfDateError`
 (`paths`), `NothingToSaveError`, `ServerPolicyError` (`change`),
-`CancelledError`, `ConfirmationRequiredError`, `NotInWorkspaceError`.
+`CancelledError`, `ConfirmationRequiredError`, `NotInWorkspaceError`,
+`ManifestError` (`problems`) and `ValidationError` (`problems`, `issues`).
 Perforce warnings such as "file(s) up-to-date" are never raised.
+
+### Whole assets: asset resolver plugins
+
+Clio works on files. A Dedaverse **asset** (a character "Bob": mesh, look,
+textures, skeleton, animation, work and published files) and an Imagine
+**asset** (a photograph and its variants) are groups of files. An *asset
+resolver plugin* says which files make up an asset; then the everyday actions
+work on all of them together:
+
+```python
+s.assets.files("dedaverse:Bob")            # the project paths of Bob's parts
+s.assets.get("dedaverse:Bob")              # also version=..., preview=True
+s.assets.lock("dedaverse:Bob")
+report = s.assets.status("dedaverse:Bob")
+s.assets.save("dedaverse:Bob", message="Bob: new look")   # one change
+s.assets.activity("dedaverse:Bob")         # recent changes to any part
+```
+
+```
+clio asset files dedaverse:Bob
+clio asset status | get | lock | unlock dedaverse:Bob
+clio asset save dedaverse:Bob -m "Bob: new look"
+```
+
+An asset is written `kind:id`. The `folder` kind is built in: the asset is
+the folder at that path, and a bare path such as `props/crate` means it. Set
+`asset_resolver = "dedaverse"` to make another kind the default for bare ids.
+
+A plugin is a Python object with a `name` and `files(session, asset_id)`
+that returns the project paths (files or folders) of the parts, or raises
+`clio.AssetNotFoundError`. A package declares it in the entry point group
+`deda.clio.resolvers`, or code adds it with `session.assets.register(plugin)`.
+Dedaverse and Imagine each ship their own; Clio imports neither.
+
+### For user interfaces: `deda.clio.views`
+
+A file browser or a history panel should not call the server for every row.
+The view models in `deda.clio.views` do the batching for you. They have no
+Qt dependency but map directly onto a `QAbstractItemModel`: `len(view)`,
+`view[row]`, and signals.
+
+```python
+from deda.clio.views import FileListView, HistoryView
+
+files = FileListView(s, "props/crate", columns=("version", "state", "locked_by", "changed_by", "changed_at"))
+files.rows_changed.connect(on_rows_changed)   # (first, last) -- on a worker thread
+files.reset.connect(on_reset)                 # the set of rows changed
+files.set_visible_range(0, 40)                # only these rows are asked for, if stale
+row = files[3]    # FileRow: asset_path, version ("v12 of 14"), state, locked_by, size, freshness, ...
+
+hist = HistoryView(s, "props/crate/crate.ma", page_size=20)
+hist.rows_inserted.connect(on_inserted)       # (first, last): newer at the top, older at the end
+hist.fetch_more()                             # the next, older page, when the user scrolls
+path = hist.content(2).result()               # that revision's bytes, in the content cache
+```
+
+Two more views cover the activity feed and branches:
+
+```python
+from deda.clio.views import ActivityView, BranchListView, BranchDiffView
+
+feed = ActivityView(s, "props", page_size=20)            # changes under a folder, newest first
+feed.rows_inserted.connect(on_inserted)                  # (first, last): news at the top, older pages at the end
+feed.fetch_more()                                        # going back in time
+today = ActivityView(s, "props", since=midnight)         # a "today" feed: stops at the date
+bob = ActivityView(s, s.assets.files("dedaverse:Bob").paths)   # one feed for an asset's parts
+feed.files(0).result()                                   # the depot paths in that change
+
+branches = BranchListView(s)       # rows: branch + relation (current, parent, child, sibling)
+branches.behind                    # files the parent changed since your last update; None on a mainline
+diff = BranchDiffView(s)           # files that differ between your branch and its parent
+[(r.asset_path, r.kind) for r in diff]    # different, only_here, only_there
+```
+
+The feed shows its cached rows at once and checks for news with the cheap
+watermark call; the files of the changes on screen are one `describe` and are
+kept (a submitted change never changes). The branch list is one `streams` plus
+one `merge -n` for the behind count. The branch diff is one `diff2` however many
+files there are. All three are display only: switching, updating and publishing
+ask the server themselves.
+
+* **One call opens a folder.** The whole folder is listed with one `fstat`,
+  and kept, so a second view of the same folder has its rows at once.
+* **Rows say how fresh they are** (`FRESH`, `STALE`, or the view is
+  `LOADING`), so the UI can show a quiet "updating" mark and never block.
+  A row is fresh for `volatile_ttl` seconds (20); `set_visible_range` asks
+  again for the visible rows that are older, in one request however many there
+  are, and prefetches the rows just below. Requests for rows that scrolled away
+  before they started are dropped.
+* **Nothing runs on the UI thread.** Signal slots run on a worker thread; a
+  Qt UI connects them to a queued signal.
+* **`start_polling()`** checks for news every `poll_interval` seconds while
+  the view is visible (`set_visible(False)` pauses it).
+* **Display only.** Lock, save and get ask the server themselves; a cached
+  row is never used to decide anything.
+* A history revision's file bytes come from the **content cache**
+  (`s.content`, `content_cache_mb`), fetched once per machine and never
+  into your workspace. `clio cache clear` empties it.
 
 **Background work and events.** `s.submit_bg(ws.get, "environments/forest")`
 runs a call on a worker thread and returns a future; each thread uses its

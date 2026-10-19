@@ -16,6 +16,12 @@ find_program(CLIO_P4D_EXECUTABLE p4d
 add_executable(clio_core_tests
     main.cpp
     p4d_fixture.cpp
+    test_coalescer.cpp
+    test_manifest.cpp
+    test_pool.cpp
+    test_resolver_cache.cpp
+    test_timestamp.cpp
+    test_write.cpp
     test_identifier.cpp
     test_pin.cpp
     test_settings.cpp

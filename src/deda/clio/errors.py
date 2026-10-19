@@ -20,8 +20,10 @@ __all__ = [
     "ConfigError",
     "ConfirmationRequiredError",
     "ConflictError",
+    "AssetNotFoundError",
     "IdentifierError",
     "LockedByOtherError",
+    "ManifestError",
     "NotInWorkspaceError",
     "NothingToSaveError",
     "OutOfDateError",
@@ -29,6 +31,7 @@ __all__ = [
     "PinError",
     "ServerPolicyError",
     "ServerUnavailableError",
+    "ValidationError",
     "WorkflowError",
 ]
 
@@ -125,6 +128,40 @@ class ConflictError(WorkflowError):
         super().__init__(message, **kwargs)
         #: The :class:`~deda.clio.models.Conflict` for each file.
         self.conflicts = tuple(conflicts)
+
+
+class AssetNotFoundError(WorkflowError):
+    """An asset resolver plugin knows no asset of that name, or lists no
+    files for it (design doc §14)."""
+
+    exit_code = 15
+
+
+class ManifestError(WorkflowError):
+    """A version manifest cannot be made or used: a file a farm machine
+    could not reproduce, or a manifest for another project."""
+
+    exit_code = 13
+
+    def __init__(self, message: str, *, problems: Sequence[str] = (), **kwargs) -> None:
+        super().__init__(message, **kwargs)
+        #: One sentence per file or reference that stops the manifest.
+        self.problems = tuple(problems)
+
+
+class ValidationError(WorkflowError):
+    """A validation hook (``deda.clio.hooks``) stopped a save. Nothing was
+    submitted and no file on disk changed."""
+
+    exit_code = 14
+
+    def __init__(self, message: str, *, issues: Sequence = (), **kwargs) -> None:
+        issues = tuple(issues)
+        super().__init__(message, **kwargs)
+        #: The :class:`~deda.clio.hooks.HookIssue` found (errors and warnings).
+        self.issues = issues
+        #: One sentence per error, for display.
+        self.problems = tuple(str(i) for i in issues if getattr(i.severity, "value", "") == "error")
 
 
 class NotInWorkspaceError(WorkflowError):

@@ -1,7 +1,9 @@
 // deda.clio._core: Python bindings for clio_core.
 
 #include "clio/core/error.hpp"
+#include "clio/core/hash.hpp"
 #include "clio/core/identifier.hpp"
+#include "clio/core/manifest.hpp"
 #include "clio/core/p4/connection.hpp"
 #include "clio/core/pin.hpp"
 #include "clio/core/resolver.hpp"
@@ -100,6 +102,10 @@ NB_MODULE(_core, m) {
         .def_prop_ro("version_store", [](const Settings& s) { return s.versionStore; })
         .def_prop_ro("pin", [](const Settings& s) { return s.pin; })
         .def_prop_ro("policy", [](const Settings& s) { return s.policy; })
+        .def_prop_ro("manifest", [](const Settings& s) { return s.manifest; })
+        .def_prop_ro("max_connections", [](const Settings& s) { return s.maxConnections; })
+        .def_prop_ro("batch_ms", [](const Settings& s) { return s.batchWindow.count(); })
+        .def_prop_ro("cache_ttl", [](const Settings& s) { return s.cacheTtl.count(); })
         .def_prop_ro("port", [](const Settings& s) { return s.connection.port; })
         .def_prop_ro("user", [](const Settings& s) { return s.connection.user; })
         .def_prop_ro("client", [](const Settings& s) { return s.connection.client; })
@@ -162,6 +168,41 @@ NB_MODULE(_core, m) {
         .def_prop_ro("is_connected", &p4::Connection::isConnected)
         .def("disconnect", &p4::Connection::disconnect);
 
+    m.def("md5_file", &md5File, "path"_a, "ignore_carriage_returns"_a = false,
+          nb::call_guard<nb::gil_scoped_release>(),
+          "MD5 of a file as Perforce prints it (upper-case hex). With ignore_carriage_returns, "
+          "'\\r\\n' counts as '\\n', for text files that p4 print wrote with the client's line endings.");
+    m.def("sha256_hex", &sha256Hex, "text"_a, "SHA-256 of a text, lower-case hex.");
+
+    nb::class_<Manifest>(m, "Manifest", "A version manifest, read-only (design doc §10.8).")
+        .def_static("parse", &Manifest::parse, "text"_a)
+        .def_static("load", &Manifest::load, "path"_a)
+        .def_prop_ro("depot", &Manifest::depot)
+        .def_prop_ro("server", &Manifest::server)
+        .def_prop_ro("root_layer", &Manifest::rootLayer)
+        .def_prop_ro("source_pin", &Manifest::sourcePin)
+        .def_prop_ro("created", &Manifest::created)
+        .def_prop_ro("created_by", &Manifest::createdBy)
+        .def_prop_ro("usd_version", &Manifest::usdVersion)
+        .def_prop_ro("sha256", &Manifest::sha256)
+        .def_prop_ro("folder_name", &Manifest::folderName)
+        .def(
+            "entries",
+            [](const Manifest& manifest) {
+                nb::dict out;
+                for (const auto& [path, entry] : manifest.entries()) {
+                    nb::dict d;
+                    d["rev"] = entry.rev;
+                    d["change"] = entry.change;
+                    d["digest"] = entry.digest;
+                    d["size"] = entry.size;
+                    d["type"] = entry.type;
+                    out[nb::str(path.c_str())] = d;
+                }
+                return out;
+            },
+            "{path: {rev, change, digest, size, type}} for every file.");
+
     nb::class_<AssetResolver>(m, "AssetResolver",
                               "Resolve clio: identifiers to local files (design doc §10.4). Thread-safe.")
         .def(nb::init<Settings>(), "settings"_a)
@@ -200,6 +241,67 @@ NB_MODULE(_core, m) {
             "path"_a,
             "Resolve a local path as USD would: a workspace path uses the settings pin, a "
             "version-store path the version its folder holds. None if not managed or not available.")
+        .def(
+            "relative_path_of",
+            [](AssetResolver& r, const std::filesystem::path& path) -> std::optional<std::string> {
+                const auto match = r.workspace().matchLocalPath(path);
+                if (!match) {
+                    return std::nullopt;
+                }
+                return match->id.relativePath();
+            },
+            "path"_a,
+            "The project-relative path ('assets/crate/crate.usda') of a workspace, version store or "
+            "manifest path, or None. No server calls.")
+        .def_prop_ro("has_manifest", [](const AssetResolver& r) { return r.manifest() != nullptr; })
+        .def(
+            "manifest_path",
+            [](AssetResolver& r, const Manifest& manifest, const std::string& relativePath) {
+                return r.workspace().manifestPath(manifest, relativePath);
+            },
+            "manifest"_a, "relative_path"_a,
+            "Where the manifest's copy of a file is, or will be, in the version store.")
+        .def(
+            "fetch_manifest",
+            [](AssetResolver& r, const Manifest& manifest, std::size_t threads,
+               std::optional<nb::callable> progress) {
+                ManifestProgress callback;
+                if (progress) {
+                    // Called from worker threads with the GIL released.
+                    auto fn = std::make_shared<nb::callable>(std::move(*progress));
+                    callback = [fn](std::size_t done, std::size_t total, const std::string& path) {
+                        nb::gil_scoped_acquire acquire;
+                        (*fn)(done, total, path);
+                    };
+                }
+                ManifestFetchReport report;
+                {
+                    nb::gil_scoped_release release;
+                    report = r.workspace().fetchManifest(manifest, threads, callback);
+                }
+                nb::dict d;
+                d["files"] = report.files;
+                d["fetched"] = report.fetched;
+                d["linked"] = report.linked;
+                d["present"] = report.present;
+                d["bytes"] = report.bytes;
+                d["failures"] = report.failures;
+                return d;
+            },
+            "manifest"_a, "threads"_a = 8, "progress"_a = nb::none(),
+            "Materialize every file of the manifest in its folder of the version store, checking "
+            "digests. Returns {files, fetched, linked, present, bytes, failures}.")
+        .def(
+            "check_manifest",
+            [](AssetResolver& r, const Manifest& manifest) {
+                nb::gil_scoped_release release;
+                return r.workspace().checkManifest(manifest);
+            },
+            "manifest"_a,
+            "Ask the server whether every revision can still be fetched with the same digest. "
+            "Returns a list of problems; empty means all is well.")
+        .def_prop_ro("sync_commands_run", &AssetResolver::syncCommandsRun,
+                     "How many 'p4 sync' commands this resolver has run (misses are batched).")
         .def("manages", &AssetResolver::manages, "path"_a,
              "True if the path is inside the workspace root or this project's version store.")
         .def("resolve_for_new_asset", &AssetResolver::resolveForNewAsset, "identifier"_a)

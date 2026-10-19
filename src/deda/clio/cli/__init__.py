@@ -6,7 +6,9 @@ relative to the current folder; ``//...`` paths are depot paths.
 Exit codes: 0 success, 1 other Clio error, 2 usage error, 3 not logged in,
 4 server unreachable, 5 locked by someone else, 6 out of date, 7 nothing to
 save, 8 refused by the server, 9 cancelled or not confirmed, 10 outside the
-workspace, 11 configuration error, 12 conflicts need a choice (branch update).
+workspace, 11 configuration error, 12 conflicts need a choice (branch update),
+13 a version manifest cannot be made or used, 14 a validation check stopped
+the save, 15 no such asset.
 """
 
 from __future__ import annotations
@@ -106,6 +108,8 @@ def handles_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
             if state is not None and state.out.as_json:
                 payload = {"error": type(e).__name__, "message": getattr(e, "message", str(e)),
                            "hint": getattr(e, "hint", ""), "p4_messages": list(getattr(e, "p4_messages", ()))}
+                if getattr(e, "problems", ()):
+                    payload["problems"] = list(e.problems)
                 if isinstance(e, clio.ConflictError):
                     payload["conflicts"] = _jsonable(e.conflicts)
                 click.echo(json.dumps(payload, indent=2))
@@ -116,6 +120,8 @@ def handles_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
                         click.echo(f"  conflict  {conflict.asset_path}  (theirs: {conflict.theirs})", err=True)
                 if hint := getattr(e, "hint", ""):
                     click.echo(f"hint: {hint}", err=True)
+                for text in getattr(e, "problems", ()):
+                    click.echo(f"  {text}", err=True)
                 for text in getattr(e, "p4_messages", ()):
                     click.echo(f"  perforce: {text}", err=True)
             sys.exit(code)
@@ -331,17 +337,21 @@ def who(state: State, paths: tuple[str, ...]) -> None:
 @cli.command()
 @click.argument("paths", nargs=-1)
 @click.option("-m", "--message", required=True, help="What changed.")
+@click.option("--no-validate", is_flag=True, help="Skip the validation hooks.")
 @pass_state
 @handles_errors
-def save(state: State, paths: tuple[str, ...], message: str) -> None:
+def save(state: State, paths: tuple[str, ...], message: str, no_validate: bool) -> None:
     """Save added, changed and deleted files to Perforce."""
-    result = state.session.workspace.save(*paths, message=message, local_base=Path.cwd())
+    result = state.session.workspace.save(*paths, message=message, local_base=Path.cwd(),
+                                          validate=not no_validate)
 
     def human() -> None:
         click.echo(f"Saved change {result.change.number}")
         for label, items in (("added", result.added), ("edited", result.edited), ("deleted", result.deleted)):
             for item in items:
                 click.echo(f"  {label:<8} {item}")
+        for warning in result.warnings:
+            click.echo(f"warning: {warning}", err=True)
 
     state.out.emit(result, human)
 
@@ -596,6 +606,294 @@ def draft_drop(state: State, number: int, yes: bool) -> None:
         click.confirm(f"Drop draft {number}?", abort=True)
     state.session.drafts.drop(number, confirm=True)
     state.out.emit({"dropped": number}, lambda: click.echo(f"Dropped draft {number}"))
+
+
+# --- assets -------------------------------------------------------------------
+
+
+@cli.group()
+def asset() -> None:
+    """Whole assets: every file that makes up "Bob" or a photo (design doc §14).
+
+    SPEC is "kind:id" (for example dedaverse:Bob), or a folder path. The kind
+    names an asset resolver plugin."""
+
+
+@asset.command("files")
+@click.argument("spec")
+@pass_state
+@handles_errors
+def asset_files(state: State, spec: str) -> None:
+    """List the files and folders that make up an asset."""
+    found = state.session.assets.files(spec)
+    state.out.emit(found, lambda: [click.echo(p) for p in found.paths])
+
+
+@asset.command("status")
+@click.argument("spec")
+@click.option("--all", "show_all", is_flag=True, help="Also list files that are up to date.")
+@pass_state
+@handles_errors
+def asset_status(state: State, spec: str, show_all: bool) -> None:
+    """Changed, locked and out-of-date files of an asset."""
+    files = state.session.assets.status(spec)
+    shown = files if show_all else [f for f in files if f.state is not clio.FileState.SYNCED or f.locked_by]
+
+    def human() -> None:
+        for f in shown:
+            click.echo(_status_line(f))
+        if not shown:
+            click.echo("Everything is up to date")
+
+    state.out.emit(shown, human)
+
+
+@asset.command("get")
+@click.argument("spec")
+@click.option("--version", "version", help="latest (default), have, @CHANGE, @LABEL or #REV.")
+@click.option("--preview", is_flag=True, help="Show what would be transferred; change nothing.")
+@pass_state
+@handles_errors
+def asset_get(state: State, spec: str, version: str | None, preview: bool) -> None:
+    """Get every file of an asset."""
+    result = state.session.assets.get(spec, version=version, preview=preview)
+
+    def human() -> None:
+        if isinstance(result, clio.SyncPlan):
+            click.echo(f"Would get {result.file_count} file(s), {_size(result.bytes_to_transfer)}")
+        else:
+            click.echo(f"Got {result.file_count} file(s), {_size(result.bytes_transferred)}"
+                       if result.file_count else "Already up to date")
+
+    state.out.emit(result, human)
+
+
+@asset.command("lock")
+@click.argument("spec")
+@pass_state
+@handles_errors
+def asset_lock(state: State, spec: str) -> None:
+    """Lock every file of an asset."""
+    locks = state.session.assets.lock(spec)
+    state.out.emit(locks, lambda: [click.echo(f"locked  {lk.asset_path}") for lk in locks])
+
+
+@asset.command("unlock")
+@click.argument("spec")
+@pass_state
+@handles_errors
+def asset_unlock(state: State, spec: str) -> None:
+    """Release the locks on an asset."""
+    unlocked = state.session.assets.unlock(spec)
+    state.out.emit(unlocked, lambda: [click.echo(f"unlocked  {p}") for p in unlocked])
+
+
+@asset.command("save")
+@click.argument("spec")
+@click.option("-m", "--message", required=True, help="What changed.")
+@click.option("--no-validate", is_flag=True, help="Skip the validation hooks.")
+@pass_state
+@handles_errors
+def asset_save(state: State, spec: str, message: str, no_validate: bool) -> None:
+    """Save the changes to an asset's files, in one change."""
+    result = state.session.assets.save(spec, message=message, validate=not no_validate)
+    state.out.emit(result, lambda: click.echo(f"Saved change {result.change.number}"))
+
+
+# --- caches -------------------------------------------------------------------
+
+
+@cli.group("cache")
+def cache_group() -> None:
+    """The history and content caches (design doc §9)."""
+
+
+@cache_group.command("clear")
+@click.option("--history", "only_history", is_flag=True, help="Only the history cache.")
+@click.option("--content", "only_content", is_flag=True, help="Only the content cache.")
+@pass_state
+@handles_errors
+def cache_clear(state: State, only_history: bool, only_content: bool) -> None:
+    """Forget cached history and delete cached file content."""
+    both = not (only_history or only_content)
+    freed = 0
+    if both or only_history:
+        state.session.history.refresh()
+    if both or only_content:
+        freed = state.session.content.clear()
+    state.out.emit({"content_bytes_freed": freed},
+                   lambda: click.echo(f"Cleared the cache{f' ({_size(freed)} of content)' if freed else ''}"))
+
+
+@cache_group.command("verify")
+@click.argument("path", required=False, default="")
+@pass_state
+@handles_errors
+def cache_verify(state: State, path: str) -> None:
+    """Check the caches against the server and drop what disagrees."""
+    history = state.session.history.verify(path)
+    content = state.session.content.verify()
+    result = {"history_dropped": history, "content_checked": content.checked,
+              "content_removed": list(content.removed)}
+    state.out.emit(result, lambda: click.echo(
+        f"History: {history} entry(ies) dropped. Content: {content.checked} file(s) checked, "
+        f"{len(content.removed)} removed"))
+
+
+# --- doctor -------------------------------------------------------------------
+
+_STATUS_MARK = {"ok": ("ok  ", "green"), "warn": ("warn", "yellow"), "fail": ("FAIL", "red"), "skip": ("skip", None)}
+
+
+@cli.command()
+@click.option("--typemap", is_flag=True, help="Print the recommended typemap for the Perforce admin and exit.")
+@pass_state
+@handles_errors
+def doctor(state: State, typemap: bool) -> None:
+    """Check this machine's setup: config, server, login, workspace, USD."""
+    from deda.clio.doctor import CheckStatus, recommended_typemap, run_doctor
+
+    if typemap:
+        click.echo(recommended_typemap(), nl=False)
+        return
+    report = run_doctor(state.session)
+
+    def human() -> None:
+        for check in report.checks:
+            mark, colour = _STATUS_MARK[check.status.value]
+            click.echo(f"[{click.style(mark, fg=colour)}] {check.name}: {check.message}")
+            if check.hint:
+                click.echo(f"       {check.hint}")
+        failed, warned = len(report.by_status(CheckStatus.FAIL)), len(report.by_status(CheckStatus.WARN))
+        click.echo("Everything needed works" if report.ok and not warned else
+                   f"{failed} failed, {warned} warning(s)")
+
+    state.out.emit(report, human)
+    if not report.ok:
+        sys.exit(1)
+
+
+# --- usd ----------------------------------------------------------------------
+
+
+@cli.group()
+def usd() -> None:
+    """USD helpers: version manifests for farm jobs."""
+
+
+@usd.group()
+def manifest() -> None:
+    """Version manifests: the same files on every machine (design doc §10.8)."""
+
+
+
+
+@manifest.command("create")
+@click.argument("root_layer")
+@click.option("--pin", default="have", show_default=True, help="have, latest, @CHANGE or @LABEL.")
+@click.option("-o", "--output", "output", required=True, type=click.Path(dir_okay=False),
+              help="Where to write the manifest.")
+@click.option("--extra", multiple=True, help="A file no layer mentions (repeat for more).")
+@click.option("--no-payloads", is_flag=True, help="Leave out payloads.")
+@click.option("--allow-missing", is_flag=True, help="Write the manifest even if a reference cannot be provided.")
+@click.option("--store", type=click.Path(file_okay=False), help="Version store folder.")
+@pass_state
+@handles_errors
+def manifest_create(state: State, root_layer: str, pin: str, output: str, extra: tuple[str, ...],
+                    no_payloads: bool, allow_missing: bool, store: str | None) -> None:
+    """Record the exact revision of every file ROOT_LAYER can load."""
+    from deda.clio.usd import Manifest
+
+    root = _under_cwd(state, root_layer)
+    made = Manifest.create(state.session, root, pin=pin, payloads="none" if no_payloads else "all",
+                           extra=[_under_cwd(state, e) for e in extra], store=store, allow_missing=allow_missing)
+    made.save(output)
+    state.out.emit({"path": output, "sha256": made.sha256, "files": len(made.files), "source_pin": made.source_pin},
+                   lambda: click.echo(f"Wrote {output}: {len(made.files)} file(s), id {made.sha256}"))
+
+
+def _under_cwd(state: State, path: str) -> str:
+    """A path as typed on the command line: absolute, or relative to the
+    current folder when that is inside the workspace, else an asset path."""
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return str(candidate)
+    local = Path.cwd() / candidate
+    try:
+        state.session.paths.asset_path_of_local(local)
+    except ClioError:
+        return path
+    return str(local)
+
+
+@manifest.command("fetch")
+@click.argument("manifest_file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--threads", default=8, show_default=True, help="Parallel downloads.")
+@click.option("--store", type=click.Path(file_okay=False), help="Version store folder.")
+@pass_state
+@handles_errors
+def manifest_fetch(state: State, manifest_file: str, threads: int, store: str | None) -> None:
+    """Download every file of a manifest and check it against its digest."""
+    from deda.clio.usd import Manifest
+
+    loaded = Manifest.load(manifest_file)
+    report = loaded.fetch(state.session, store=store, parallel=threads)
+
+    def human() -> None:
+        click.echo(f"{report.files} file(s): {report.fetched} fetched ({_size(report.bytes_fetched)}), "
+                   f"{report.linked} linked, {report.present} already there")
+        for failure in report.failures:
+            click.secho(f"  failed: {failure}", fg="red", err=True)
+
+    state.out.emit(report, human)
+    if not report.ok:
+        sys.exit(1)
+
+
+@manifest.command("check")
+@click.argument("manifest_file", type=click.Path(exists=True, dir_okay=False))
+@pass_state
+@handles_errors
+def manifest_check(state: State, manifest_file: str) -> None:
+    """Ask the server whether every revision of a manifest can still be fetched."""
+    from deda.clio.usd import Manifest
+
+    report = Manifest.load(manifest_file).check(state.session)
+
+    def human() -> None:
+        click.echo("All revisions are available" if report.ok else f"{len(report.problems)} problem(s):")
+        for problem in report.problems:
+            click.secho(f"  {problem}", fg="red", err=True)
+
+    state.out.emit(report, human)
+    if not report.ok:
+        sys.exit(1)
+
+
+@manifest.command("diff")
+@click.argument("first", type=click.Path(exists=True, dir_okay=False))
+@click.argument("second", type=click.Path(exists=True, dir_okay=False))
+@pass_state
+@handles_errors
+def manifest_diff(state: State, first: str, second: str) -> None:
+    """What changed between two manifests (no server needed)."""
+    from deda.clio.usd import Manifest
+
+    result = Manifest.load(first).diff(Manifest.load(second))
+
+    def human() -> None:
+        if result.same:
+            click.echo("The manifests list the same revisions")
+        for path in result.added:
+            click.echo(f"  added    {path}")
+        for path in result.removed:
+            click.echo(f"  removed  {path}")
+        for path, (old, new) in result.changed.items():
+            click.echo(f"  changed  {path}  #{old} -> #{new}")
+
+    state.out.emit(result, human)
+    if not result.same:
+        sys.exit(1)
 
 
 def _size(n: int) -> str:

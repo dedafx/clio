@@ -2,11 +2,18 @@
 
 #include "clio/core/error.hpp"
 #include "clio/core/file_lock.hpp"
+#include "clio/core/hash.hpp"
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 
+#include <algorithm>
 #include <atomic>
+#include <thread>
+#include <cctype>
+#include <map>
+#include <set>
 #include <system_error>
 
 #ifdef _WIN32
@@ -204,17 +211,47 @@ std::optional<Pin> pinFromDirName(const std::string& name) {
     return std::nullopt;
 }
 
+bool deletedAtHead(const p4::Record& record) {
+    const auto it = record.find("headAction");
+    return it != record.end() &&
+           (it->second == "delete" || it->second == "move/delete" || it->second == "purge" ||
+            it->second == "archive");
+}
+
+// Values of a numbered tagged field: otherOpen0, otherOpen1, ... or, with
+// one holder, the field itself.
+std::vector<std::string> numberedField(const p4::Record& record, const std::string& name) {
+    std::vector<std::string> values;
+    for (int i = 0;; ++i) {
+        const auto it = record.find(name + std::to_string(i));
+        if (it == record.end()) {
+            break;
+        }
+        values.push_back(it->second);
+    }
+    return values;
+}
+
+// "sam@sam_ws" -> "sam (workspace sam_ws)"
+std::string holderText(const std::string& userAtClient) {
+    const auto at = userAtClient.find('@');
+    if (at == std::string::npos) {
+        return userAtClient;
+    }
+    return userAtClient.substr(0, at) + " (workspace " + userAtClient.substr(at + 1) + ")";
+}
+
 } // namespace
 
 Workspace::Workspace(Settings settings)
-    : _settings(std::move(settings)), _connection(_settings.connection) {
+    : _settings(std::move(settings)), _pool(_settings.connection, _settings.maxConnections) {
     // Name the server's store folder by the port actually used, so different
     // servers taken from the environment never share a folder. (Equivalent
     // aliases for one server get separate folders, which is safe.)
     std::string port = _settings.connection.port;
     if (port.empty()) {
         try {
-            port = _connection.effectivePort();
+            port = _pool.effectivePort();
         } catch (const Error&) {
         }
     }
@@ -263,6 +300,13 @@ std::optional<LocalPathMatch> Workspace::matchLocalPath(const std::filesystem::p
         if (slash == std::string::npos) {
             return std::nullopt;
         }
+        if (!_manifestFolder.empty() && rel->substr(0, slash) == _manifestFolder) {
+            try {
+                return LocalPathMatch{AssetIdentifier::fromRelativePath(rel->substr(slash + 1)), std::nullopt, true, true};
+            } catch (const Error&) {
+                return std::nullopt;
+            }
+        }
         auto pin = pinFromDirName(rel->substr(0, slash));
         if (!pin) {
             return std::nullopt;
@@ -295,11 +339,332 @@ p4::CommandResult Workspace::sync(const std::vector<AssetIdentifier>& ids, const
     for (const auto& id : ids) {
         args.push_back(depotPath(id) + pin.p4RevSpec());
     }
-    std::lock_guard<std::mutex> lock(_mutex);
+    std::lock_guard<std::mutex> lock(_syncMutex);
     // Other processes (a DCC's resolver, the clio CLI) may change the same
     // workspace; serialize with them too.
     FileLock workspaceLock(lockPath());
-    return _connection.runOrThrow("sync", args);
+    return _pool.runOrThrow("sync", args);
+}
+
+WriteCheck Workspace::prepareForWrite(const AssetIdentifier& id) {
+    const std::string depot = depotPath(id);
+    const std::filesystem::path local = workspacePath(id);
+
+    std::lock_guard<std::mutex> lock(_syncMutex);
+    FileLock workspaceLock(lockPath());
+
+    const auto fstat = _pool.runOrThrow("fstat", {depot});
+    const p4::Record* record = fstat.records.empty() ? nullptr : &fstat.records.front();
+
+    WriteCheck check;
+    if (record && record->count("action")) {
+        return check; // already open in this workspace: nothing to do
+    }
+    if (!record || deletedAtHead(*record)) {
+        check.isNew = true;
+        return check;
+    }
+
+    // Someone else's lock: an explicit one, or the exclusive open that a +l
+    // file type takes.
+    std::string holder;
+    if (record->count("otherLock")) {
+        const auto locks = numberedField(*record, "otherLock");
+        const auto opens = numberedField(*record, "otherOpen");
+        holder = !locks.empty() ? locks.front() : (!opens.empty() ? opens.front() : "another user");
+    } else if (record->count("headType") && record->at("headType").find("+l") != std::string::npos) {
+        const auto opens = numberedField(*record, "otherOpen");
+        if (!opens.empty()) {
+            holder = opens.front();
+        }
+    }
+    if (!holder.empty()) {
+        check.allowed = false;
+        check.whyNot = id.path() + " is locked by " + holderText(holder);
+        return check;
+    }
+
+    if (!record->count("haveRev")) {
+        check.allowed = false;
+        check.whyNot = id.path() + " is in Perforce but not in your workspace; get it before changing it";
+        return check;
+    }
+    if (record->count("headRev") && record->at("headRev") != record->at("haveRev")) {
+        check.warning = id.path() + ": your copy is not the latest version";
+    }
+
+    const auto edit = _pool.run("edit", {local.string()});
+    const bool opened = std::any_of(edit.records.begin(), edit.records.end(),
+                                    [](const p4::Record& r) { return r.count("action") > 0; });
+    if (!opened) {
+        check.allowed = false;
+        check.whyNot = "Perforce did not open " + id.path() + " for edit";
+        if (edit.hasErrors()) {
+            check.whyNot += ": " + edit.errorText();
+        }
+    }
+    return check;
+}
+
+std::string Workspace::addNewFile(const AssetIdentifier& id) {
+    const std::filesystem::path local = workspacePath(id);
+    std::error_code ec;
+    if (!std::filesystem::exists(local, ec)) {
+        return {}; // the write did not happen
+    }
+    std::lock_guard<std::mutex> lock(_syncMutex);
+    FileLock workspaceLock(lockPath());
+    // -f: add even if the file name has characters Perforce would warn about.
+    const auto add = _pool.run("add", {"-f", local.string()});
+    if (add.hasErrors()) {
+        return id.path() + " was saved but not added to Perforce: " + add.errorText();
+    }
+    return {};
+}
+
+std::optional<HaveInfo> Workspace::haveInfo(const AssetIdentifier& id) {
+    const auto fstat = _pool.runOrThrow("fstat", {"-T", "haveRev,action", depotPath(id)});
+    if (fstat.records.empty()) {
+        return std::nullopt;
+    }
+    const p4::Record& record = fstat.records.front();
+    const auto have = record.find("haveRev");
+    if (have == record.end() || have->second.empty() || have->second == "none") {
+        return std::nullopt;
+    }
+    HaveInfo info;
+    info.haveRev = std::strtol(have->second.c_str(), nullptr, 10);
+    info.opened = record.count("action") > 0;
+    return info;
+}
+
+bool Workspace::clientUsesModtime() {
+    std::lock_guard<std::mutex> lock(_modtimeMutex);
+    if (!_usesModtime) {
+        const auto spec = _pool.runOrThrow("client", {"-o"});
+        bool uses = false;
+        if (!spec.records.empty()) {
+            const auto options = spec.records.front().find("Options");
+            if (options != spec.records.front().end()) {
+                // "allwrite noclobber nocompress unlocked modtime rmdir": a
+                // whole word, because "nomodtime" contains "modtime".
+                const std::string& text = options->second;
+                std::size_t at = 0;
+                while ((at = text.find("modtime", at)) != std::string::npos) {
+                    const bool wordStart = at == 0 || text[at - 1] == ' ';
+                    const bool wordEnd = at + 7 == text.size() || text[at + 7] == ' ';
+                    if (wordStart && wordEnd) {
+                        uses = true;
+                    }
+                    at += 7;
+                }
+            }
+        }
+        _usesModtime = uses;
+    }
+    return *_usesModtime;
+}
+
+void Workspace::useManifest(const Manifest& manifest) {
+    _manifestFolder = manifest.folderName();
+}
+
+std::filesystem::path Workspace::manifestPath(const Manifest& manifest, const std::string& relativePath) const {
+    return underRoot(_storeBase() / manifest.folderName(), AssetIdentifier::fromRelativePath(relativePath));
+}
+
+Workspace::Materialized Workspace::materialize(const Manifest& manifest, const ManifestEntry& entry,
+                                               bool verifyPresent, std::int64_t* bytesFetched) {
+    namespace fs = std::filesystem;
+    const fs::path target = manifestPath(manifest, entry.path);
+    std::error_code ec;
+    const bool check = entry.digestCheckable();
+
+    if (fs::exists(target, ec)) {
+        if (!verifyPresent || !check || md5File(target, entry.isText()) == entry.digest) {
+            return Materialized::Present;
+        }
+        // Damaged or replaced: put the right file back.
+        fs::permissions(target, fs::perms::owner_write, fs::perm_options::add, ec);
+        fs::remove(target, ec);
+    }
+    fs::create_directories(target.parent_path(), ec);
+    if (ec) {
+        throw Error("Could not create " + target.parent_path().string() + ": " + ec.message());
+    }
+
+    const auto readOnly = [](const fs::path& file) {
+        std::error_code e;
+        fs::permissions(file, fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write,
+                        fs::perm_options::remove, e);
+    };
+    // Put the pool's file at `target`: a hard link, or a copy where the file
+    // system cannot link.
+    const auto place = [&](const fs::path& source) {
+        std::error_code e;
+        fs::create_hard_link(source, target, e);
+        if (e) {
+            fs::copy_file(source, target, fs::copy_options::overwrite_existing, e);
+            if (e) {
+                throw Error("Could not store " + target.string() + ": " + e.message());
+            }
+            readOnly(target);
+        }
+    };
+
+    const bool pooled = !entry.digest.empty();
+    const fs::path pool = _settings.versionStore / "objects" / entry.digest;
+    if (pooled && fs::exists(pool, ec)) {
+        place(pool);
+        return Materialized::Linked;
+    }
+
+    static std::atomic<unsigned> counter{0};
+    fs::path temp = target;
+    temp += ".clio-tmp-" + std::to_string(CLIO_GETPID()) + "-" + std::to_string(counter.fetch_add(1));
+    _pool.runOrThrow("print", {"-q", "-o", temp.string(), depotPath(AssetIdentifier::fromRelativePath(entry.path)) +
+                                                              "#" + std::to_string(entry.rev)});
+    if (!fs::exists(temp, ec)) {
+        throw Error(entry.path + "#" + std::to_string(entry.rev) +
+                    " is not on the server any more (obliterated or archived)");
+    }
+    if (check) {
+        const std::string actual = md5File(temp, entry.isText());
+        if (actual != entry.digest) {
+            fs::remove(temp, ec);
+            throw Error(entry.path + "#" + std::to_string(entry.rev) + " has digest " + actual +
+                        " on the server, but the manifest has " + entry.digest +
+                        ". The file was changed or restored after the manifest was made");
+        }
+    }
+    if (bytesFetched) {
+        *bytesFetched += static_cast<std::int64_t>(fs::file_size(temp, ec));
+    }
+    readOnly(temp);
+    if (!pooled) {
+        fs::rename(temp, target, ec);
+        if (ec) {
+            fs::remove(temp, ec);
+            if (!fs::exists(target)) {
+                throw Error("Could not store " + target.string());
+            }
+        }
+        return Materialized::Fetched;
+    }
+    fs::create_directories(pool.parent_path(), ec);
+    fs::rename(temp, pool, ec);
+    if (ec) {
+        // Another thread stored the same content first.
+        fs::remove(temp, ec);
+        if (!fs::exists(pool)) {
+            throw Error("Could not store " + pool.string());
+        }
+    }
+    place(pool);
+    return Materialized::Fetched;
+}
+
+ManifestFetchReport Workspace::fetchManifest(const Manifest& manifest, std::size_t threads,
+                                             const ManifestProgress& progress) {
+    std::vector<const ManifestEntry*> entries;
+    for (const auto& [path, entry] : manifest.entries()) {
+        entries.push_back(&entry);
+    }
+    ManifestFetchReport report;
+    report.files = entries.size();
+
+    std::atomic<std::size_t> next{0};
+    std::atomic<std::size_t> done{0};
+    std::mutex reportMutex;
+    const auto worker = [&] {
+        for (;;) {
+            const std::size_t index = next.fetch_add(1);
+            if (index >= entries.size()) {
+                return;
+            }
+            const ManifestEntry& entry = *entries[index];
+            std::int64_t bytes = 0;
+            std::string failure;
+            Materialized how = Materialized::Present;
+            try {
+                how = materialize(manifest, entry, /*verifyPresent=*/true, &bytes);
+            } catch (const std::exception& e) {
+                failure = entry.path + ": " + e.what();
+            }
+            std::lock_guard<std::mutex> lock(reportMutex);
+            if (!failure.empty()) {
+                report.failures.push_back(failure);
+            } else {
+                switch (how) {
+                case Materialized::Present: ++report.present; break;
+                case Materialized::Linked: ++report.linked; break;
+                case Materialized::Fetched: ++report.fetched; break;
+                }
+                report.bytes += bytes;
+            }
+            if (progress) {
+                progress(++done, entries.size(), entry.path);
+            }
+        }
+    };
+
+    const std::size_t count = std::max<std::size_t>(1, std::min(threads, entries.size()));
+    std::vector<std::thread> workers;
+    for (std::size_t i = 1; i < count; ++i) {
+        workers.emplace_back(worker);
+    }
+    worker();
+    for (auto& t : workers) {
+        t.join();
+    }
+    std::sort(report.failures.begin(), report.failures.end());
+    return report;
+}
+
+std::vector<std::string> Workspace::checkManifest(const Manifest& manifest) {
+    std::vector<std::string> problems;
+    std::vector<const ManifestEntry*> entries;
+    for (const auto& [path, entry] : manifest.entries()) {
+        entries.push_back(&entry);
+    }
+    constexpr std::size_t chunk = 500;
+    for (std::size_t start = 0; start < entries.size(); start += chunk) {
+        const std::size_t end = std::min(entries.size(), start + chunk);
+        std::vector<std::string> args{"-Ol", "-T", "depotFile,headRev,digest"};
+        std::map<std::string, const ManifestEntry*> byDepotFile;
+        for (std::size_t i = start; i < end; ++i) {
+            const ManifestEntry& entry = *entries[i];
+            const auto id = AssetIdentifier::fromRelativePath(entry.path);
+            args.push_back(depotPath(id) + "#" + std::to_string(entry.rev));
+            byDepotFile[_settings.depotRoot + "/" + entry.path] = &entry;
+        }
+        const auto result = _pool.runOrThrow("fstat", args);
+        std::set<std::string> seen;
+        for (const auto& record : result.records) {
+            const auto file = record.find("depotFile");
+            if (file == record.end() || !byDepotFile.count(file->second)) {
+                continue;
+            }
+            const ManifestEntry& entry = *byDepotFile[file->second];
+            seen.insert(entry.path);
+            const auto digest = record.find("digest");
+            if (digest != record.end() && !entry.digest.empty()) {
+                std::string actual = digest->second;
+                for (char& c : actual) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                if (actual != entry.digest) {
+                    problems.push_back(entry.path + "#" + std::to_string(entry.rev) +
+                                       " has a different digest on the server than in the manifest");
+                }
+            }
+        }
+        for (std::size_t i = start; i < end; ++i) {
+            if (!seen.count(entries[i]->path)) {
+                problems.push_back(entries[i]->path + "#" + std::to_string(entries[i]->rev) +
+                                   " is not on the server any more (obliterated or archived)");
+            }
+        }
+    }
+    return problems;
 }
 
 FetchResult Workspace::fetchVersion(const AssetIdentifier& id, const Pin& pin) {
@@ -316,12 +681,9 @@ FetchResult Workspace::fetchVersion(const AssetIdentifier& id, const Pin& pin) {
     // Unique across threads and processes sharing the version store.
     temp += ".clio-tmp-" + std::to_string(CLIO_GETPID()) + "-" + std::to_string(counter.fetch_add(1));
 
-    {
-        std::lock_guard<std::mutex> lock(_mutex);
-        // A file missing at this version is a warning, not an error, so it
-        // does not throw; connection and login failures do.
-        _connection.runOrThrow("print", {"-q", "-o", temp.string(), depotPath(id) + pin.p4RevSpec()});
-    }
+    // A file missing at this version is a warning, not an error, so it
+    // does not throw; connection and login failures do.
+    _pool.runOrThrow("print", {"-q", "-o", temp.string(), depotPath(id) + pin.p4RevSpec()});
 
     if (!fs::exists(temp)) {
         return FetchResult::NotFound;
@@ -351,8 +713,7 @@ FetchResult Workspace::fetchVersion(const AssetIdentifier& id, const Pin& pin) {
 p4::CommandResult Workspace::run(const std::string& command,
                                  const std::vector<std::string>& args,
                                  const std::optional<std::string>& input) {
-    std::lock_guard<std::mutex> lock(_mutex);
-    return _connection.run(command, args, input);
+    return _pool.run(command, args, input);
 }
 
 } // namespace clio::core
