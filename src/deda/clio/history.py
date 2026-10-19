@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 
 from deda.clio.backends.base import Result
 from deda.clio.errors import NotInWorkspaceError, WorkflowError
-from deda.clio.models import Change, Freshness, HistoryPage, Revision
+from deda.clio.models import Change, Freshness, HistoryPage, Integration, Revision
 
 if TYPE_CHECKING:
     from deda.clio.session import Session
@@ -110,6 +110,21 @@ def _time(value: str | None) -> datetime:
     return datetime.fromtimestamp(int(value or 0))
 
 
+def _rev(value: str) -> int:
+    """``#3`` -> 3; ``#none`` -> 0."""
+    value = value.lstrip("#")
+    return int(value) if value.isdigit() else 0
+
+
+def _integrations(rec: dict[str, str], i: int) -> tuple[Integration, ...]:
+    found, j = [], 0
+    while f"how{i},{j}" in rec:
+        found.append(Integration(rec[f"how{i},{j}"], rec.get(f"file{i},{j}", ""),
+                                 _rev(rec.get(f"srev{i},{j}", "")), _rev(rec.get(f"erev{i},{j}", ""))))
+        j += 1
+    return tuple(found)
+
+
 def _revisions(result: Result) -> list[Revision]:
     revisions = []
     for rec in result.records:
@@ -128,6 +143,7 @@ def _revisions(result: Result) -> list[Revision]:
                 file_type=rec.get(f"type{i}", ""),
                 size=int(rec[f"fileSize{i}"]) if rec.get(f"fileSize{i}") else None,
                 digest=rec.get(f"digest{i}"),
+                integrations=_integrations(rec, i),
             ))
             i += 1
     return revisions

@@ -907,8 +907,13 @@ Each result carries **freshness** (`FRESH`, `STALE` with its age, or
 * **`BranchDiffView`**: one `diff2 -q branch/... other/...` (default: the branch
   you are on against its parent); rows are `different`, `only_here` or
   `only_there` with the revision on each side.
-* *Not built:* "which branch a revision came from" (integration records in the
-  history rows), thumbnails (§9.8), lock badges for folders other than the
+* **Integration records.** `Revision.integrations` holds Perforce's integration
+  records for the revision (`how`, other file, revision range), read from the
+  same `filelog` the history already runs, so a history row costs no extra call.
+  `Revision.came_from` is the first "... from" record; `Integration.branch` is
+  the stream name of the other file. The activity feed has no records: it lists
+  changes, not file revisions.
+* *Not built:* thumbnails (§9.8), lock badges for folders other than the
   visible rows, a persistent cache.
 
 ### 9.6 Cached vs live: decision table
@@ -1749,7 +1754,7 @@ Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
 | **3 — Performance** *(done)* | Stat-first disk check for `status` and `save` ([benchmarks.md](benchmarks.md#phase-3-the-disk-check-2026-10-12)); `ConnectionPool` in `clio_core`; the miss coalescer (single-flight plus a batching window for `sync`, parallel fetches of pinned versions); time-bounded resolver memo (§8.3, §10.3 "As built"). *Measured and not built:* C++ hashing, scan and diff, a persistent store and a Python status cache (see [benchmarks.md](benchmarks.md#phase-3-what-was-not-built-2026-10-18)). |
 | **4 — USD completion** *(done, CI not yet run)* | Write side: edit/add on save, refuse on another user's lock (§10.6); revision-based timestamps for `modtime` clients (§10.3); `deda.clio.usd.prepare`, `prepare_for_edit` and `finish_edit` (option A, §10.2). A Linux CI workflow builds and tests against USD 26.08 and 25.08 (`.github/workflows/ci.yml`); it has not run on GitHub yet. *Deferred:* locking a layer before it is edited (today the edit happens at save), submit hooks. |
 | **4½ — Version manifests** *(done)* | `Manifest` create/save/load/fetch/check/diff (§10.8), `manifest=` context setting, content-addressed pool, `clio usd manifest` CLI, farm guide (proxy + `policy=verify`, [usd.md](usd.md#rendering-on-a-farm-version-manifests)). *Deferred:* shelves for unsubmitted work, expression variables. |
-| **5 — Ecosystem** *(mostly done)* | *Done:* `clio doctor` and `clio doctor --typemap` (§8.5); validation hooks, `deda.clio.hooks` (§14); ContentCache and `clio cache clear/verify` (§9.3); view models `FileListView` and `HistoryView` over a coalescing, deduplicating, prioritized, cancellable `RequestPipeline` (§9.5). *Also done:* asset resolver plugins, `deda.clio.resolvers` and `session.assets` (§14). *Also done:* `ActivityView`, `BranchListView` and `BranchDiffView`. *Left:* integration records in history rows, thumbnails (§9.8), Dedaverse/DCC integration when targeted. |
+| **5 — Ecosystem** *(mostly done)* | *Done:* `clio doctor` and `clio doctor --typemap` (§8.5); validation hooks, `deda.clio.hooks` (§14); ContentCache and `clio cache clear/verify` (§9.3); view models `FileListView` and `HistoryView` over a coalescing, deduplicating, prioritized, cancellable `RequestPipeline` (§9.5). *Also done:* asset resolver plugins, `deda.clio.resolvers` and `session.assets` (§14). *Also done:* `ActivityView`, `BranchListView` and `BranchDiffView`. *Also done:* integration records in history rows. *Left:* thumbnails (§9.8), Dedaverse/DCC integration when targeted. |
 
 ### Backlog
 

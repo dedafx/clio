@@ -140,6 +140,33 @@ class SaveResult:
 
 
 @dataclass(frozen=True, slots=True)
+class Integration:
+    """Where a revision's content came from, or went to (a Perforce
+    integration record). ``how`` is Perforce's wording: ``branch from``,
+    ``copy from``, ``merge from``, ``edit from``, ``add from``, ``delete from``,
+    ``ignored``, or the forward form (``copy into``, ``merge into`` ...) on the
+    revision that was the source."""
+
+    how: str
+    #: The other file, its revisions (0 when Perforce says ``#none``).
+    depot_path: str
+    start_rev: int
+    end_rev: int
+
+    @property
+    def into(self) -> bool:
+        """The other file received this revision (the forward direction)."""
+        return self.how.endswith(" into") or self.how in ("ignored by",)
+
+    @property
+    def branch(self) -> str:
+        """Name of the branch (stream) the other file is on: the first folder
+        under its depot, e.g. ``crate-damage`` for ``//imagine/crate-damage/a.ma``."""
+        parts = self.depot_path.split("/")
+        return parts[3] if len(parts) > 3 and parts[:2] == ["", ""] else ""
+
+
+@dataclass(frozen=True, slots=True)
 class Revision:
     depot_path: str
     rev: int
@@ -152,6 +179,14 @@ class Revision:
     file_type: str
     size: int | None = None
     digest: str | None = None
+    #: Which branch this revision came from (and where it went): empty for an
+    #: ordinary edit. Comes with the history, at no extra server call.
+    integrations: tuple[Integration, ...] = ()
+
+    @property
+    def came_from(self) -> Integration | None:
+        """The first record saying this revision's content came from another file."""
+        return next((i for i in self.integrations if i.how.endswith(" from") and i.depot_path), None)
 
 
 @dataclass(frozen=True, slots=True)
