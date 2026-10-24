@@ -403,7 +403,9 @@ def history(state: State, path: str, limit: int) -> None:
     def human() -> None:
         for r in page.items:
             first = r.description.splitlines()[0] if r.description else ""
-            click.echo(f"v{r.rev:<4} change {r.change:<6} {r.time:%Y-%m-%d %H:%M}  {r.user:<12} {r.action:<8} {first}")
+            origin = r.came_from
+            note = f"  [{origin.how} {origin.branch or origin.depot_path}#{origin.end_rev}]" if origin else ""
+            click.echo(f"v{r.rev:<4} change {r.change:<6} {r.time:%Y-%m-%d %H:%M}  {r.user:<12} {r.action:<8} {first}{note}")
 
     state.out.emit(page, human)
 

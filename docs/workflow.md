@@ -93,7 +93,7 @@ clio save -m "Crate: damage pass on lid" props/crate
 clio unlock props/crate/crate.ma  # release; unchanged files are closed again
 clio discard props/crate --yes    # throw away changes (a copy is kept)
 
-clio history props/crate/crate.ma # versions of a file
+clio history props/crate/crate.ma # versions of a file (and which branch a version came from)
 clio activity props               # recent changes in a folder
 clio login | logout | whoami
 clio doctor                       # is this machine set up well? (see below)
@@ -236,6 +236,8 @@ with clio.connect("imagine") as s:
     page = s.history.revisions("props/crate/crate.ma", limit=20)
     for r in page.items:
         print(r.rev, r.change, r.user, r.description)
+        if r.came_from:                           # which branch this version came from
+            print("  ", r.came_from.how, r.came_from.branch)
     older = s.history.revisions("props/crate/crate.ma", before=page.next_cursor)
 
     # Branches (streams) and drafts.
