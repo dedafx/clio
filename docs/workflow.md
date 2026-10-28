@@ -20,6 +20,11 @@ behind it, see [design.md](design.md) §5, §7, §9, §11 and §12.
 | **publish** | Copy your branch's saved work up to its parent | `p4 copy` |
 | **draft** | Work shared without saving it | shelved change |
 
+If you know Perforce, these spellings work too and run the Clio command:
+`clio sync` (get), `clio submit` (save), `clio edit` (lock), `clio revert`
+(discard) and `clio shelve` (draft share). They take the same options and run
+the same checks, so `clio revert` still asks before it throws work away.
+
 ## First-time setup
 
 ```bash
