@@ -36,6 +36,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
+        id: py
         with:
           python-version: "3.13"
 
@@ -58,7 +59,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/usd-${{ matrix.usd }}
-          key: usd-${{ matrix.usd }}-py3.13-ubuntu-24.04-v1
+          # USD's CMake config pins the exact Python it was built with, so a
+          # new 3.13 patch release on the runner needs a fresh build.
+          key: usd-${{ matrix.usd }}-py${{ steps.py.outputs.python-version }}-ubuntu-24.04-v1
 
       - name: Build OpenUSD ${{ matrix.usd }}
         if: matrix.usd != 'none' && steps.usd-cache.outputs.cache-hit != 'true'
