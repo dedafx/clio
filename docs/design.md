@@ -1663,8 +1663,10 @@ clio usd deps LAYER             # list dependencies and their state, no sync
 clio usd localize LAYER --dest DIR   # rewrite clio: paths for delivery (§10.5)
 ```
 
-Perforce-literate users can use aliases (`sync`, `submit`, `edit`,
-`revert`, `shelve`) *(not implemented yet)*.
+Perforce-literate users can use aliases: `sync` (get), `submit` (save),
+`edit` (lock), `revert` (discard) and `shelve` (draft share). *As built:* each
+alias is a copy of the Clio command with the same options and checks
+(`_alias` in `cli/__init__.py`), so none of them is a raw Perforce command.
 
 ## 13. Testing strategy
 

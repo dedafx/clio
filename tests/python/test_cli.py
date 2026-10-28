@@ -107,6 +107,34 @@ def test_nothing_to_save_and_discard(run):
     assert path.read_text() == "v1"
 
 
+def test_perforce_style_aliases(run):
+    alice, bob = run.alice, run.bob
+    path = alice.paths.root / "a.ma"
+    path.write_text("v1")
+    submitted = run("submit", "-m", "first", "a.ma")
+    assert submitted.exit_code == 0 and "added    a.ma" in submitted.output
+
+    synced = run("sync", user=bob)
+    assert synced.exit_code == 0 and "Got 1 file(s)" in synced.output
+
+    edited = run("edit", "a.ma")
+    assert edited.exit_code == 0 and "locked  a.ma" in edited.output
+
+    path.chmod(path.stat().st_mode | stat.S_IWRITE)
+    path.write_text("oops")
+    reverted = run("revert", "a.ma", "--yes", "--no-backup")
+    assert reverted.exit_code == 0 and "discarded  a.ma" in reverted.output
+    assert path.read_text() == "v1"
+
+    run("edit", "a.ma")
+    path.write_text("v2")
+    shelved = run("shelve", "-m", "wip", "a.ma")
+    assert shelved.exit_code == 0 and "Shared draft" in shelved.output
+
+    helped = run("--help")
+    assert "Same as 'clio get'." in helped.output
+
+
 def test_errors_have_exit_codes(run, tmp_path):
     outside = run("get", os.fspath(tmp_path))
     assert outside.exit_code == 10

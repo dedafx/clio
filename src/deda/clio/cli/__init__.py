@@ -13,6 +13,7 @@ the save, 15 no such asset.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import enum
 import json
@@ -896,6 +897,25 @@ def manifest_diff(state: State, first: str, second: str) -> None:
     state.out.emit(result, human)
     if not result.same:
         sys.exit(1)
+
+
+# --- Perforce-style aliases ---------------------------------------------------
+
+
+def _alias(name: str, target: click.Command, spelled: str) -> None:
+    """Add ``name`` as another spelling of ``target`` (same options, same checks)."""
+    alias = copy.copy(target)
+    alias.name = name
+    alias.help = f"Same as 'clio {spelled}'."
+    alias.short_help = None
+    cli.add_command(alias, name)
+
+
+_alias("sync", get, "get")
+_alias("submit", save, "save")
+_alias("edit", lock, "lock")
+_alias("revert", discard, "discard")
+_alias("shelve", draft_share, "draft share")
 
 
 def _size(n: int) -> str:
