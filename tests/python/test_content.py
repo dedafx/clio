@@ -40,7 +40,8 @@ def test_a_revision_is_fetched_once_and_named_by_its_content(alice, tmp_path):
     one = cache.get(alice, oldest)
     assert one.read_bytes() == b"\x00\x01version one"
     assert one.name == f"{oldest.digest.lower()}-{oldest.size}.bin"
-    assert not os.access(one, os.W_OK)  # read-only
+    # Read-only by mode: os.access(W_OK) is always true for root.
+    assert not one.stat().st_mode & stat.S_IWRITE
     assert cache.get(alice, oldest) == one
     assert alice.backend.calls["print"] == before + 1  # the second call used the cache
 
