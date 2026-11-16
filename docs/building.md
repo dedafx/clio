@@ -134,8 +134,13 @@ from a CMake build tree.
 
 `.github/workflows/ci.yml` follows the steps above on Ubuntu, once for each
 supported USD version (26.08 and 25.08, cached after the first build) and
-once without USD. It has not run on GitHub yet; fix it as the first runs
-show. Windows is built by hand for now.
+once without USD. The USD cache is keyed on the exact Python patch release,
+because USD's CMake config pins it; a new 3.13 patch release on the runner
+rebuilds USD once.
+
+A second job follows the Windows steps above (`windows-2022`, the `_dyn`
+P4API, vcpkg OpenSSL) and runs the C++ and Python tests without USD. USD on
+Windows is still built by hand.
 
 ## 5. Using the resolver
 
