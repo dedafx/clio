@@ -1386,6 +1386,74 @@ Under option A (no plugin), the same behaviour is available as
 `clio_usd.prepare_for_edit(layer_paths)`, which DCC integrations call from
 their save callbacks.
 
+#### 10.6.1 Proposal: lock a layer before it is edited *(not built)*
+
+**The gap.** Everything above happens when the layer is *saved*. Between the
+first change in memory and the save, Clio does nothing. If Sam locks the same
+`.usdc` meanwhile, the artist finds out at save, after a long session. The
+save is refused with the reason and nothing on disk is lost, but the edits
+exist only in memory and have to be exported by hand. The earlier the lock is
+taken, the less work is at risk. For mergeable text (`.usda`, `text` in the
+typemap, §8.5) there is no exclusive lock at all, and that is correct for
+text that can be merged.
+
+**What USD gives us.** Sdf has no "about to change" hook that a plugin can
+veto: `Sdf.Notice.LayersDidChange` fires after the change, and the resolver
+only sees opens and writes. What it does have is `Sdf.Layer.permissionToEdit`,
+which makes edits to a layer fail with an error, and `Usd.Notice.StageEditTargetChanged`,
+which tells us which layer the artist is about to author into. *Both need
+checking in a prototype against 26.08 and 25.08; this proposal has not been run
+against USD.*
+
+**Proposal (Python only, no change to the plugin).** A small guard, used by
+DCC integrations and scripts, that turns "start editing" into an explicit step:
+
+```python
+guard = clio.usd.guard(session, stage)      # managed layers become read-only to edits
+guard.begin_edit(layer_a, layer_b)          # one fstat + one edit (+ lock for +l types)
+...                                         # author as usual
+guard.release()                             # layers go back to permissionToEdit = False
+```
+
+* `guard` finds the stage's local layers that are in the project and sets
+  `permissionToEdit = False` on them. Layers outside the project (anonymous
+  layers, other disks) are left alone.
+* `begin_edit(*layers)` is `prepare_for_edit` for those layers: the same one
+  `fstat` plus one `edit`, the same `LockedByOtherError` with the owner's name,
+  the same warning when the copy is not the latest. Only if it succeeds does it
+  set `permissionToEdit = True` on those layers. So the refusal comes *before*
+  the first change, with nothing to lose.
+* With `auto=True` the guard listens for `StageEditTargetChanged` and calls
+  `begin_edit` for the new edit target, so setting the target is the moment the
+  lock is taken. Without it, the integration calls `begin_edit` itself (for
+  example when the artist presses "Edit this layer").
+* Saving does not release anything: the file is still open for edit until the
+  artist runs `unlock` or `save`, as for any other file. A layer that is saved
+  by `Sdf.Layer.Save` still goes through the plugin's write hooks, which find
+  the file already open and do nothing more.
+* No server call per layer, no cache: `begin_edit` always asks Perforce (the
+  server is the authority, §8.3) and batches the layers into one command.
+
+**Questions for the owner of the design**
+
+1. *Which layers.* Every local layer of the stage, or only the edit target?
+   Locking only the edit target takes the fewest locks, but a script that
+   edits several layers must call `begin_edit` for each.
+2. *Text layers.* Should `.usda` get a real `p4 lock` when it is edited early,
+   or only the plain `p4 edit` (which lets two people edit and merge)? The
+   proposal keeps today's rule: exclusive only where the file type is `+l`;
+   a `lock_on_edit` setting could change that per project.
+3. *Where it lives.* Python only, as proposed, or also in the plugin so a DCC
+   gets it with no integration code? The plugin cannot see edits before they
+   happen, so this would still need the Python guard in the DCC.
+4. *Failure.* An error from `begin_edit`, or a quiet read-only layer plus a
+   notice? The proposal is the error, because the artist should see who holds
+   the lock at the moment they try to edit.
+
+**Tests if built:** unit tests with the fake backend for the batching and the
+refusal; `p4d` tests for two users; USD tests (skipped without `pxr`) for the
+`permissionToEdit` and edit-target behaviour on both USD versions.
+
 ### 10.7 Performance notes
 
 * **Waves, not files.** Option A costs one server round trip per
